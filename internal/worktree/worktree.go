@@ -595,7 +595,7 @@ func resolveCreationState(spec Spec) (*git.Git, bool, string, error) {
 			spec.Path, spec.Base, resolvedBase, spec.BaseSHA)
 	}
 	if spec.managed() && branchExists {
-		head, err := repoGit.RevParseVerifyCommit(spec.Branch)
+		head, err := repoGit.RevParseVerifyCommit("refs/heads/" + spec.Branch)
 		if err != nil {
 			return nil, false, "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
 		}
