@@ -48,17 +48,18 @@ func writeManagedBdCityFixture(t *testing.T, cityPath string) {
 
 func startStandaloneBdDoltLikeProcess(t *testing.T, dataDir string) *exec.Cmd {
 	t.Helper()
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("requires bash for exec -a")
-	}
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll(dataDir): %v", err)
 	}
-	fifo := filepath.Join(dataDir, "sql-server")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatalf("Mkfifo(sql-server): %v", err)
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary path: %v", err)
 	}
-	cmd := exec.Command("bash", "-c", `exec -a dolt cat sql-server -- --data-dir "$1"`, "fake-dolt", dataDir)
+	// Reuse the test binary's fake server mode: coreutils may reject a
+	// spoofed argv[0], while this child intentionally ignores its arguments.
+	cmd := exec.Command(self)
+	cmd.Args = []string{"dolt", "sql-server", "--data-dir", dataDir}
+	cmd.Env = append(os.Environ(), fakeDoltSQLServerMarkerEnv+"=1")
 	cmd.Dir = dataDir
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
