@@ -35,7 +35,9 @@ func TestMemStoreConditionalWriterConformance(t *testing.T) {
 	beadstest.RunConditionalWriterConformanceWithOptions(t, "MemStore",
 		func(_ *testing.T) beads.Store { return beads.NewMemStore() },
 		beadstest.ConditionalWriterOptions{
-			SuppliesCurrent: true,
+			RowBackedMutationFlavors: true,
+			RestrictedUpdateFields:   true,
+			SuppliesCurrent:          true,
 			OpenDisabled: func(_ *testing.T) beads.Store {
 				s := beads.NewMemStore()
 				s.DisableConditionalWrites = true
@@ -43,6 +45,14 @@ func TestMemStoreConditionalWriterConformance(t *testing.T) {
 			},
 		},
 	)
+}
+
+// TestAtomicCloseMemStoreAtomicCloserConformance pins the opt-in in-memory
+// atomic-close store to the shared AtomicConditionalCloser contract, the same
+// table FileStore and SQLiteStore run.
+func TestAtomicCloseMemStoreAtomicCloserConformance(t *testing.T) {
+	beadstest.RunAtomicConditionalCloserConformance(t, "AtomicCloseMemStore",
+		func(_ *testing.T) beads.Store { return beads.NewAtomicCloseMemStore() })
 }
 
 func TestMemStoreSetMetadata(t *testing.T) {

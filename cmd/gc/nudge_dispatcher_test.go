@@ -141,6 +141,53 @@ func TestDispatchAllQueuedNudgesEmptyQueue(t *testing.T) {
 	}
 }
 
+// TestDispatchAllQueuedNudgesSweepsExpiredOrphanEvenWithoutMatch guards
+// against ra-oudpha finding-3's orphan population: a queued item whose
+// target agent has no open session can never reach step 2's "matched"
+// check in the per-session loop, so it can never reach the sweep that
+// claimDueQueuedNudgesForTarget runs as a side effect of a successful
+// claim. Before the fix, such an item sat in Pending forever, past its
+// TTL, invisible to every maintenance pass. The dispatch tick must sweep
+// the whole queue unconditionally so TTL expiry (#4421 semantics) still
+// applies to items no open session will ever match.
+func TestDispatchAllQueuedNudgesSweepsExpiredOrphanEvenWithoutMatch(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	dir := t.TempDir()
+	// Created 25h ago, so ExpiresAt (created+24h TTL) is already 1h in the
+	// past. "ghost-agent" has no open session in the snapshot below and
+	// never will, so it can never satisfy the per-session loop's match step.
+	item := newQueuedNudge("ghost-agent", "msg", time.Now().Add(-25*time.Hour))
+	if err := enqueueQueuedNudge(dir, item); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+
+	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, nil, newSessionBeadSnapshot(nil), nil)
+	if err != nil {
+		t.Fatalf("dispatchAllQueuedNudges: %v", err)
+	}
+	if delivered != 0 {
+		t.Fatalf("delivered = %d, want 0", delivered)
+	}
+
+	// Read the raw persisted state (not via listQueuedNudges, which would
+	// run its own maintenance sweep as a side effect and mask the bug).
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 0 {
+		t.Fatalf("pending = %d, want 0 (expired orphan should have been swept by the dispatch tick)", len(state.Pending))
+	}
+	if len(state.Dead) != 1 {
+		t.Fatalf("dead = %d, want 1", len(state.Dead))
+	}
+	if state.Dead[0].LastError != "expired" {
+		t.Fatalf("dead[0].LastError = %q, want %q", state.Dead[0].LastError, "expired")
+	}
+}
+
 func TestDispatchAllQueuedNudgesSkipsNotYetDue(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -228,6 +275,66 @@ func TestDispatchAllQueuedNudgesDeliversAndAcks(t *testing.T) {
 	}
 	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
 		t.Fatalf("queue not drained: pending=%d inFlight=%d dead=%d", len(pending), len(inFlight), len(dead))
+	}
+}
+
+// TestDispatchAllQueuedNudgesHoldsNudgesForKillFencedSession: while a
+// `gc session kill` is tearing the runtime down, a queued nudge must stay
+// queued instead of being typed into the dying process and acked.
+func TestDispatchAllQueuedNudgesHoldsNudgesForKillFencedSession(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store.Store, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	fake.Activity = map[string]time.Time{info.SessionName: time.Now().Add(-10 * time.Second)}
+	if err := store.SetMetadataBatch(info.ID, session.KillPendingPatch(time.Now())); err != nil {
+		t.Fatalf("writing kill fence: %v", err)
+	}
+	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "review the deploy logs", time.Now().Add(-time.Minute))); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+	snapshot, err := loadSessionBeadSnapshot(store.Store)
+	if err != nil {
+		t.Fatalf("loadSessionBeadSnapshot: %v", err)
+	}
+
+	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, fake, snapshot, nil)
+	if err != nil {
+		t.Fatalf("dispatchAllQueuedNudges: %v", err)
+	}
+	if delivered != 0 {
+		t.Fatalf("delivered = %d, want 0 while the kill is in flight", delivered)
+	}
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" {
+			t.Fatalf("nudge typed into a runtime being killed: %q", call.Message)
+		}
+	}
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("queue = pending %d, inFlight %d, dead %d; want the nudge still pending", len(pending), len(inFlight), len(dead))
+	}
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if got := state.DispatchSkips["kill-pending"]; got != 1 {
+		t.Fatalf("DispatchSkips[kill-pending] = %d, want 1 (full map: %#v)", got, state.DispatchSkips)
 	}
 }
 

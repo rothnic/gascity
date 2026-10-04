@@ -19,6 +19,8 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/splittest"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/spf13/pflag"
 )
 
@@ -45,6 +47,55 @@ func mustCreateReadyBead(t *testing.T, store beads.Store, b beads.Bead) beads.Be
 		t.Fatalf("create %q: %v", b.Title, err)
 	}
 	return created
+}
+
+// mustReadyLegs assembles the reader's legs through the production seam, over
+// an explicitly stated binding. The leg list is a Plan(RoutedWork) projection
+// now, so it can fail — but only on a standing storage refusal, which no
+// fixture here stages.
+func mustReadyLegs(t *testing.T, cityName string, cityStore beads.Store, rigStores map[string]beads.Store, binding beads.Store) []readyLeg {
+	t.Helper()
+	legs, err := readyFederationLegsOverBinding(cityName, cityStore, rigStores, binding)
+	if err != nil {
+		t.Fatalf("readyFederationLegsOverBinding: %v", err)
+	}
+	return legs
+}
+
+// TestReadyReaderEscalatesThePlansPartialLegs pins the ONE place this reader
+// overrides the resolver's per-leg policy, and pins that it really is an
+// override.
+//
+// The plan marks a rig leg PartialDegrade — a scope reporting a hole, which the
+// API turns into a Partial 200 naming the rig. A CLI work query has no field for
+// that: its whole output is the array, and a short array is indistinguishable
+// from "no work". So this reader escalates every leg failure to fatal.
+//
+// Asserting the plan's verdict as well as the reader's behavior is what keeps
+// this honest. If the resolver ever made rig legs Fatal, this reader would agree
+// with it by accident and the escalation comment would become a lie nobody
+// notices.
+func TestReadyReaderEscalatesThePlansPartialLegs(t *testing.T) {
+	city := beads.NewMemStore()
+	rig := beads.NewMemStoreFrom(1000, nil, nil)
+	legs := mustReadyLegs(t, "mycity", city, map[string]beads.Store{"alpha": rig}, nil)
+	if len(legs) != 2 {
+		t.Fatalf("got %d legs, want the city and the rig", len(legs))
+	}
+	if legs[1].onError != storeref.PolicyPartialDegrade {
+		t.Fatalf("the rig leg's plan policy is %v, want PartialDegrade — this reader's escalation is only meaningful if there is something to escalate", legs[1].onError)
+	}
+
+	// And the reader fails loud on it anyway.
+	failing := []readyLeg{legs[0], {label: legs[1].label, store: listFailStore{Store: beads.NewMemStore()}, onError: legs[1].onError}}
+	if _, err := readyBeadsForOpts(failing, readyOpts{status: readyStatusInProgress}); err == nil {
+		t.Fatal("a degraded rig leg produced a clean answer; a short array here is indistinguishable from \"no work\"")
+	}
+	// Control: the same call over healthy legs succeeds, so the error above is
+	// the leg failure and not the fixture.
+	if _, err := readyBeadsForOpts(legs, readyOpts{status: readyStatusInProgress}); err != nil {
+		t.Fatalf("healthy legs errored: %v", err)
+	}
 }
 
 func readyWireIDs(rows []readyBead) []string {
@@ -316,20 +367,44 @@ func TestReadyEmitsADedicatedWireTypeNotTheDomainBead(t *testing.T) {
 //
 // When beads.Bead gains or loses a JSON field this test goes red. That is the
 // point: the external array follows only when someone says it should.
+//
+// # The one deliberate divergence
+//
+// `blocked_by` is emitted by `gc ready` and is NOT a beads.Bead field, and that
+// was decided rather than drifted into. It is a COMPUTED projection, not a
+// column: the crash-recovery arm (--status in_progress) resolves each row's
+// blocking dependencies through the leg that served the row, because the
+// consumer of that arm — the hook's work query — needs the blocker's STATUS to
+// decide whether a resumed holder's own bead is currently gated, and
+// `dependencies` carries edges without statuses. bd's own `bd ready --json`
+// emits exactly this field in exactly this shape, so adding it makes the
+// drop-in MORE faithful, not less. It stays out of beads.Bead because it is
+// derived per-read, not stored.
 func TestReadyWireFieldSetIsPinnedToTheHTTPBeadShape(t *testing.T) {
+	// computedReadyWireFields are emitted by gc ready but deliberately absent
+	// from beads.Bead. Every entry needs a stated reason above; the set is small
+	// on purpose.
+	computedReadyWireFields := map[string]bool{"blocked_by": true}
+
 	want := []string{
-		"assignee", "created_at", "defer_until", "dependencies", "description",
-		"ephemeral", "from", "id", "is_blocked", "issue_type", "labels",
-		"metadata", "needs", "no_history", "parent", "priority", "ref",
-		"status", "title", "updated_at",
+		"assignee", "blocked_by", "created_at", "defer_until", "dependencies",
+		"description", "ephemeral", "from", "id", "is_blocked", "issue_type",
+		"labels", "metadata", "needs", "no_history", "parent", "priority",
+		"ref", "status", "title", "updated_at",
 	}
 	got := jsonFieldNames(reflect.TypeOf(readyBead{}))
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("readyBead JSON fields = %v, want %v", got, want)
 	}
+	stored := make([]string, 0, len(got))
+	for _, field := range got {
+		if !computedReadyWireFields[field] {
+			stored = append(stored, field)
+		}
+	}
 	domain := jsonFieldNames(reflect.TypeOf(beads.Bead{}))
-	if !reflect.DeepEqual(got, domain) {
-		t.Fatalf("readyBead JSON fields = %v but beads.Bead publishes %v; the external array's field set diverged from the HTTP Bead shape — decide deliberately whether the wire follows, then update this pin", got, domain)
+	if !reflect.DeepEqual(stored, domain) {
+		t.Fatalf("readyBead's stored JSON fields = %v but beads.Bead publishes %v; the external array's field set diverged from the HTTP Bead shape — decide deliberately whether the wire follows, then update this pin", stored, domain)
 	}
 }
 
@@ -430,7 +505,7 @@ func TestReadyDedupeIsFirstLegWins(t *testing.T) {
 	}
 
 	rows, err := readyBeadsForOpts(
-		readyFederationLegs("mycity", work, nil, graph),
+		mustReadyLegs(t, "mycity", work, nil, graph),
 		readyOpts{},
 	)
 	if err != nil {
@@ -452,7 +527,7 @@ func TestReadyFederationLegOrderMatchesTheAPIContract(t *testing.T) {
 	rigA := splittest.NewWorkStore(t, "ra")
 	graph := splittest.NewClassStore(t, config.BeadClassGraph)
 
-	legs := readyFederationLegs("mycity", city, map[string]beads.Store{
+	legs := mustReadyLegs(t, "mycity", city, map[string]beads.Store{
 		"rig-B":  rigB,
 		"rig-A":  rigA,
 		"mycity": splittest.NewWorkStore(t, "shadow"),
@@ -480,14 +555,14 @@ func TestReadySingleStoreCityFederatesOneLeg(t *testing.T) {
 	graph := splittest.NewClassStore(t, config.BeadClassGraph)
 	step := mustCreateReadyBead(t, graph, beads.Bead{Title: "graph step", Type: "task"})
 
-	legacy, err := readyBeadsForOpts(readyFederationLegs("mycity", city, nil, nil), readyOpts{})
+	legacy, err := readyBeadsForOpts(mustReadyLegs(t, "mycity", city, nil, nil), readyOpts{})
 	if err != nil {
 		t.Fatalf("gc ready: %v", err)
 	}
 	if got := readyWireIDs(legacy); !reflect.DeepEqual(got, []string{work.ID}) {
 		t.Fatalf("single-store ready = %v, want exactly [%s]; a legacy city must not gain a leg", got, work.ID)
 	}
-	split, err := readyBeadsForOpts(readyFederationLegs("mycity", city, nil, graph), readyOpts{})
+	split, err := readyBeadsForOpts(mustReadyLegs(t, "mycity", city, nil, graph), readyOpts{})
 	if err != nil {
 		t.Fatalf("gc ready: %v", err)
 	}
@@ -774,7 +849,7 @@ func TestReadyDefaultOrderIsTheCanonicalReadyOrder(t *testing.T) {
 	seeded = append(seeded, mustCreateReadyBead(t, graph, beads.Bead{Title: "graph urgent", Type: "task", Priority: readyPriority(1)}))
 	seeded = append(seeded, mustCreateReadyBead(t, city, beads.Bead{Title: "city backlog", Type: "task", Priority: readyPriority(3)}))
 
-	rows, err := readyBeadsForOpts(readyFederationLegs("mycity", city, nil, graph), readyOpts{})
+	rows, err := readyBeadsForOpts(mustReadyLegs(t, "mycity", city, nil, graph), readyOpts{})
 	if err != nil {
 		t.Fatalf("gc ready: %v", err)
 	}
@@ -883,10 +958,10 @@ func TestCmdReadyOnALegacyCityFederatesCityAndRigStores(t *testing.T) {
 	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatalf("creating rig dir: %v", err)
 	}
-	cityToml := "[workspace]\nname = \"readytest\"\n\n" +
+	cityToml := "[workspace]\nname = \"readytest\"\nprefix = \"re\"\n\n" +
 		"[beads]\nprovider = \"file\"\n\n" +
 		"[session]\nprovider = \"fake\"\n\n" +
-		"[[rigs]]\nname = \"frontend\"\npath = " + strconv.Quote(rigDir) + "\n"
+		"[[rigs]]\nname = \"frontend\"\npath = " + strconv.Quote(rigDir) + "\nprefix = \"re\"\n"
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
 	}
@@ -923,7 +998,7 @@ func TestCmdReadyOnALegacyCityFederatesCityAndRigStores(t *testing.T) {
 	// Now the city store, whose first bead aliases the rig's id.
 	cityBead := mustCreateReadyBead(t, cityStore, beads.Bead{Title: "city work", Type: "task"})
 	if cityBead.ID != rigBead.ID {
-		t.Fatalf("city bead %s did not alias the rig bead %s; legacy file mode was expected to mint the same id per scope", cityBead.ID, rigBead.ID)
+		t.Fatalf("city bead %s did not alias the rig bead %s; city and rig share an explicit prefix and were expected to mint the same id", cityBead.ID, rigBead.ID)
 	}
 	second := mustCreateReadyBead(t, cityStore, beads.Bead{Title: "more city work", Type: "task"})
 
@@ -1146,4 +1221,231 @@ func assertEveryLegAskedForTheFederatedTier(t *testing.T, surface string, legs i
 			t.Errorf("%s read leg %d at tier %v, want beads.FederatedReadTier (%v); legs that answer at different tiers cannot be merged into one answer", surface, i, tier, beads.FederatedReadTier)
 		}
 	}
+}
+
+// readyCountedRigNames are the bound rigs of the load-count fixture by default.
+// Three is enough to tell "once per invocation" from "once per rig" apart. Pass
+// an explicit list to newReadyCityWithRigs to vary the count; this stays a
+// read-only default so no test has to rebind it.
+var readyCountedRigNames = []string{"alpha", "beta", "gamma"}
+
+// newReadyCityWithRigs writes a real on-disk file-provider city with each rig in
+// rigNames bound and openable, defaulting to readyCountedRigNames when none are
+// given, left ambient (GC_CITY) the way newReadyCityWithBrokenRig leaves its
+// city. The last rig's path is written relative to the city so config loading's
+// rig-path normalisation is part of what the load-count tests exercise. One
+// agent template ("worker") lets the session-close and drain-ack tests resolve a
+// session bead.
+func newReadyCityWithRigs(t *testing.T, rigNames ...string) string {
+	t.Helper()
+	if len(rigNames) == 0 {
+		rigNames = readyCountedRigNames
+	}
+	cityDir := t.TempDir()
+	var cityToml strings.Builder
+	cityToml.WriteString("[workspace]\nname = \"readycounted\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"fake\"\n\n[[agent]]\nname = \"worker\"\nstart_command = \"true\"\nmax_active_sessions = 1\n")
+	rigDirs := make([]string, 0, len(rigNames))
+	for i, name := range rigNames {
+		dir := filepath.Join(cityDir, "rigs", name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("creating rig dir %s: %v", dir, err)
+		}
+		rigDirs = append(rigDirs, dir)
+		tomlPath := dir
+		if i == len(rigNames)-1 {
+			tomlPath = filepath.Join("rigs", name)
+		}
+		cityToml.WriteString("\n[[rigs]]\nname = " + strconv.Quote(name) + "\npath = " + strconv.Quote(tomlPath) + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml.String()), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatalf("ensuring scoped file store layout: %v", err)
+	}
+	for _, scope := range append([]string{cityDir}, rigDirs...) {
+		if err := ensurePersistedScopeLocalFileStore(scope); err != nil {
+			t.Fatalf("ensuring file store at %s: %v", scope, err)
+		}
+	}
+
+	prevCityFlag, prevRigFlag := cityFlag, rigFlag
+	cityFlag, rigFlag = "", ""
+	t.Cleanup(func() { cityFlag, rigFlag = prevCityFlag, prevRigFlag })
+	t.Setenv("GC_CITY", cityDir)
+	return cityDir
+}
+
+// TestReadyLoadsCityConfigOnce pins `gc ready` to one full city-config load per
+// invocation. The command loads the config up front; every store it then opens
+// (city leg, each rig leg) used to throw that config away and reload city.toml
+// plus every pack include inside the open — 8 loads on a 6-rig city, ~10 s of a
+// work query on maintainer-city. It is a one-shot process, so the config it
+// loaded is the config its opens must use.
+//
+// GC_RIG is set the way an agent's work_query runs (GC_CITY + GC_RIG): without
+// it, city resolution maps the cwd to a rig with a load of its own, which is
+// context resolution rather than a store open and is not what this pins.
+//
+// Not parallel: loadCityConfigCalls is process-wide.
+func TestReadyLoadsCityConfigOnce(t *testing.T) {
+	newReadyCityWithRigs(t)
+	t.Setenv("GC_RIG", readyCountedRigNames[0])
+
+	var stdout, stderr bytes.Buffer
+	before := loadCityConfigCalls.Load()
+	if code := cmdReady(readyOpts{}, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdReady = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if grew := loadCityConfigCalls.Load() - before; grew != 1 {
+		t.Fatalf("gc ready loaded the city config %d times over %d bound rigs, want exactly 1: the store opens must reuse the config the command already loaded", grew, len(readyCountedRigNames))
+	}
+}
+
+// TestReadyRigLegStoresReuseSuppliedConfig pins the rig-leg opener on its own:
+// handed a config, it opens every bound rig without loading one.
+func TestReadyRigLegStoresReuseSuppliedConfig(t *testing.T) {
+	cityDir := newReadyCityWithRigs(t)
+	cfg, err := loadCityConfig(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("load city config: %v", err)
+	}
+
+	before := loadCityConfigCalls.Load()
+	stores, err := readyRigLegStores(cfg, cityDir)
+	if err != nil {
+		t.Fatalf("readyRigLegStores: %v", err)
+	}
+	if grew := loadCityConfigCalls.Load() - before; grew != 0 {
+		t.Fatalf("readyRigLegStores loaded the city config %d times despite a supplied config", grew)
+	}
+	if len(stores) != len(readyCountedRigNames) {
+		t.Fatalf("readyRigLegStores opened %d rig stores, want %d", len(stores), len(readyCountedRigNames))
+	}
+}
+
+// TestControllerRigStoresStillReloadConfigPerRig is the other half of the
+// policy split TestRigStoreOpenPolicyDiffersByCaller pins: the controller's
+// opener is long-lived and deliberately keeps re-resolving config inside each
+// rig open, so threading the one-shot config must not have reached it.
+func TestControllerRigStoresStillReloadConfigPerRig(t *testing.T) {
+	cityDir := newReadyCityWithRigs(t)
+	cfg, err := loadCityConfig(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("load city config: %v", err)
+	}
+
+	before := loadCityConfigCalls.Load()
+	stores := buildStandaloneRigStores(cfg, cityDir, io.Discard)
+	if grew := loadCityConfigCalls.Load() - before; grew != int64(len(readyCountedRigNames)) {
+		t.Fatalf("buildStandaloneRigStores loaded the city config %d times, want once per bound rig (%d): the controller keeps its reload-per-open semantics", grew, len(readyCountedRigNames))
+	}
+	if len(stores) != len(readyCountedRigNames) {
+		t.Fatalf("buildStandaloneRigStores opened %d rig stores, want %d", len(stores), len(readyCountedRigNames))
+	}
+
+	before = loadCityConfigCalls.Load()
+	if stores := buildStandaloneRigStoresWithConfig(cfg, cityDir, io.Discard); len(stores) != len(readyCountedRigNames) {
+		t.Fatalf("buildStandaloneRigStoresWithConfig opened %d rig stores, want %d", len(stores), len(readyCountedRigNames))
+	}
+	if grew := loadCityConfigCalls.Load() - before; grew != 0 {
+		t.Fatalf("buildStandaloneRigStoresWithConfig loaded the city config %d times despite a supplied config", grew)
+	}
+}
+
+// newCountedSessionBead creates an active "worker" session bead in the
+// fixture's city store, holding one in_progress work bead, and returns the
+// session bead.
+func newCountedSessionBead(t *testing.T, cityDir, sessionName string) beads.Bead {
+	t.Helper()
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "counted worker",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": sessionName,
+			"template":     "worker",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session bead): %v", err)
+	}
+	work, err := store.Create(beads.Bead{
+		Title:    "held work",
+		Type:     "task",
+		Assignee: sessionBead.ID,
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create(work bead): %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark work in_progress: %v", err)
+	}
+	return sessionBead
+}
+
+// TestDrainAckReleaseLoadsCityConfigOnce pins drain-ack's held-claim release
+// to one city-config load across the city open and every rig leg. It used to
+// be 2 + one per bound rig (the city open reloaded, then the explicit load,
+// then buildStandaloneRigStores reloaded per rig): 5 on this 3-rig city.
+//
+// Not parallel: loadCityConfigCalls is process-wide.
+func TestDrainAckReleaseLoadsCityConfigOnce(t *testing.T) {
+	cityDir := newReadyCityWithRigs(t)
+	t.Setenv("GC_BEADS", "file")
+	newCountedSessionBead(t, cityDir, "worker-drained")
+
+	var stderr bytes.Buffer
+	before := loadCityConfigCalls.Load()
+	releaseUnexecutedClaimsForSession(cityDir, "worker-drained", &stderr)
+	if grew := loadCityConfigCalls.Load() - before; grew != 1 {
+		t.Fatalf("drain-ack release loaded the city config %d times over %d bound rigs, want exactly 1; stderr=%s", grew, len(readyCountedRigNames), stderr.String())
+	}
+}
+
+// TestSessionCloseRigLegsReuseLoadedConfig pins `gc session close` on the
+// 3-rig fixture: the rig legs of the assigned-work release reuse the config
+// the command loaded instead of reloading once per bound rig. The command
+// still has loads of its own (store open, config load), so the pin is that
+// the total does not scale with the rig count.
+//
+// Not parallel: loadCityConfigCalls is process-wide.
+func TestSessionCloseRigLegsReuseLoadedConfig(t *testing.T) {
+	// Compare two rig counts instead of pinning an absolute number: the close
+	// path has loads of its own (store open, the command's config load, the
+	// session/worker plumbing) that unrelated changes may move. What this pins
+	// is that the rig legs add none — before they reused the command's config,
+	// every extra bound rig added one load.
+	oneRig := sessionCloseConfigLoads(t, []string{"alpha"})
+	threeRigs := sessionCloseConfigLoads(t, []string{"alpha", "beta", "gamma"})
+	t.Logf("gc session close config loads: %d with 1 bound rig, %d with 3", oneRig, threeRigs)
+	if threeRigs != oneRig {
+		t.Fatalf("gc session close loaded the city config %d times with 3 bound rigs but %d with 1: the rig legs must reuse the command's config instead of loading once per rig", threeRigs, oneRig)
+	}
+}
+
+// sessionCloseConfigLoads runs `gc session close` on a fresh load-count
+// fixture with the given bound rigs and returns how many city-config loads the
+// command performed.
+func sessionCloseConfigLoads(t *testing.T, rigNames []string) int64 {
+	t.Helper()
+	cityDir := newReadyCityWithRigs(t, rigNames...)
+	t.Setenv("GC_DIR", t.TempDir())
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+	sessionBead := newCountedSessionBead(t, cityDir, "worker-closed")
+
+	var stdout, stderr bytes.Buffer
+	before := loadCityConfigCalls.Load()
+	if code := cmdSessionClose([]string{sessionBead.ID}, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionClose with %d rigs = %d, want 0; stdout=%s stderr=%s", len(rigNames), code, stdout.String(), stderr.String())
+	}
+	return loadCityConfigCalls.Load() - before
 }

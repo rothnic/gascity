@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log"
 	"os"
@@ -20,6 +23,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/rollout/gate"
@@ -51,6 +55,14 @@ func (p *sweepIsRunningFalseNegativeProvider) IsRunning(name string) bool {
 	return false
 }
 
+type sweepUnavailableLivenessProvider struct {
+	*runtime.Fake
+}
+
+func (p *sweepUnavailableLivenessProvider) ObserveLivenessWithError(name string, processNames []string) (runtime.Liveness, error) {
+	return runtime.ObserveLiveness(p.Fake, name, processNames), fmt.Errorf("pool sweep: %w", runtime.ErrRuntimeUnavailable)
+}
+
 func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 	store := beads.NewMemStore()
 	bead, err := store.Create(beads.Bead{
@@ -78,6 +90,7 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 	}
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -95,6 +108,49 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 	}
 	if got.Status == "closed" {
 		t.Fatalf("running pool bead was closed: %+v", got)
+	}
+}
+
+func TestSweepUndesiredPoolSessionBeads_DefersWhenLivenessUnavailable(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-unavailable",
+			"template":             "worker",
+			"agent_name":           "worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "active",
+			"continuation_epoch":   "1",
+			"generation":           "1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	closed := sweepUndesiredPoolSessionBeads(
+		"",
+		beads.SessionStore{Store: store},
+		nil,
+		newSessionBeadSnapshot([]beads.Bead{bead}),
+		nil,
+		&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}},
+		&sweepUnavailableLivenessProvider{Fake: runtime.NewFake()},
+		false,
+	)
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0 while runtime liveness is unavailable", closed)
+	}
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("pool bead was closed despite runtime uncertainty: %+v", got)
 	}
 }
 
@@ -252,6 +308,7 @@ func TestSweepUndesiredPoolSessionBeads_UsesProcessNameFallback(t *testing.T) {
 	}
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -309,6 +366,7 @@ func TestSweepUndesiredPoolSessionBeads_RunningProbeAvoidsFullObservation(t *tes
 	sp.SetActivity("worker-bd-running", time.Now())
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -350,6 +408,7 @@ func TestSweepUndesiredPoolSessionBeads_UsesRuntimeLivenessObservation(t *testin
 	}
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		newSessionBeadSnapshot([]beads.Bead{bead}),
@@ -404,6 +463,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsProtectedCreateBeforeRuntimeProbe(t
 	sp := runtime.NewFake()
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -904,6 +964,14 @@ func TestCityRuntimeDemandSnapshotRefreshesForNewRoutedReadyWork(t *testing.T) {
 	if got := second.result.PoolDesiredCounts[template]; got != 1 {
 		t.Fatalf("PoolDesiredCounts[%s] = %d, want 1 for newly-ready routed work", template, got)
 	}
+
+	third := cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
+	if buildCalls != 2 {
+		t.Fatalf("buildDesiredState call count = %d, want 2 after stable patrol reuse", buildCalls)
+	}
+	if got := third.result.PoolDesiredCounts[template]; got != 1 {
+		t.Fatalf("cached PoolDesiredCounts[%s] = %d, want 1", template, got)
+	}
 }
 
 func TestCityRuntimeEnsureManagedDoltPublishedForTickCallsHealthWhenManagedPortMissing(t *testing.T) {
@@ -1050,8 +1118,12 @@ func TestCityRuntimeTickPreflightsManagedDoltBeforeSessionSnapshot(t *testing.T)
 	}
 }
 
-func TestCityRuntimeTickPreflightsManagedDoltBeforeDueOrderDispatch(t *testing.T) {
+// Order dispatch moved off the tick onto the orders lane; the lane pass keeps
+// the tick's ordering: managed-Dolt preflight before any order store read or
+// tracking write.
+func TestOrdersLanePassPreflightsManagedDoltBeforeDueOrderDispatch(t *testing.T) {
 	disableManagedDoltRecoveryForTest(t)
+	t.Setenv(fsPressureThresholdEnv, "100")
 	t.Setenv("GC_BEADS", "bd")
 
 	cityPath := t.TempDir()
@@ -1093,10 +1165,7 @@ func TestCityRuntimeTickPreflightsManagedDoltBeforeDueOrderDispatch(t *testing.T
 	cs.cityBeadStore = store
 	cr.setControllerState(cs)
 
-	dirty := &atomic.Bool{}
-	lastProviderName := ""
-	prevPoolRunning := map[string]bool{}
-	cr.tick(context.Background(), dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
+	cr.runOrdersLanePass(context.Background(), cr.cityPath, ordersLaneReasonCadence)
 
 	preflightIndex := orderEvents.index("preflight")
 	orderListIndex := orderEvents.index("order-list")
@@ -1541,37 +1610,22 @@ func (b *blockingOrderDispatcher) drainContextErrors() []error {
 	return append([]error(nil), b.ctxErrs...)
 }
 
-func TestCityRuntimeTickDispatchesOrdersBeforeDemandSnapshot(t *testing.T) {
-	store := beads.NewMemStore()
-	od := &recordingOrderDispatcher{}
-	cr := &CityRuntime{
-		cityName:            "test-city",
-		cityPath:            t.TempDir(),
-		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
-		sp:                  runtime.NewFake(),
-		standaloneCityStore: store,
-		od:                  od,
-		stdout:              io.Discard,
-		stderr:              io.Discard,
-	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
-		if !od.called.Load() {
-			t.Fatal("order dispatch should happen before demand snapshot build")
-		}
-		return DesiredStateResult{State: map[string]TemplateParams{}}
-	}
-
-	var dirty atomic.Bool
-	var lastProviderName string
-	var prevPoolRunning map[string]bool
-	cr.tick(context.Background(), &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
-
-	if !od.called.Load() {
-		t.Fatal("order dispatcher was not called")
-	}
-}
-
-func TestCityRuntimePatrolReconcilesGraphStepClosedAfterWatcherStartup(t *testing.T) {
+// TestCityRuntimeSweepReconcilesGraphStepClosedWithNoEvent pins the completion
+// lane's two halves against the failure they exist for.
+//
+// A graph store emits no bead.closed by design, and a controller can crash
+// between the durable step close and the best-effort journal append — so a
+// closed step can exist that NOTHING in the journal names. The tick's delta pass
+// is correct to emit nothing for it: it cannot know. The convergence sweep must
+// repair it, exactly once, and say nothing on the next pass.
+//
+// This replaces the pre-lane contract, which was "a poke tick reconciles nothing
+// and a patrol tick reconciles everything". Trigger-name gating is not a
+// cadence: under overload every surviving ticker fire IS a patrol trigger, so
+// that gate ran the whole-corpus walk on every tick and cost 72.4s of it
+// (ga-l7jdg). What replaces it is explicit cadence state, and the assertions
+// below are the same facts asked of the lane that now owns them.
+func TestCityRuntimeSweepReconcilesGraphStepClosedWithNoEvent(t *testing.T) {
 	backing := beads.NewMemStore()
 	root, err := backing.Create(beads.Bead{ID: "gcg-run", Metadata: map[string]string{
 		beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
@@ -1602,12 +1656,16 @@ func TestCityRuntimePatrolReconcilesGraphStepClosedAfterWatcherStartup(t *testin
 	if err := backing.Close(step.ID); err != nil {
 		t.Fatal(err)
 	}
-	completed, err := ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
-	if err != nil {
-		t.Fatal(err)
+	completedFacts := func() []events.Event {
+		t.Helper()
+		got, listErr := ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		return got
 	}
-	if len(completed) != 0 {
-		t.Fatalf("completed events before patrol = %#v, want none without bead.closed", completed)
+	if got := completedFacts(); len(got) != 0 {
+		t.Fatalf("completed events before any pass = %#v, want none without bead.closed", got)
 	}
 
 	cr := &CityRuntime{
@@ -1625,48 +1683,56 @@ func TestCityRuntimePatrolReconcilesGraphStepClosedAfterWatcherStartup(t *testin
 	var dirty atomic.Bool
 	var lastProviderName string
 	var prevPoolRunning map[string]bool
-	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "poke")
-	completed, err = ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(completed) != 0 {
-		t.Fatalf("completed events after poke = %#v, want no global reconciliation outside patrol", completed)
+
+	// No journal event names this root, so no tick repairs it — on any trigger.
+	// This is the delta lane being honestly delta, and it is what makes the
+	// sweep non-optional rather than redundant.
+	for _, trigger := range []string{"poke", "patrol"} {
+		cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, trigger)
+		if got := completedFacts(); len(got) != 0 {
+			t.Fatalf("completed events after a %s tick = %#v, want none: no event named this root", trigger, got)
+		}
 	}
 
-	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
-
-	completed, err = ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
-	if err != nil {
-		t.Fatal(err)
+	// The sweep repairs it, exactly once.
+	lane := cr.completionsLaneOf()
+	backstop := &executionevent.CompletionBackstop{}
+	if result := cr.runCompletionsSweepChunk(backstop, lane, backstopReasonCadence); result.Emitted != 1 || !result.SweepComplete {
+		t.Fatalf("sweep chunk = %+v, want one fact and a complete traversal", result)
 	}
+	completed := completedFacts()
 	if len(completed) != 1 {
-		t.Fatalf("completed events after patrol = %#v, want one", completed)
+		t.Fatalf("completed events after the sweep = %#v, want one", completed)
 	}
 	if got := completed[0]; got.RunID != root.ID || got.SessionID != "gcs-session" || got.StepID != "build" {
 		t.Fatalf("completed event = %#v", got)
 	}
 
-	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
-	completed, err = ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
-	if err != nil {
-		t.Fatal(err)
+	if result := cr.runCompletionsSweepChunk(backstop, lane, backstopReasonCadence); result.Emitted != 0 {
+		t.Fatalf("second sweep chunk = %+v, want no new facts", result)
 	}
-	if len(completed) != 1 {
-		t.Fatalf("completed events after second patrol = %#v, want exact-fact no-op", completed)
+	if got := completedFacts(); len(got) != 1 {
+		t.Fatalf("completed events after a second sweep = %#v, want exact-fact no-op", got)
+	}
+
+	// And the delta lane agrees: a tick that DOES name the root emits nothing
+	// further. Without this row, "the tick emits nothing" above would be
+	// satisfied by a delta lane that is wired to nothing at all.
+	lane.observe(events.Event{Type: events.ExecutionStepCompleted, RunID: root.ID})
+	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
+	if got := completedFacts(); len(got) != 1 {
+		t.Fatalf("completed events after a tick that named the root = %#v, want the one fact", got)
 	}
 }
 
 func TestCityRuntimeTickReturnsBeforeDemandWhenCanceled(t *testing.T) {
 	store := beads.NewMemStore()
-	od := &recordingOrderDispatcher{}
 	cr := &CityRuntime{
 		cityName:            "test-city",
 		cityPath:            t.TempDir(),
 		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
 		sp:                  runtime.NewFake(),
 		standaloneCityStore: store,
-		od:                  od,
 		stdout:              io.Discard,
 		stderr:              io.Discard,
 	}
@@ -1683,41 +1749,10 @@ func TestCityRuntimeTickReturnsBeforeDemandWhenCanceled(t *testing.T) {
 	var prevPoolRunning map[string]bool
 	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
 
-	if od.called.Load() {
-		t.Fatal("order dispatcher should not run after city context is canceled")
-	}
-}
-
-func TestCityRuntimeTickReturnsBeforeDemandWhenCanceledDuringOrderDispatch(t *testing.T) {
-	store := beads.NewMemStore()
-	ctx, cancel := context.WithCancel(context.Background())
-	od := &recordingOrderDispatcher{
-		onDispatch: func(context.Context, string, time.Time) {
-			cancel()
-		},
-	}
-	cr := &CityRuntime{
-		cityName:            "test-city",
-		cityPath:            t.TempDir(),
-		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
-		sp:                  runtime.NewFake(),
-		standaloneCityStore: store,
-		od:                  od,
-		stdout:              io.Discard,
-		stderr:              io.Discard,
-	}
-	cr.buildFnWithSessionBeads = func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
-		t.Fatal("demand snapshot should not run after order dispatch cancels the city context")
-		return DesiredStateResult{State: map[string]TemplateParams{}}
-	}
-
-	var dirty atomic.Bool
-	var lastProviderName string
-	var prevPoolRunning map[string]bool
-	cr.tick(ctx, &dirty, &lastProviderName, cr.cityPath, &prevPoolRunning, "patrol")
-
-	if !od.called.Load() {
-		t.Fatal("order dispatcher was not called")
+	// The tick no longer dispatches orders itself; a canceled tick must not
+	// hand the orders lane a pass either.
+	if n := len(cr.ordersLaneOf().wakeCh); n != 0 {
+		t.Fatalf("pending orders-lane wakes after a canceled tick = %d, want 0", n)
 	}
 }
 
@@ -1872,7 +1907,7 @@ func TestOrderTrackingSweepWatchdogClosesAllStaleTracking(t *testing.T) {
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingSweepWatchdog(time.Now().Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+	cr.runOrderTrackingSweepWatchdog(cr.cfg, time.Now().Add(orderTrackingSweepWatchdogStaleAfter+time.Second))
 
 	gotSweep, err := store.Get(sweepTracking.ID)
 	if err != nil {
@@ -1913,7 +1948,7 @@ func TestOrderTrackingSweepWatchdogUsesCloseBudget(t *testing.T) {
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingSweepWatchdog(time.Now().Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+	cr.runOrderTrackingSweepWatchdog(cr.cfg, time.Now().Add(orderTrackingSweepWatchdogStaleAfter+time.Second))
 
 	closed := 0
 	for _, id := range ids {
@@ -1957,7 +1992,7 @@ func TestOrderTrackingSweepWatchdogAllowsSweepOrderToCleanStaleTracking(t *testi
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingSweepWatchdog(sweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+	cr.runOrderTrackingSweepWatchdog(cr.cfg, sweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter+time.Second))
 
 	if got, err := store.Get(sweepTracking.ID); err != nil {
 		t.Fatalf("Get(sweep): %v", err)
@@ -2058,7 +2093,7 @@ func TestOrderTrackingSweepWatchdogClosesRigStoreSweepTracking(t *testing.T) {
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingSweepWatchdog(rigSweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter + time.Millisecond))
+	cr.runOrderTrackingSweepWatchdog(cr.cfg, rigSweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter+time.Millisecond))
 
 	gotRig, err := rigStore.Get(rigSweepTracking.ID)
 	if err != nil {
@@ -2133,7 +2168,7 @@ func TestOrderTrackingSweepWatchdogFallsBackToConfiguredRigStore(t *testing.T) {
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingSweepWatchdog(rigSweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter + time.Millisecond))
+	cr.runOrderTrackingSweepWatchdog(cr.cfg, rigSweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter+time.Millisecond))
 
 	gotRig, err := rigStore.Get(rigSweepTracking.ID)
 	if err != nil {
@@ -2427,6 +2462,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsCreatingState(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2480,6 +2516,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsRecentlyCreated(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2528,6 +2565,7 @@ func TestSweepUndesiredPoolSessionBeads_SweepsStaleCreatingState(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2569,6 +2607,7 @@ func TestSweepUndesiredPoolSessionBeads_SweepsLongStuckActiveWithoutWake(t *test
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2608,6 +2647,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsRecentCreationCompleteAfterWakeReco
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2649,6 +2689,7 @@ func TestSweepUndesiredPoolSessionBeads_SweepsActiveWithoutCreationCompleteAt(t 
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2696,6 +2737,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsAwakeStateInPreWakeWindow(t *testin
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2745,6 +2787,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsRecoveredActiveBead(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2796,6 +2839,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsFreshRestartAfterPriorCrash(t *test
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2842,6 +2886,7 @@ func TestSweepUndesiredPoolSessionBeads_SweepsCrashedActiveBead(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2878,6 +2923,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsPendingCreateClaim(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2928,6 +2974,7 @@ func TestSweepUndesiredPoolSessionBeads_SweepsExpiredPendingCreateClaimLease(t *
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -2967,6 +3014,7 @@ func TestSweepUndesiredPoolSessionBeads_UsesPendingCreateStartedAtForCreatingSta
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -3018,6 +3066,7 @@ func TestSweepUndesiredPoolSessionBeads_ClosesStoppedSessions(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -3076,6 +3125,7 @@ func TestSweepUndesiredPoolSessionBeads_ClosesMissingOrStaleSessionName(t *testi
 			}
 
 			closed := sweepUndesiredPoolSessionBeads(
+				"",
 				beads.SessionStore{Store: store},
 				nil,
 				newSessionBeadSnapshot([]beads.Bead{bead}),
@@ -3122,6 +3172,7 @@ func TestSweepUndesiredPoolSessionBeads_KeepsAssignedSessionsOpen(t *testing.T) 
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -3165,6 +3216,7 @@ func TestSweepUndesiredPoolSessionBeads_SkipsPartialAssignedSnapshot(t *testing.
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{bead})
 
 	closed := sweepUndesiredPoolSessionBeads(
+		"",
 		beads.SessionStore{Store: store},
 		nil,
 		sessionBeads,
@@ -3273,7 +3325,12 @@ func TestCityRuntimeBeadReconcileTick_TransientStoreQueryPartialKeepsRunningPool
 // call-site un-gate this was skipped whenever CanReportActivity was true,
 // leaving tmux warm slots with no wake path. The marker is pre-seeded past the
 // grace window so a single tick nudges (attempt count 0 -> 1).
-func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeRunsForReportActivityRuntime(t *testing.T) {
+//
+// This test guards both regressions at once: the call-site un-gate above (the
+// CanReportActivity precondition and the attempt count 0 -> 1 assertion), and
+// the blank-nudge fallback delivery — the agent configures a whitespace-only
+// nudge, so the single delivered Nudge must carry defaultPoolClaimNudge.
+func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeFallsBackForBlankNudgeOnReportActivityRuntime(t *testing.T) {
 	sp := runtime.NewFake()
 	if !sp.Capabilities().CanReportActivity {
 		t.Fatal("precondition: fake runtime must report activity for this un-gate test to be meaningful")
@@ -3312,7 +3369,7 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeRunsForReportActivityRuntime
 	cr := &CityRuntime{
 		cityPath:            t.TempDir(),
 		cityName:            "maintainer-city",
-		cfg:                 &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(5), Nudge: "Run gc hook --claim --json now."}}},
+		cfg:                 &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(5), Nudge: " \t "}}},
 		sp:                  sp,
 		standaloneCityStore: store,
 		sessionDrains:       newDrainTracker(),
@@ -3342,6 +3399,19 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeRunsForReportActivityRuntime
 	if c := got.Metadata[idleClaimNudgeCountKey]; c != "1" {
 		t.Fatalf("idle-claim nudge did not fire for a report-activity runtime: attempt count = %q, want 1", c)
 	}
+	var nudges []runtime.Call
+	for _, call := range sp.SnapshotCalls() {
+		if call.Method == "Nudge" {
+			nudges = append(nudges, call)
+		}
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("runtime Nudge calls = %#v, want exactly one fallback delivery", nudges)
+	}
+	if got, want := nudges[0].Message, defaultPoolClaimNudge; got != want {
+		t.Fatalf("fallback nudge payload = %q, want %q", got, want)
+	}
+	t.Logf("controller recovery delivered %q to running pool session %q; persisted attempt=%s", nudges[0].Message, nudges[0].Name, got.Metadata[idleClaimNudgeCountKey])
 }
 
 // A warm pool slot can finish its startup turn before work is routed. When the
@@ -3805,7 +3875,7 @@ func (f fixedWispGC) shouldRun(time.Time) bool {
 	return true
 }
 
-func (f fixedWispGC) runGC(beads.GraphStore, beads.MailStore, time.Time) (int, error) {
+func (f fixedWispGC) runGC(beads.GraphStore, beads.SessionStore, beads.MailStore, time.Time) (int, error) {
 	return f.purged, f.err
 }
 
@@ -3974,6 +4044,11 @@ func TestCityRuntimeTick_RefreshesManualSessionOverlayAfterSync(t *testing.T) {
 			Name:     "my-city",
 			Provider: "claude",
 		},
+		// ga-hgjlhi: waitForAsyncStarts budgets cfg.Daemon.ShutdownTimeoutDuration(),
+		// which falls back to a 5s production default. The drain added below costs
+		// ~4s of real staleKeyDetectDelay waits, so an inherited 5s leaves ~1s of
+		// headroom on 12-way-shard CI. Match the trace fixtures' explicit 30s.
+		Daemon: config.DaemonConfig{ShutdownTimeout: "30s"},
 		Providers: map[string]config.ProviderSpec{
 			"claude": {
 				Command:    "echo",
@@ -4026,6 +4101,17 @@ func TestCityRuntimeTick_RefreshesManualSessionOverlayAfterSync(t *testing.T) {
 	var lastProviderName string
 	dirty := &atomic.Bool{}
 	cr.tick(context.Background(), dirty, &lastProviderName, cityPath, &prevPoolRunning, "test")
+	// tick() enqueues the async start wave and returns without waiting for it:
+	// enqueuePreparedStartWaveForCity spawns a goroutine per candidate and
+	// reports TraceOutcomeStartEnqueued immediately. That goroutine goes on to
+	// write cityPath/.gc/events.jsonl a few hundred microseconds later, which
+	// races t.TempDir()'s os.RemoveAll and fails the test with
+	// "TempDir RemoveAll cleanup: ... /.gc: directory not empty" even though
+	// every assertion below passed. Drain the wave first, exactly as the
+	// recovery-tick loop further down this file does (ga-9qs5gk).
+	if !cr.waitForAsyncStarts() {
+		t.Fatal("async session starts did not settle after tick")
+	}
 
 	if !mutated {
 		t.Fatal("test setup did not mutate the manual session bead between build and reconcile")
@@ -4299,13 +4385,21 @@ func TestControlDispatcherTickRepairsRigRouteAndRestartsRuntimeMissingDispatcher
 	// materializing its replacement, so allow its bounded multi-tick convergence
 	// path without relying on the targeted dispatcher signal. Wait after each
 	// pass so the next tick observes committed async-start state instead of racing
-	// four reconciles ahead of their completion.
+	// several reconciles ahead of their completion.
+	//
+	// The replacement's runtime name is the dead session's name — it is derived
+	// from the dispatcher identity, not from a bead ID (ga-vcjr9) — so the retire
+	// must commit before the create can claim it, and the create before the
+	// start. The main ticks drive retire + re-materialize; the targeted
+	// dispatcher signal then starts the replacement the same way it started the
+	// original above.
 	for tick := range 4 {
 		runMainTick()
 		if !cr.waitForAsyncStarts() {
 			t.Fatalf("replacement async starts did not settle after recovery tick %d", tick+1)
 		}
 	}
+	cr.controlDispatcherTick(context.Background())
 	recoveryDeadline := time.NewTimer(testutil.GoroutineRaceTimeout)
 	recoveryTicker := time.NewTicker(10 * time.Millisecond)
 	defer recoveryDeadline.Stop()
@@ -5074,7 +5168,7 @@ func TestCityRuntimeReloadRetainsTimedOutDispatcherForShutdownDrain(t *testing.T
 		configName: "test-city",
 	}
 
-	writeCityRuntimeConfigWithShutdownTimeout(t, tomlPath, "fake", "1s")
+	writeCityRuntimeConfigWithOneSecondShutdownTimeout(t, tomlPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	lastProviderName := "fake"
@@ -5123,7 +5217,7 @@ func TestCityRuntimeReloadDrainShortCircuitsOnTickContextCancel(t *testing.T) {
 		configName: "test-city",
 	}
 
-	writeCityRuntimeConfigWithShutdownTimeout(t, tomlPath, "fake", "1s")
+	writeCityRuntimeConfigWithOneSecondShutdownTimeout(t, tomlPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	lastProviderName := "fake"
@@ -5178,7 +5272,7 @@ func TestCityRuntimeReloadDrainBoundedByTimeout(t *testing.T) {
 		configName: "test-city",
 	}
 
-	writeCityRuntimeConfigWithShutdownTimeout(t, tomlPath, "fake", "1s")
+	writeCityRuntimeConfigWithOneSecondShutdownTimeout(t, tomlPath)
 	lastProviderName := "fake"
 	start := time.Now()
 	cr.reloadConfig(context.Background(), &lastProviderName, cityPath)
@@ -5365,15 +5459,6 @@ func TestCityRuntimeManualHardReloadRepliesBeforeDispatch(t *testing.T) {
 	sp := runtime.NewFake()
 	var stdout bytes.Buffer
 
-	// recordingOrderDispatcher is a pure in-process fake (no order subprocesses),
-	// so it carries none of the tempdir-cleanup races the real dispatcher would.
-	od := &recordingOrderDispatcher{
-		onDispatch: func(context.Context, string, time.Time) {
-			if len(doneCh) == 0 {
-				t.Error("dispatchOrders ran before the manual hard-reload reply was sent (#3206)")
-			}
-		},
-	}
 	cr := newTestCityRuntime(t, CityRuntimeParams{
 		CityPath:    cityPath,
 		CityName:    "test-city",
@@ -5393,15 +5478,16 @@ func TestCityRuntimeManualHardReloadRepliesBeforeDispatch(t *testing.T) {
 		Stdout: &stdout,
 		Stderr: io.Discard,
 	})
-	cr.od = od
 	cr.activeReload = &reloadRequest{doneCh: doneCh} // hard reload (soft=false)
 	lastProviderName := "fake"
 	var prevPoolRunning map[string]bool
 
 	cr.tick(context.Background(), dirty, &lastProviderName, cityPath, &prevPoolRunning, "poke")
 
-	if !od.called.Load() {
-		t.Fatal("order dispatcher was not called")
+	// Order dispatch runs on its own lane, so it cannot delay the reply at
+	// all; the tick only wakes the lane, after it has replied.
+	if n := len(cr.ordersLaneOf().wakeCh); n != 1 {
+		t.Fatalf("pending orders-lane wakes after the tick = %d, want 1", n)
 	}
 	select {
 	case reply := <-doneCh:
@@ -6696,11 +6782,11 @@ func writeCityRuntimeConfigNamed(t *testing.T, tomlPath, name, provider string) 
 	}
 }
 
-func writeCityRuntimeConfigWithShutdownTimeout(t *testing.T, tomlPath, provider, timeout string) {
+func writeCityRuntimeConfigWithOneSecondShutdownTimeout(t *testing.T, tomlPath string) {
 	t.Helper()
 	clearInheritedBeadsEnv(t)
 	requireNoLeakedDoltAfterForPaths(t, filepath.Dir(tomlPath))
-	data := []byte("[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"" + provider + "\"\n\n[daemon]\nshutdown_timeout = \"" + timeout + "\"\n")
+	data := []byte("[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"fake\"\n\n[daemon]\nshutdown_timeout = \"1s\"\n")
 	if err := os.WriteFile(tomlPath, data, 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -7112,7 +7198,7 @@ func TestOrderTrackingRetentionWatchdog_SkipsWhenIntervalNotElapsed(t *testing.T
 		// Set last to now-1s: interval has not elapsed.
 		orderTrackingRetentionWatchdogLast: now.Add(-time.Second),
 	}
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 
 	// Bead skip-00 should still exist (watchdog skipped).
 	if _, err := store.Get("skip-00"); err != nil {
@@ -7145,7 +7231,7 @@ func TestOrderTrackingRetentionWatchdog_PrunesEligibleBeads(t *testing.T) {
 		logPrefix:           "gc test",
 		// Zero last: watchdog fires immediately.
 	}
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 
 	// 2 oldest beads (prune-00, prune-01) should be deleted.
 	for _, id := range []string{"prune-00", "prune-01"} {
@@ -7187,7 +7273,7 @@ func TestOrderTrackingRetentionWatchdog_LogsPrunedCount(t *testing.T) {
 		stderr:              &stderrBuf,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 
 	got := stderrBuf.String()
 	if !strings.Contains(got, "pruned") {
@@ -7198,17 +7284,19 @@ func TestOrderTrackingRetentionWatchdog_LogsPrunedCount(t *testing.T) {
 	}
 }
 
-func TestOrderTrackingRetentionWatchdog_NilCfgSkipsWithoutPanic(_ *testing.T) {
+func TestOrderTrackingRetentionWatchdog_NilCfgSkipsWithoutPanic(t *testing.T) {
+	requireNoLeakedDoltAfterForPaths(t, repoRootForLint(t))
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 	cr := &CityRuntime{
-		cityName:  "test-city",
-		cfg:       nil, // nil cfg: watchdog must not panic
-		stdout:    io.Discard,
-		stderr:    io.Discard,
-		logPrefix: "gc test",
+		cityName:            "test-city",
+		cfg:                 nil, // nil cfg: watchdog must not panic
+		standaloneCityStore: beads.NewMemStore(),
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
 	}
 	// Must not panic.
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 }
 
 func TestOrderTrackingRetentionWatchdog_StampsLastAfterFiring(t *testing.T) {
@@ -7222,14 +7310,14 @@ func TestOrderTrackingRetentionWatchdog_StampsLastAfterFiring(t *testing.T) {
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 
 	if !cr.orderTrackingRetentionWatchdogLast.Equal(now) {
 		t.Fatalf("orderTrackingRetentionWatchdogLast = %v, want %v", cr.orderTrackingRetentionWatchdogLast, now)
 	}
 	// Second call within the interval must not update the timestamp.
 	later := now.Add(time.Minute)
-	cr.runOrderTrackingRetentionWatchdog(later)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, later)
 	if !cr.orderTrackingRetentionWatchdogLast.Equal(now) {
 		t.Fatalf("orderTrackingRetentionWatchdogLast = %v, want unchanged %v", cr.orderTrackingRetentionWatchdogLast, now)
 	}
@@ -7284,7 +7372,7 @@ func TestOrderTrackingRetentionWatchdog_SkipsBulkDeleteWhenBackupStale(t *testin
 	// 48h since the last backup, past the 24h bulkDeleteMaxAge default.
 	cr, store, stderrBuf := seedRetentionWatchdogCity(t, now, 48*time.Hour)
 
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 
 	// Nothing may be deleted while the recovery point is stale.
 	for i := range minClosedOrderTrackingRetained + 2 {
@@ -7308,7 +7396,7 @@ func TestOrderTrackingRetentionWatchdog_PrunesWhenBackupFresh(t *testing.T) {
 	// 1h since the last backup, well inside the 24h bulkDeleteMaxAge default.
 	cr, store, stderrBuf := seedRetentionWatchdogCity(t, now, time.Hour)
 
-	cr.runOrderTrackingRetentionWatchdog(now)
+	cr.runOrderTrackingRetentionWatchdog(cr.cfg, now)
 
 	if got := stderrBuf.String(); strings.Contains(got, "skipping bulk delete") {
 		t.Fatalf("stderr = %q, want no skip with a fresh backup", got)
@@ -7415,5 +7503,156 @@ func TestWarnIfClosedOrderTrackingBacklogLarge_CountsStoresTogether(t *testing.T
 	}
 	if strings.Count(got, "gc start:") != 1 {
 		t.Fatalf("warning = %q, want one advisory line for the city", got)
+	}
+}
+
+// TestNewCityRuntimeWiresAssignedWorkDeferTracker pins the assigned-work defer
+// tracker into the runtime's construction, not merely into the option that
+// consumes it. The tracker is the same-bead backstop the idle-kill ladder
+// consults; its behavior tests all drive withAssignedWorkDeferTracker directly,
+// so dropping cr.adt from newCityRuntime leaves every one of them green while
+// the backstop is dead in production. That has happened once already, during a
+// branch split, and only the unused-symbol linter noticed, because the builder
+// happened to lose its last caller at the same time. Losing just the
+// construction call would be silent.
+func TestNewCityRuntimeWiresAssignedWorkDeferTracker(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+
+	if cr.adt == nil {
+		t.Fatal("newCityRuntime left adt nil: the idle-kill same-bead defer backstop is not wired")
+	}
+
+	// Construction alone is not the whole wiring: the tracker also has to be
+	// HANDED to the reconcile pass. Applying the option here would only prove
+	// the option works, which no one doubts, and would stay green with the
+	// production call deleted. So pin the production call site, the way this
+	// package already pins call sites (TestGCNonTestFilesStayOnWorkerBoundary).
+	//
+	// Pin it through the PARSER rather than a substring search. A text search
+	// cannot tell code from a comment, so commenting the argument out would
+	// leave the backstop dead in production with this test still green; the
+	// parser only ever sees the call if the compiler does too.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "city_runtime.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse city_runtime.go: %v", err)
+	}
+	handed := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "withAssignedWorkDeferTracker" || len(call.Args) != 1 {
+			return true
+		}
+		sel, ok := call.Args[0].(*ast.SelectorExpr)
+		if ok && sel.Sel != nil && sel.Sel.Name == "adt" {
+			handed = true
+			return false
+		}
+		return true
+	})
+	if !handed {
+		t.Fatal("city_runtime.go no longer hands the constructed tracker to the reconcile pass: the backstop is dead in production while every behavior test that drives the option directly stays green")
+	}
+}
+
+// TestCityRuntimeWiresSessionEventPumpCallSites pins the two production call
+// sites that wire cr.sessionEvents: construction plus the initial subscribe
+// in run(), and the re-point in reloadConfigTraced() when the provider
+// changes. Every pump behavior test in session_event_pump_test.go constructs
+// a sessionEventPump directly and never drives CityRuntime.run or a reload,
+// so deleting either wiring line would leave those tests green while the
+// event-driven poke is dead in production (the same hazard
+// TestNewCityRuntimeWiresAssignedWorkDeferTracker pins for cr.adt).
+//
+// Pin it through the PARSER rather than a substring search: a text search
+// cannot tell code from a comment, so commenting a line out would leave the
+// backstop dead in production with this test still green.
+func TestCityRuntimeWiresSessionEventPumpCallSites(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "city_runtime.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse city_runtime.go: %v", err)
+	}
+
+	constructed := false // cr.sessionEvents = newSessionEventPump(...)
+	restarted := false   // cr.sessionEvents.restart(cr.sp) in run()
+	repointed := false   // cr.sessionEvents.restart(nextSp) in reloadConfigTraced()
+
+	isSessionEventsSelector := func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok || sel.Sel == nil || sel.Sel.Name != "sessionEvents" {
+			return false
+		}
+		recv, ok := sel.X.(*ast.Ident)
+		return ok && recv.Name == "cr"
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if len(node.Lhs) == 1 && len(node.Rhs) == 1 && isSessionEventsSelector(node.Lhs[0]) {
+				if call, ok := node.Rhs[0].(*ast.CallExpr); ok {
+					if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "newSessionEventPump" {
+						constructed = true
+					}
+				}
+			}
+		case *ast.CallExpr:
+			sel, ok := node.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel == nil || sel.Sel.Name != "restart" || len(node.Args) != 1 {
+				return true
+			}
+			if !isSessionEventsSelector(sel.X) {
+				return true
+			}
+			switch arg := node.Args[0].(type) {
+			case *ast.SelectorExpr:
+				if arg.Sel != nil && arg.Sel.Name == "sp" {
+					restarted = true
+				}
+			case *ast.Ident:
+				if arg.Name == "nextSp" {
+					repointed = true
+				}
+			}
+		}
+		return true
+	})
+
+	if !constructed {
+		t.Fatal("city_runtime.go no longer constructs cr.sessionEvents via newSessionEventPump: the event-driven reconcile poke is dead in production")
+	}
+	if !restarted {
+		t.Fatal("city_runtime.go no longer calls cr.sessionEvents.restart(cr.sp) in run(): startup never subscribes to the provider's session-event stream")
+	}
+	if !repointed {
+		t.Fatal("city_runtime.go no longer calls cr.sessionEvents.restart(nextSp) on provider change: a reload leaves the pump subscribed to the stale provider")
 	}
 }

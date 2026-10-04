@@ -21,10 +21,13 @@ var (
 	_ runtime.Provider                      = (*Provider)(nil)
 	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
 	_ runtime.InteractionProvider           = (*Provider)(nil)
+	_ runtime.IdleSnapshotProvider          = (*Provider)(nil)
 	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
 	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
 	_ runtime.RelaunchProvider              = (*Provider)(nil)
 	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.LivenessObserverWithError     = (*Provider)(nil)
+	_ runtime.SessionEventProvider          = (*Provider)(nil)
 )
 
 // New creates a hybrid provider. isRemote returns true for sessions
@@ -93,6 +96,12 @@ func (p *Provider) ObserveLiveness(name string, processNames []string) runtime.L
 	return runtime.ObserveLiveness(p.route(name), name, processNames)
 }
 
+// ObserveLivenessWithError forwards the optional error-bearing observation to
+// the selected backend without collapsing uncertainty into false.
+func (p *Provider) ObserveLivenessWithError(name string, processNames []string) (runtime.Liveness, error) {
+	return runtime.ObserveLivenessWithError(p.route(name), name, processNames)
+}
+
 // Nudge delegates to the routed backend.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	return p.route(name).Nudge(name, content)
@@ -105,6 +114,18 @@ func (p *Provider) WaitForIdle(ctx context.Context, name string, timeout time.Du
 		return wp.WaitForIdle(ctx, name, timeout)
 	}
 	return runtime.ErrInteractionUnsupported
+}
+
+// SnapshotIdle delegates to the routed backend when it can take a
+// point-in-time idle observation. Like WaitForIdle this must be forwarded
+// explicitly: this Provider enumerates the optional interfaces it supports
+// rather than embedding a backend, so a local tmux session would otherwise
+// lose SnapshotIdle for every session in a local/remote split city.
+func (p *Provider) SnapshotIdle(name string) (bool, error) {
+	if sp, ok := p.route(name).(runtime.IdleSnapshotProvider); ok {
+		return sp.SnapshotIdle(name)
+	}
+	return false, runtime.ErrInteractionUnsupported
 }
 
 // NudgeNow delegates to the routed backend when it supports immediate
@@ -220,12 +241,17 @@ func (p *Provider) RunLive(name string, cfg runtime.Config) error {
 
 // Capabilities returns the intersection of both backends' capabilities.
 // A capability is reported only if both local and remote support it.
+// NeedsClaimBackstop is a need, not an ability, so it unions instead: if
+// either backend requires the stalled-claim backstop, the composite does too.
 func (p *Provider) Capabilities() runtime.ProviderCapabilities {
 	lc := p.local.Capabilities()
 	rc := p.remote.Capabilities()
 	return runtime.ProviderCapabilities{
 		CanReportAttachment: lc.CanReportAttachment && rc.CanReportAttachment,
 		CanReportActivity:   lc.CanReportActivity && rc.CanReportActivity,
+		CanStream:           lc.CanStream && rc.CanStream,
+		CanAttachTTY:        lc.CanAttachTTY && rc.CanAttachTTY,
+		NeedsClaimBackstop:  lc.NeedsClaimBackstop || rc.NeedsClaimBackstop,
 	}
 }
 
@@ -235,4 +261,19 @@ func (p *Provider) SleepCapability(name string) runtime.SessionSleepCapability {
 		return scp.SleepCapability(name)
 	}
 	return runtime.SessionSleepCapabilityDisabled
+}
+
+// SubscribeSessionEvents forwards the session-event streams of the backends
+// that implement runtime.SessionEventProvider. Without this method,
+// wrapping an event-capable local backend behind hybrid for remote routing
+// would fail the runtime.SessionEventProvider type assertion in cmd/gc's
+// sessionEventPump.restart and silently drop the event-driven reconcile
+// poke. When both backends publish events, both streams are merged, so
+// neither backend's session deaths wait for the patrol scan; a nested
+// composite without an event-capable backend is skipped. See
+// runtime.SubscribeSessionEventSources.
+func (p *Provider) SubscribeSessionEvents(ctx context.Context) (<-chan runtime.SessionEvent, error) {
+	return runtime.SubscribeSessionEventSources(ctx,
+		runtime.SessionEventSource{Name: "local", Provider: p.local},
+		runtime.SessionEventSource{Name: "remote", Provider: p.remote})
 }
