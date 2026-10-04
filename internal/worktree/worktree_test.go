@@ -503,6 +503,129 @@ func TestEnsureManagedWorktreePersistsAndVerifiesProvenance(t *testing.T) {
 	}
 }
 
+func TestVerifyManagedWorktreeAcceptsDescendantsOfRecordedBase(t *testing.T) {
+	repo, base := initTestRepo(t)
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-test")
+	spec := managedSpec(repo, root, wt, "work/gc-test", base)
+	created, err := Ensure(spec)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	spec.BaseSHA = created.Provenance.BaseSHA
+
+	if err := os.WriteFile(filepath.Join(wt, "implementation.txt"), []byte("completed work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wt, "add", "implementation.txt")
+	runGit(t, wt, "commit", "-m", "implement after recorded input")
+	head := runGit(t, wt, "rev-parse", "HEAD")
+
+	verified, err := Verify(spec)
+	if err != nil {
+		t.Fatalf("Verify descendant: %v", err)
+	}
+	if verified.Head != head || verified.Provenance.BaseSHA != spec.BaseSHA {
+		t.Fatalf("verified head/base = %s/%s, want %s/%s",
+			verified.Head, verified.Provenance.BaseSHA, head, spec.BaseSHA)
+	}
+	reused, err := Ensure(spec)
+	if err != nil || reused.Created || reused.Head != head {
+		t.Fatalf("Ensure descendant = %+v, %v; want unchanged worktree at %s", reused, err, head)
+	}
+}
+
+// A reset must not let unchanged ownership metadata attest a lost input commit.
+func TestVerifyManagedWorktreeRejectsHeadMissingRecordedBase(t *testing.T) {
+	repo, base := initTestRepo(t)
+	beforeInput := runGit(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "input.txt"), []byte("required parent output\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "input.txt")
+	runGit(t, repo, "commit", "-m", "required parent output")
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-test")
+	spec := managedSpec(repo, root, wt, "work/gc-test", base)
+	created, err := Ensure(spec)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	spec.BaseSHA = created.Provenance.BaseSHA
+	runGit(t, wt, "reset", "--hard", beforeInput)
+	marker := filepath.Join(wt, "uncommitted.txt")
+	if err := os.WriteFile(marker, []byte("preserve work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	provenancePath, err := provenanceFilePath(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeProvenance, err := os.ReadFile(provenancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Verify(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
+		t.Errorf("Verify reset branch error = %v, want recorded base refusal", err)
+	}
+	if _, err := Ensure(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
+		t.Errorf("Ensure reset branch error = %v, want recorded base refusal", err)
+	}
+	dry := spec
+	dry.DryRun = true
+	if _, err := Ensure(dry); err == nil {
+		t.Error("dry-run accepted an existing worktree missing its recorded input")
+	}
+	if got := runGit(t, wt, "rev-parse", "HEAD"); got != beforeInput {
+		t.Errorf("refusal moved HEAD to %s, want %s", got, beforeInput)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserve work\n" {
+		t.Errorf("refusal changed work: data=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(provenancePath); err != nil || string(got) != string(beforeProvenance) {
+		t.Errorf("refusal changed durable provenance: err=%v", err)
+	}
+}
+
+// Provisioning must not bind a required parent SHA to an older existing branch.
+func TestEnsureManagedWorktreeRejectsExistingBranchMissingRecordedBase(t *testing.T) {
+	repo, base := initTestRepo(t)
+	staleHead := runGit(t, repo, "rev-parse", "HEAD")
+	runGit(t, repo, "branch", "work/gc-test", staleHead)
+	if err := os.WriteFile(filepath.Join(repo, "input.txt"), []byte("required parent output\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "input.txt")
+	runGit(t, repo, "commit", "-m", "required parent output")
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-test")
+	spec := managedSpec(repo, root, wt, "work/gc-test", base)
+	spec.BaseSHA = runGit(t, repo, "rev-parse", "HEAD")
+	beforeTree := strings.Join(snapshotTree(t, root), "\n")
+	beforeRegistration := runGit(t, repo, "worktree", "list", "--porcelain")
+	dry := spec
+	dry.DryRun = true
+	if _, err := Ensure(dry); err == nil || !strings.Contains(err.Error(), "recorded base") {
+		t.Errorf("dry-run stale branch error = %v, want recorded base refusal", err)
+	}
+	if got := strings.Join(snapshotTree(t, root), "\n"); got != beforeTree {
+		t.Error("dry-run refusal mutated the worktree root")
+	}
+	if _, err := Ensure(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
+		t.Errorf("Ensure stale branch error = %v, want recorded base refusal", err)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("refused workspace remains at %s: %v", wt, err)
+	}
+	if got := runGit(t, repo, "rev-parse", spec.Branch); got != staleHead {
+		t.Errorf("refusal changed preexisting branch from %s to %s", staleHead, got)
+	}
+	if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != beforeRegistration {
+		t.Error("refusal left a workspace registration")
+	}
+}
+
 func TestVerifyManagedWorktreeRejectsConflictingProvenanceAndPreservesWIP(t *testing.T) {
 	repo, base := initTestRepo(t)
 	root := t.TempDir()
