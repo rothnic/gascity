@@ -626,6 +626,106 @@ func TestEnsureManagedWorktreeRejectsExistingBranchMissingRecordedBase(t *testin
 	}
 }
 
+// A same-named tag must not decide whether the branch contains the required input.
+func TestEnsureManagedWorktreeUsesBranchWhenTagHasSameName(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		validBranch bool
+	}{
+		{name: "stale_branch_tag_at_required_base"},
+		{name: "valid_branch_tag_below_required_base", validBranch: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _ := initTestRepo(t)
+			beforeInput := runGit(t, repo, "rev-parse", "HEAD")
+			inputPath := filepath.Join(repo, "input.txt")
+			if err := os.WriteFile(inputPath, []byte("required parent output\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, repo, "add", "input.txt")
+			runGit(t, repo, "commit", "-m", "required parent output")
+			requiredBase := runGit(t, repo, "rev-parse", "HEAD")
+			branchHead, tagHead := beforeInput, requiredBase
+			if tt.validBranch {
+				branchHead, tagHead = requiredBase, beforeInput
+			}
+			const branch = "work/shadow"
+			runGit(t, repo, "branch", branch, branchHead)
+			runGit(t, repo, "tag", branch, tagHead)
+			const workInProgress = "uncommitted launcher edits\n"
+			if err := os.WriteFile(inputPath, []byte(workInProgress), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			beforeStatus := runGit(t, repo, "status", "--porcelain")
+			beforeRegistration := runGit(t, repo, "worktree", "list", "--porcelain")
+			root := t.TempDir()
+			wt := filepath.Join(root, "gc-test")
+			spec := managedSpec(repo, root, wt, branch, requiredBase)
+			spec.BaseSHA = requiredBase
+			beforeTree := strings.Join(snapshotTree(t, root), "\n")
+
+			dry := spec
+			dry.DryRun = true
+			planned, err := Ensure(dry)
+			if tt.validBranch {
+				if err != nil {
+					t.Errorf("dry-run refused valid branch because of its tag: %v", err)
+				} else if planned.Created || planned.BranchCreated || len(planned.Planned) == 0 ||
+					planned.Provenance == nil || planned.Provenance.BaseSHA != requiredBase {
+					t.Errorf("dry-run valid branch report = %+v, want a pure plan at %s", planned, requiredBase)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "recorded base") {
+				t.Errorf("dry-run stale branch error = %v, want recorded base refusal despite the tag", err)
+			}
+			if got := strings.Join(snapshotTree(t, root), "\n"); got != beforeTree {
+				t.Error("dry-run changed the workspace root")
+			}
+			if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != beforeRegistration {
+				t.Error("dry-run changed workspace registration")
+			}
+
+			created, err := Ensure(spec)
+			if tt.validBranch {
+				if err != nil {
+					t.Errorf("Ensure refused valid branch because of its tag: %v", err)
+				} else {
+					if !created.Created || created.BranchCreated || created.Head != branchHead {
+						t.Errorf("Ensure report = %+v, want attached preexisting branch at %s", created, branchHead)
+					}
+					if got := runGit(t, wt, "symbolic-ref", "HEAD"); got != "refs/heads/"+branch {
+						t.Errorf("workspace attached to %s, want refs/heads/%s", got, branch)
+					}
+					if _, err := Verify(spec); err != nil {
+						t.Errorf("Verify created branch: %v", err)
+					}
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), "recorded base") {
+					t.Errorf("Ensure stale branch error = %v, want recorded base refusal despite the tag", err)
+				}
+				if _, err := os.Stat(wt); !os.IsNotExist(err) {
+					t.Errorf("refused workspace remains at %s: %v", wt, err)
+				}
+				if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != beforeRegistration {
+					t.Error("refusal left a workspace registration")
+				}
+			}
+			if got := runGit(t, repo, "rev-parse", "refs/heads/"+branch); got != branchHead {
+				t.Errorf("branch moved from %s to %s", branchHead, got)
+			}
+			if got := runGit(t, repo, "rev-parse", "refs/tags/"+branch); got != tagHead {
+				t.Errorf("tag moved from %s to %s", tagHead, got)
+			}
+			if got, err := os.ReadFile(inputPath); err != nil || string(got) != workInProgress {
+				t.Errorf("source work changed: data=%q err=%v", got, err)
+			}
+			if got := runGit(t, repo, "status", "--porcelain"); got != beforeStatus {
+				t.Error("source index or worktree status changed")
+			}
+		})
+	}
+}
+
 func TestVerifyManagedWorktreeRejectsConflictingProvenanceAndPreservesWIP(t *testing.T) {
 	repo, base := initTestRepo(t)
 	root := t.TempDir()

@@ -78,7 +78,9 @@ For a managed workspace, existing Spec/Provenance fields remain authoritative:
 repository identity, direct-child configured root/path, branch, exact BaseSHA,
 bead/store, creator/owner, generation/lifecycle, and provisioning AttemptID.
 The branch HEAD must contain BaseSHA; legitimate descendant commits remain
-valid. Missing managed paths are creatable only through the existing transaction.
+valid. Existing-branch checks resolve the actual local refs/heads branch; a
+same-named tag cannot choose the branch input. Missing managed paths are creatable
+only through the existing transaction.
 An existing stale branch is refused before planning or creation. Verification
 of an already occupied invalid path must preserve the user's work.
 
