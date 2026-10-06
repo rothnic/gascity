@@ -39,9 +39,14 @@ var setupBazelBeadsDigests = map[string]string{
 func TestSetupBazelIsBeadsByteCopy(t *testing.T) {
 	root := repoRoot(t)
 	for name, want := range setupBazelBeadsDigests {
-		got := fmt.Sprintf("%x", sha256.Sum256([]byte(readFile(t, root, setupBazelDir+"/"+name))))
+		content := readFile(t, root, setupBazelDir+"/"+name)
+		if name == "action.yml" {
+			content = strings.Replace(content,
+				"      if: github.repository == 'gastownhall/gascity'\n", "", 1)
+		}
+		got := fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
 		if got != want {
-			t.Errorf("%s/%s sha256 %s, want %s (beads' copy): change beads' composite first, then copy it here", setupBazelDir, name, got, want)
+			t.Errorf("%s/%s sha256 %s, want %s (beads' copy after stripping the sole documented fork cache guard): change beads' composite first, then copy it here", setupBazelDir, name, got, want)
 		}
 	}
 	// bazel-test.yml still runs tools/rbe/fork-credential.sh.

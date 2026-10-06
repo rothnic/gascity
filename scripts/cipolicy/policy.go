@@ -99,12 +99,13 @@ const (
 	// acceptance_bd_contract tag and bd binary the preceding step already
 	// resolved onto PATH. No new job, trigger or permission.
 	//
-	// Bumped again (rbe-west plan R2 step 1): the runner-policy job's own
-	// runs-on drops its hard-coded login list for blacksmith-2vcpu-ubuntu-2404,
-	// matching runner_policy.py, which now selects Blacksmith for every event
-	// and author. Reviewed delta: that one runs-on value, no new job, step,
-	// trigger or permission.
-	expectedCIExecutionHash     = "63317c9e54304db88ef66aa35a70b9b09a7e0a34c5002ecab567b51ccc8c3026"
+	// Bumped for fork-safe runner selection: the policy bootstrap uses
+	// ubuntu-latest and passes RUNNER_REPOSITORY from github.repository so only
+	// the exact upstream repository selects donated Blacksmith capacity. The
+	// reviewed execution-shape delta is limited to that bootstrap runner and
+	// one env value; no provider execution fields, permissions, triggers or
+	// downstream job shapes changed.
+	expectedCIExecutionHash     = "f19b8d0a60f290e132b05e4751adaa2028ab09509d7dbb5c203ca4c347697df4"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
