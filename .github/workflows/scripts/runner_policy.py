@@ -6,8 +6,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
 ALLOWLIST_PATH = Path(".github/blacksmith-allowlist.txt")
+UPSTREAM_REPOSITORY = "gastownhall/gascity"
 
 BLACKSMITH_RUNNERS = {
     "runner_2vcpu": "blacksmith-2vcpu-ubuntu-2404",
@@ -43,18 +43,16 @@ def select_runners(
     author: str,
     allowlist: set[str],
     *,
+    repository: str = "",
     force_blacksmith: bool = False,
 ) -> tuple[bool, str, dict[str, str]]:
-    """Return whether to use Blacksmith, the reason, and runner labels.
-
-    Blacksmith for every event and author: Blacksmith donates compute to this
-    OSS repository, and GitHub-hosted jobs queue behind the organisation's
-    concurrent-job cap (fork and push jobs waited p90 4-9 minutes on
-    2026-10-02/03, Blacksmith jobs 7-9 seconds). The arguments stay for the
-    callers and tests; the allowlist no longer selects runners.
-    """
-    del event_name, author, allowlist, force_blacksmith
-    return True, "Blacksmith for every event (OSS repository)", BLACKSMITH_RUNNERS
+    """Return backend, explanation and runner labels for an explicit repository."""
+    del event_name, author, allowlist
+    if repository.strip().lower() != UPSTREAM_REPOSITORY:
+        return False, "GitHub-hosted runners for non-upstream repository", GITHUB_RUNNERS
+    if force_blacksmith:
+        return True, "Blacksmith explicitly forced for upstream repository", BLACKSMITH_RUNNERS
+    return True, "Blacksmith donated runners for upstream repository", BLACKSMITH_RUNNERS
 
 
 def append_outputs(use_blacksmith: bool, reason: str, runners: dict[str, str]) -> None:
@@ -85,11 +83,10 @@ def append_summary(use_blacksmith: bool, reason: str, event_name: str, author: s
 def main() -> None:
     event_name = os.environ["EVENT_NAME"]
     author = os.environ.get("PR_AUTHOR", "").strip()
+    repository = os.environ.get("RUNNER_REPOSITORY", "")
     force_blacksmith = os.environ.get("FORCE_BLACKSMITH", "").strip().lower() == "true"
     use_blacksmith, reason, runners = select_runners(
-        event_name,
-        author,
-        load_allowlist(),
+        event_name, author, load_allowlist(), repository=repository,
         force_blacksmith=force_blacksmith,
     )
     append_outputs(use_blacksmith, reason, runners)

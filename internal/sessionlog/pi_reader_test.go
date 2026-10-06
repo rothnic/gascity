@@ -481,15 +481,17 @@ func rewritePiFilePreservingSignature(t *testing.T, path string, write func()) {
 	}
 }
 
-func TestFindPiSessionFileByIDSkipsRereadWhenStatSignatureUnchanged(t *testing.T) {
+func TestFindPiSessionCandidatesInSkipsRereadWhenStatSignatureUnchanged(t *testing.T) {
 	root := t.TempDir()
 	workDir := filepath.Join(t.TempDir(), "project-aa")
 	otherDir := filepath.Join(filepath.Dir(workDir), "project-bb")
 	path := filepath.Join(root, "session.jsonl")
 	writePiSessionHeaderFile(t, path, workDir)
 
-	if got := FindPiSessionFileByID([]string{root}, workDir, "sess-1"); got != path {
-		t.Fatalf("FindPiSessionFileByID() = %q, want %q", got, path)
+	// Keep the cache working set local: default transcript discovery can exceed
+	// the bounded cache and evict this fixture between scans.
+	if got := findPiSessionCandidatesIn(root, cleanPiWorkDir(workDir)); len(got) != 1 || got[0].path != path || got[0].sessionID != "sess-1" {
+		t.Fatalf("findPiSessionCandidatesIn() = %#v, want %q with session ID sess-1", got, path)
 	}
 
 	// Rewrite the header to a different cwd of the same byte length and restore
@@ -499,8 +501,8 @@ func TestFindPiSessionFileByIDSkipsRereadWhenStatSignatureUnchanged(t *testing.T
 		writePiSessionHeaderFile(t, path, otherDir)
 	})
 
-	if got := FindPiSessionFileByID([]string{root}, workDir, "sess-1"); got != path {
-		t.Fatalf("FindPiSessionFileByID() after same-signature rewrite = %q, want cached %q", got, path)
+	if got := findPiSessionCandidatesIn(root, cleanPiWorkDir(workDir)); len(got) != 1 || got[0].path != path || got[0].sessionID != "sess-1" {
+		t.Fatalf("findPiSessionCandidatesIn() after same-signature rewrite = %#v, want cached %q with session ID sess-1", got, path)
 	}
 }
 
@@ -628,14 +630,14 @@ func TestFindPiSessionFileByIDRetriesAfterScanError(t *testing.T) {
 	}
 }
 
-func TestFindPiSessionFileByIDCachesNonSessionFirstLine(t *testing.T) {
+func TestFindPiSessionCandidatesInCachesNonSessionFirstLine(t *testing.T) {
 	root := t.TempDir()
 	workDir := filepath.Join(t.TempDir(), "project")
 	path := filepath.Join(root, "notes.jsonl")
 	writePiHeaderFile(t, path, "message", "sess-1", workDir)
 
-	if got := FindPiSessionFileByID([]string{root}, workDir, "sess-1"); got != "" {
-		t.Fatalf("FindPiSessionFileByID() for a non-session first line = %q, want empty", got)
+	if got := findPiSessionCandidatesIn(root, cleanPiWorkDir(workDir)); len(got) != 0 {
+		t.Fatalf("findPiSessionCandidatesIn() for a non-session first line = %#v, want no candidates", got)
 	}
 
 	// "message" and "session" are the same byte length, so this rewrite keeps the
@@ -645,8 +647,8 @@ func TestFindPiSessionFileByIDCachesNonSessionFirstLine(t *testing.T) {
 	rewritePiFilePreservingSignature(t, path, func() {
 		writePiHeaderFile(t, path, "session", "sess-1", workDir)
 	})
-	if got := FindPiSessionFileByID([]string{root}, workDir, "sess-1"); got != "" {
-		t.Fatalf("FindPiSessionFileByID() after a same-signature rewrite = %q, want the cached empty result", got)
+	if got := findPiSessionCandidatesIn(root, cleanPiWorkDir(workDir)); len(got) != 0 {
+		t.Fatalf("findPiSessionCandidatesIn() after a same-signature rewrite = %#v, want the cached absence of candidates", got)
 	}
 }
 

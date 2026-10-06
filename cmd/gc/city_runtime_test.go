@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -766,18 +767,21 @@ func TestTickDebouncer_CancelPendingDrainsQueuedFire(t *testing.T) {
 }
 
 func TestTickDebouncer_RearmsAfterFire(t *testing.T) {
-	d := newTickDebouncer()
-	debounce := 20 * time.Millisecond
-	d.arm(debounce)
-	if got := drainFiredCount(d, debounce+50*time.Millisecond); got != 1 {
-		t.Fatalf("first burst fired count = %d, want 1", got)
-	}
-	// Second burst should arm a fresh timer — the AfterFunc callback must
-	// have cleared the internal timer pointer.
-	d.arm(debounce)
-	if got := drainFiredCount(d, debounce+50*time.Millisecond); got != 1 {
-		t.Fatalf("second burst fired count = %d, want 1", got)
-	}
+	// Keep callbacks and observation windows on the same logical clock.
+	synctest.Test(t, func(t *testing.T) {
+		d := newTickDebouncer()
+		debounce := 20 * time.Millisecond
+		d.arm(debounce)
+		if got := drainFiredCount(d, debounce+50*time.Millisecond); got != 1 {
+			t.Fatalf("first burst fired count = %d, want 1", got)
+		}
+		// Second burst should arm a fresh timer — the AfterFunc callback must
+		// have cleared the internal timer pointer.
+		d.arm(debounce)
+		if got := drainFiredCount(d, debounce+50*time.Millisecond); got != 1 {
+			t.Fatalf("second burst fired count = %d, want 1", got)
+		}
+	})
 }
 
 func TestTickDebouncer_IndependentInstances(t *testing.T) {

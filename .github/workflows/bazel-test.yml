@@ -62,7 +62,7 @@ permissions:
 jobs:
   bazel:
     name: bazel test (side-by-side)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -71,15 +71,15 @@ jobs:
       # Hoisted so the step-level `if:` below can see it. Empty for forks
       # (no secrets) and for rbe=cache/off dispatches: the job then runs
       # locally.
-      BAZEL_REMOTE_EXECUTOR: ${{ inputs.rbe != 'cache' && inputs.rbe != 'off' && ((vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && secrets.RBE_WEST_EXECUTOR || secrets.BAZEL_REMOTE_EXECUTOR) || '' }}
+      BAZEL_REMOTE_EXECUTOR: ${{ github.repository == 'gastownhall/gascity' && inputs.rbe != 'cache' && inputs.rbe != 'off' && ((vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && secrets.RBE_WEST_EXECUTOR || secrets.BAZEL_REMOTE_EXECUTOR) || '' }}
       RBE_INSTANCE_OVERRIDE: ${{ (vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && 'oss' || '' }}
       # Without an executor: rbe-west's anonymous read-only cache, unless rbe=off.
-      BAZEL_FORK_CACHE: ${{ inputs.rbe != 'off' && 'true' || '' }}
+      BAZEL_FORK_CACHE: ${{ github.repository == 'gastownhall/gascity' && inputs.rbe != 'off' && 'true' || '' }}
       # Fork and Dependabot PRs: remote execution on rbe-fork with a
       # short-lived certificate from rbe-west's mint (infra README "rbe-fork";
       # tools/rbe/fork-credential.sh). If the mint is closed or refuses, the
       # job falls back to the read-only fork cache as before.
-      BAZEL_FORK_REMOTE: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'true' || '' }}
+      BAZEL_FORK_REMOTE: ${{ github.repository == 'gastownhall/gascity' && github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'true' || '' }}
     steps:
       # Best effort: a worker boots (~30 s) while this job checks out and
       # analyzes. The rbe-west scaler covers anything beyond one worker.
@@ -123,8 +123,10 @@ jobs:
           # Blacksmith (gastownhall pool): the image user's ~/.cache is root-owned and the
           # bazel JVM stats user.home/.cache regardless of HOME/output_user_root. Make it
           # writable; also keep bazelisk state under the runner temp.
-          sudo chmod 755 /home/ubuntu
-          sudo mkdir -p /home/ubuntu/.cache && sudo chown "$(id -u):$(id -g)" /home/ubuntu/.cache
+          if [ "$GITHUB_REPOSITORY" = "gastownhall/gascity" ]; then
+            sudo chmod 755 /home/ubuntu
+            sudo mkdir -p /home/ubuntu/.cache && sudo chown "$(id -u):$(id -g)" /home/ubuntu/.cache
+          fi
           mkdir -p "$RUNNER_TEMP/bazel-home" && echo "BAZELISK_HOME=$RUNNER_TEMP/bazel-home" >> "$GITHUB_ENV"
 
       # Runner-side bazel caches: without these every run re-hashes the
@@ -137,9 +139,11 @@ jobs:
       # 10GB cache and evict main's entry. PRs restore main's latest.
       - name: Bazel cache day
         id: bazel-cache-day
+        if: github.repository == 'gastownhall/gascity'
         run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
       - name: Restore bazel output base
         id: bazel-cache
+        if: github.repository == 'gastownhall/gascity'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
@@ -159,7 +163,7 @@ jobs:
       # read-only fork cache (the steps below key on steps.fork-cert).
       - name: rbe-fork status
         id: fork-status
-        if: env.BAZEL_REMOTE_EXECUTOR == '' && env.BAZEL_FORK_REMOTE == 'true'
+        if: github.repository == 'gastownhall/gascity' && env.BAZEL_REMOTE_EXECUTOR == '' && env.BAZEL_FORK_REMOTE == 'true'
         continue-on-error: true
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -307,7 +311,7 @@ jobs:
             --define=gotags=acceptance_a --test_timeout=1100
 
       - name: Save bazel output base
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.bazel-cache.outputs.cache-hit != 'true'
+        if: github.repository == 'gastownhall/gascity' && always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.bazel-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
@@ -369,7 +373,7 @@ jobs:
 
   sync-check:
     name: BUILD files in sync
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -389,8 +393,10 @@ jobs:
         run: |
           curl -sSfL -o /tmp/bazelisk             https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
           sudo install -m 0755 /tmp/bazelisk /usr/local/bin/bazel
-          sudo chmod 755 /home/ubuntu 2>/dev/null || true
-          sudo mkdir -p /home/ubuntu/.cache && sudo chown "$(id -u):$(id -g)" /home/ubuntu/.cache
+          if [ "$GITHUB_REPOSITORY" = "gastownhall/gascity" ]; then
+            sudo chmod 755 /home/ubuntu 2>/dev/null || true
+            sudo mkdir -p /home/ubuntu/.cache && sudo chown "$(id -u):$(id -g)" /home/ubuntu/.cache
+          fi
       - name: BUILD files are in sync (gazelle + repo tree)
         run: |
           make bazel-sync

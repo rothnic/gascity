@@ -39,9 +39,37 @@ var setupBazelBeadsDigests = map[string]string{
 func TestSetupBazelIsBeadsByteCopy(t *testing.T) {
 	root := repoRoot(t)
 	for name, want := range setupBazelBeadsDigests {
-		got := fmt.Sprintf("%x", sha256.Sum256([]byte(readFile(t, root, setupBazelDir+"/"+name))))
+		content := readFile(t, root, setupBazelDir+"/"+name)
+		if name == "action.yml" {
+			var action struct {
+				Runs struct {
+					Steps []struct {
+						Name string `yaml:"name"`
+						If   string `yaml:"if"`
+					} `yaml:"steps"`
+				} `yaml:"runs"`
+			}
+			if err := yaml.Unmarshal([]byte(content), &action); err != nil {
+				t.Fatalf("parse %s/action.yml: %v", setupBazelDir, err)
+			}
+			guards := 0
+			for _, step := range action.Runs.Steps {
+				if step.If == "github.repository == 'gastownhall/gascity'" {
+					guards++
+					if step.Name != "Restore Bazel runner cache" {
+						t.Errorf("fork-only guard belongs to %q, want Restore Bazel runner cache", step.Name)
+					}
+				}
+			}
+			if guards != 1 {
+				t.Fatalf("action.yml has %d exact fork-only guards, want one on Restore Bazel runner cache", guards)
+			}
+			content = strings.Replace(content,
+				"      if: github.repository == 'gastownhall/gascity'\n", "", 1)
+		}
+		got := fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
 		if got != want {
-			t.Errorf("%s/%s sha256 %s, want %s (beads' copy): change beads' composite first, then copy it here", setupBazelDir, name, got, want)
+			t.Errorf("%s/%s sha256 %s, want %s (beads' copy after stripping the sole documented fork cache guard): change beads' composite first, then copy it here", setupBazelDir, name, got, want)
 		}
 	}
 	// bazel-test.yml still runs tools/rbe/fork-credential.sh.
@@ -491,8 +519,8 @@ func TestBazelMultiLaneWorkflowShape(t *testing.T) {
 	if lane.Strategy.FailFast == nil || *lane.Strategy.FailFast {
 		t.Errorf("lane strategy: want fail-fast: false")
 	}
-	if want := "${{ (needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404' }}"; lane.RunsOn != want {
-		t.Errorf("lane runs-on = %q, want %q (2 vCPU clients in remote modes)", lane.RunsOn, want)
+	if want := "${{ github.repository == 'gastownhall/gascity' && ((needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404') || 'ubuntu-latest' }}"; lane.RunsOn != want {
+		t.Errorf("lane runs-on = %q, want %q", lane.RunsOn, want)
 	}
 
 	// Every checkout is full blobless history, then fresh-merge onto the rbe

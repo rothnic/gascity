@@ -69,7 +69,7 @@ permissions:
 jobs:
   rbe:
     name: execution mode
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -84,20 +84,23 @@ jobs:
       - name: Decide remote execution
         id: decide
         env:
-          RBE_VAR_ON: ${{ vars.RBE_WEST_WORKERS == 'true' }}
+          REPOSITORY: ${{ github.repository }}
+          RBE_VAR_ON: ${{ github.repository == 'gastownhall/gascity' && vars.RBE_WEST_WORKERS == 'true' }}
           RBE_INPUT_OFF: ${{ inputs.rbe == 'off' }}
           RBE_INPUT_CACHE: ${{ inputs.rbe == 'cache' }}
           PULL_REQUEST: ${{ github.event_name == 'pull_request' }}
           FORK: ${{ github.event.pull_request.head.repo.fork == true }}
           DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
-          HAS_EXECUTOR: ${{ secrets.RBE_WEST_EXECUTOR != '' }}
+          HAS_EXECUTOR: ${{ github.repository == 'gastownhall/gascity' && secrets.RBE_WEST_EXECUTOR != '' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           for v in RBE_VAR_ON RBE_INPUT_OFF RBE_INPUT_CACHE PULL_REQUEST FORK DEPENDABOT HAS_EXECUTOR; do
             case "${!v}" in true|false) ;; *) echo "::error::$v is '${!v}'"; exit 1 ;; esac
           done
           tier=
-          if [ "$RBE_INPUT_OFF" = true ]; then
+          if [ "$REPOSITORY" != "gastownhall/gascity" ]; then
+            mode=local
+          elif [ "$RBE_INPUT_OFF" = true ]; then
             mode=local
           elif [ "$RBE_INPUT_CACHE" = true ]; then
             mode=cache
@@ -188,7 +191,7 @@ jobs:
       # Best effort: a worker boots (~30 s) while the lanes check out and
       # analyze. The rbe-west scaler covers anything beyond one worker.
       - name: Pre-warm the OSS worker pool (rbe-west)
-        if: steps.decide.outputs.mode == 'remote'
+        if: github.repository == 'gastownhall/gascity' && steps.decide.outputs.mode == 'remote'
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -213,7 +216,7 @@ jobs:
     if: needs.rbe.outputs.lanes != '[]'
     # Remote modes: the runner is only a Bazel client. Local modes (cache,
     # local: rbe-fork closed or a dispatch) execute here, so they get 4 vCPU.
-    runs-on: ${{ (needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && ((needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404') || 'ubuntu-latest' }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -328,7 +331,7 @@ jobs:
       # Only a push to main that missed the exact key writes the runner cache
       # (--repository_cache only, never the rc or credentials), from one lane.
       - name: Save Bazel runner cache
-        if: always() && matrix.lane == 'unit' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.bazel.outcome == 'success' && steps.bazel.outputs.cache-hit != 'true'
+        if: github.repository == 'gastownhall/gascity' && always() && matrix.lane == 'unit' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.bazel.outcome == 'success' && steps.bazel.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bazel-ci-cache
@@ -340,8 +343,8 @@ jobs:
   coverage:
     name: bazel / coverage
     needs: rbe
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.rbe.outputs.mode == 'remote'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: github.repository == 'gastownhall/gascity' && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.rbe.outputs.mode == 'remote'
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       contents: read
@@ -385,7 +388,7 @@ jobs:
   sync-check:
     name: bazel / BUILD files in sync (preview)
     needs: rbe
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -427,7 +430,7 @@ jobs:
     name: bazel lanes (preview)
     needs: [rbe, lane, sync-check]
     if: always()
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       # Lanes may be skipped only where the lane job's if skips them: an

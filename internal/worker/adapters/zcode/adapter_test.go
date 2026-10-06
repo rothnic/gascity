@@ -1610,6 +1610,11 @@ func TestInterruptedTurnClosesTheMirrorEntry(t *testing.T) {
 	s.waitForOutput("zcode-repl turn in flight", 20*time.Second)
 	s.signal(syscall.SIGINT)
 	s.waitForOutput("zcode-repl error rc=", 15*time.Second)
+	// Keep stdin open: EOF must not conceal a missed SIGTERM. A hung
+	// fixture is killed and fails the unchanged exit-code assertion.
+	s.cmd.WaitDelay = adapterWaitBudget
+	killOnHang := time.AfterFunc(adapterWaitBudget, func() { _ = s.cmd.Process.Kill() })
+	defer killOnHang.Stop()
 	s.signal(syscall.SIGTERM)
 	if _, code := s.wait(); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
