@@ -216,7 +216,7 @@ jobs:
     if: needs.rbe.outputs.lanes != '[]'
     # Remote modes: the runner is only a Bazel client. Local modes (cache,
     # local: rbe-fork closed or a dispatch) execute here, so they get 4 vCPU.
-    runs-on: ${{ github.repository == 'gastownhall/gascity' && (needs.rbe.outputs.mode == 'remote' || startsWith(needs.rbe.outputs.mode, 'fork-')) && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && ((needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404') || 'ubuntu-latest' }}
     timeout-minutes: 90
     permissions:
       contents: read

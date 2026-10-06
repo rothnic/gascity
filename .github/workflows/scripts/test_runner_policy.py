@@ -38,16 +38,19 @@ class RunnerPolicyTests(unittest.TestCase):
 
     def test_all_runner_policy_bootstraps_are_github_hosted(self) -> None:
         root = Path(__file__).parents[1]
-        callers = []
-        for path in root.glob("*.yml"):
-            text = path.read_text(encoding="utf-8")
-            if "python3 .github/workflows/scripts/runner_policy.py" in text:
-                callers.append(path.name)
-                self.assertRegex(text, r"(?m)^\s+runs-on: ubuntu-latest$")
-        self.assertEqual(set(callers), {
+        callers = {
             "ci.yml", "mac-regression.yml", "review-formulas.yml",
             "codeql.yml", "container-scan.yml", "govulncheck.yml",
-        })
+        }
+        import re
+        for name in callers:
+            text = (root / name).read_text(encoding="utf-8")
+            policy_job = re.search(r"(?ms)^  runner-policy:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\\Z)", text)
+            self.assertIsNotNone(policy_job, name)
+            block = policy_job.group(1)
+            self.assertRegex(block, r"(?m)^    runs-on: ubuntu-latest$", name)
+            self.assertIn("python3 .github/workflows/scripts/runner_policy.py", block, name)
+            self.assertIn("RUNNER_REPOSITORY: ${{ github.repository }}", block, name)
 
     def test_review_formulas_codecov_is_upstream_only(self) -> None:
         text = (Path(__file__).parents[1] / "review-formulas.yml").read_text(encoding="utf-8")
