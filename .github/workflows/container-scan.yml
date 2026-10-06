@@ -57,7 +57,7 @@ env:
 jobs:
   runner-policy:
     name: Runner policy
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     outputs:
       use_blacksmith: ${{ steps.policy.outputs.use_blacksmith }}
       reason: ${{ steps.policy.outputs.reason }}
@@ -73,6 +73,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          RUNNER_REPOSITORY: ${{ github.repository }}
         run: |
           python3 .github/workflows/scripts/runner_policy.py
 

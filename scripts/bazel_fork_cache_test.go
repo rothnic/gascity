@@ -229,7 +229,7 @@ const (
 	rbeForkStatusURL = "https://rbe-mint.ops.gascity.com:8444/v1/status?repo="
 	// bazel-test.yml's BAZEL_FORK_REMOTE: fork and Dependabot pull_request
 	// runs (no secrets) ask rbe-fork.
-	bazelForkRemoteEnv = "${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'true' || '' }}"
+	bazelForkRemoteEnv = "${{ github.repository == 'gastownhall/gascity' && github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'true' || '' }}"
 )
 
 // bazelTestCurlStub stands in for curl in the rbe-fork status step: it
@@ -291,7 +291,7 @@ func TestBazelRBEForkSteps(t *testing.T) {
 	}
 	for id, w := range map[string]want{
 		"fork-status": {
-			"env.BAZEL_REMOTE_EXECUTOR == '' && env.BAZEL_FORK_REMOTE == 'true'",
+			"github.repository == 'gastownhall/gascity' && env.BAZEL_REMOTE_EXECUTOR == '' && env.BAZEL_FORK_REMOTE == 'true'",
 			map[string]string{"PR_NUMBER": "${{ github.event.pull_request.number }}"},
 		},
 		"fork-key": {
