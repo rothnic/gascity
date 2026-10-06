@@ -480,16 +480,6 @@ func multiLaneLaneNames() []string {
 	return names
 }
 
-func bazelLaneRunner(repository, mode string) string {
-	if repository != "gastownhall/gascity" {
-		return "ubuntu-latest"
-	}
-	if mode == "cache" || mode == "local" {
-		return "blacksmith-4vcpu-ubuntu-2404"
-	}
-	return "blacksmith-2vcpu-ubuntu-2404"
-}
-
 func TestBazelMultiLaneWorkflowShape(t *testing.T) {
 	wf := readMultiLaneWorkflow(t)
 	lane, ok := wf.Jobs["lane"]
@@ -531,23 +521,6 @@ func TestBazelMultiLaneWorkflowShape(t *testing.T) {
 	}
 	if want := "${{ github.repository == 'gastownhall/gascity' && ((needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404') || 'ubuntu-latest' }}"; lane.RunsOn != want {
 		t.Errorf("lane runs-on = %q, want %q", lane.RunsOn, want)
-	}
-	for _, tc := range []struct {
-		repository string
-		mode       string
-		want       string
-	}{
-		{"gastownhall/gascity", "local", "blacksmith-4vcpu-ubuntu-2404"},
-		{"gastownhall/gascity", "cache", "blacksmith-4vcpu-ubuntu-2404"},
-		{"gastownhall/gascity", "remote", "blacksmith-2vcpu-ubuntu-2404"},
-		{"gastownhall/gascity", "fork-ro", "blacksmith-2vcpu-ubuntu-2404"},
-		{"rothnic/gascity", "local", "ubuntu-latest"},
-		{"", "remote", "ubuntu-latest"},
-	} {
-		got := bazelLaneRunner(tc.repository, tc.mode)
-		if got != tc.want {
-			t.Errorf("bazelLaneRunner(%q, %q) = %q, want %q", tc.repository, tc.mode, got, tc.want)
-		}
 	}
 
 	// Every checkout is full blobless history, then fresh-merge onto the rbe
