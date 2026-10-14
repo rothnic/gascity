@@ -225,6 +225,9 @@ becoming more useful as models improve — it becomes LESS useful instead.
 - Error messages include context: `fmt.Errorf("adding rig %q: %w", name, err)`
 - Don't swallow errors: no silently filled-in defaults, masked decode
   failures, or ignored timeouts.
+- Native guarded metadata requests check controller and coordination ownership
+  before close-policy or backend effects. Both the original row and projected
+  metadata must remain eligible; removing an ownership mark cannot authorize a write.
 - Comments describe current behavior; don't narrate removed functionality.
 - Role names never appear in Go code. If you're writing `if role == "mayor"`,
   it's a design error.

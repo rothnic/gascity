@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"strconv"
 	"strings"
@@ -55,6 +56,9 @@ keys. Optional expected_status and expected_assignee predicates are preserved.
 The retained native claim must be a changing guard with its in-progress status
 and current assignee. Session admission reads the authoritative city session
 class; every transaction row remains in the selected work store.
+
+Requests refuse controller-owned and coordination-owned rows before editing or
+closing them, including metadata changes that would create an ownership mark.
 
 An optional close_reason on a row closes it with normal dependency policy and
 the admitted native session in the same transaction. Close reasons must be nonempty.
@@ -321,6 +325,27 @@ func admitBeadsGuardedMetadataBatch(info session.Info, request beadsGuardedMetad
 		if coordclass.ControllerOwned(beads.Bead{Type: row.Type, Labels: row.Labels}) {
 			return fmt.Errorf("row %q is controller-owned", row.ID)
 		}
+		if row.ID == a.ClaimedBeadID && len(row.Metadata) == 0 {
+			return fmt.Errorf("reading claimed bead %q metadata: native metadata is absent", row.ID)
+		}
+		original, err := beadsGuardedMetadataIdentity(row)
+		if err != nil {
+			return fmt.Errorf("reading row %q metadata: %w", row.ID, err)
+		}
+		if coordclass.CoordinationOwned(original) {
+			return fmt.Errorf("row %q is coordination-owned", row.ID)
+		}
+		projected := original
+		projected.Metadata = maps.Clone(original.Metadata)
+		for key, value := range patch.Set {
+			projected.Metadata[key] = value
+		}
+		for _, key := range patch.Delete {
+			delete(projected.Metadata, key)
+		}
+		if coordclass.CoordinationOwned(projected) {
+			return fmt.Errorf("row %q would become coordination-owned", row.ID)
+		}
 		if row.ID != a.ClaimedBeadID {
 			continue
 		}
@@ -331,19 +356,64 @@ func admitBeadsGuardedMetadataBatch(info session.Info, request beadsGuardedMetad
 			row.Status != "in_progress" || row.Assignee != assignee {
 			return fmt.Errorf("claimed bead %q requires its changing revision, in-progress status and native assignee guards", row.ID)
 		}
-		var metadata map[string]json.RawMessage
-		if err := json.Unmarshal(row.Metadata, &metadata); err != nil {
-			return fmt.Errorf("reading claimed bead %q metadata: %w", row.ID, err)
-		}
-		if raw, present := metadata[beadmeta.SessionIDMetadataKey]; present {
-			var sessionID string
-			if err := json.Unmarshal(raw, &sessionID); err != nil || sessionID != a.SessionID {
-				return fmt.Errorf("claimed bead %q belongs to another native session", row.ID)
-			}
+		if sessionID, present := original.Metadata[beadmeta.SessionIDMetadataKey]; present && sessionID != a.SessionID {
+			return fmt.Errorf("claimed bead %q belongs to another native session", row.ID)
 		}
 	}
 	if !foundClaim {
 		return fmt.Errorf("retained claimed bead %q must be a changing guard in this store's batch", a.ClaimedBeadID)
 	}
 	return nil
+}
+
+// Ownership and claim identities must be strings, without coercing native
+// numeric, boolean or null values in unrelated metadata keys.
+func beadsGuardedMetadataIdentity(row beads.MetadataSnapshot) (beads.Bead, error) {
+	bead := beads.Bead{Type: row.Type, Labels: row.Labels, Metadata: make(map[string]string)}
+	if len(row.Metadata) == 0 {
+		return bead, nil
+	}
+	if !utf8.Valid(row.Metadata) {
+		return bead, fmt.Errorf("metadata must be valid UTF-8")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(row.Metadata))
+	start, err := decoder.Token()
+	if err != nil {
+		return bead, err
+	}
+	if start != json.Delim('{') {
+		return bead, fmt.Errorf("metadata must be a JSON object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return bead, err
+		}
+		key := token.(string)
+		if seen[key] {
+			return bead, fmt.Errorf("duplicate metadata property %q", key)
+		}
+		seen[key] = true
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return bead, err
+		}
+		var value string
+		if bytes.TrimSpace(raw)[0] == '"' {
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return bead, err
+			}
+			bead.Metadata[key] = value
+		} else if key == "session_id" || key == beadmeta.SessionIDMetadataKey {
+			return bead, fmt.Errorf("metadata identity %q must be a string", key)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return bead, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return bead, fmt.Errorf("trailing JSON after metadata")
+	}
+	return bead, nil
 }

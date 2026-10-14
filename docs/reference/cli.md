@@ -446,6 +446,9 @@ The retained native claim must be a changing guard with its in-progress status
 and current assignee. Session admission reads the authoritative city session
 class; every transaction row remains in the selected work store.
 
+Requests refuse controller-owned and coordination-owned rows before editing or
+closing them, including metadata changes that would create an ownership mark.
+
 An optional close_reason on a row closes it with normal dependency policy and
 the admitted native session in the same transaction. Close reasons must be nonempty.
 The complete request is limited to 100 native items: each unique row costs one,
