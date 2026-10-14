@@ -13,9 +13,11 @@ import (
 
 // Worktree represents a single git worktree entry.
 type Worktree struct {
-	Path   string
-	Head   string
-	Branch string
+	Path     string
+	Head     string
+	Branch   string
+	Bare     bool // explicit bare control registration
+	Prunable bool // native stale registration marker
 }
 
 // Git wraps git operations scoped to a working directory.
@@ -525,6 +527,10 @@ func parseWorktreeList(output string) []Worktree {
 		switch {
 		case strings.HasPrefix(line, "worktree "):
 			current.Path = canonicalWorktreePath(unquoteGitPath(strings.TrimPrefix(line, "worktree ")))
+		case line == "bare":
+			current.Bare = true
+		case line == "prunable" || strings.HasPrefix(line, "prunable "):
+			current.Prunable = true
 		case strings.HasPrefix(line, "HEAD "):
 			current.Head = strings.TrimPrefix(line, "HEAD ")
 		case strings.HasPrefix(line, "branch "):

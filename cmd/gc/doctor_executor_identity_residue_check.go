@@ -379,6 +379,11 @@ func staleWorkDirStamp(cfg *config.City, bd beads.Bead) bool {
 // worktree-ownership metadata keys worktreeSpecForBead inspects to tell a
 // managed per-bead worktree apart from an unmanaged spawn.
 func hasWorktreeOwnershipEvidence(bd beads.Bead) bool {
+	for _, key := range []string{beadmeta.WorktreeModeMetadataKey, beadmeta.WorktreePlacementMetadataKey, beadmeta.WorktreeRefMetadataKey} {
+		if _, declared := bd.Metadata[key]; declared {
+			return true
+		}
+	}
 	for _, key := range []string{
 		beadmeta.WorktreeRootMetadataKey,
 		beadmeta.WorktreeRepoMetadataKey,

@@ -335,7 +335,7 @@ gc bd release-if-current my-project-abc worker-1
 Manage the beads provider (backing store for issue tracking).
 
 Subcommands for topology operations, health checking, diagnostics, exact-store
-metadata compare-and-set, and read-only list/show routed through the supervisor
+metadata compare-and-set and guarded batches, and read-only list/show routed through the supervisor
 API with transparent fallback to direct bd reads.
 
 ```
@@ -345,6 +345,7 @@ gc beads
 | Subcommand | Description |
 |------------|-------------|
 | [gc beads city](#gc-beads-city) | Manage canonical city endpoint topology |
+| [gc beads guarded-metadata-batch](#gc-beads-guarded-metadata-batch) | Read exact metadata revisions or apply one guarded native batch |
 | [gc beads health](#gc-beads-health) | Check beads provider health |
 | [gc beads list](#gc-beads-list) | List beads (API-routed with bd fallback) |
 | [gc beads metadata-cas](#gc-beads-metadata-cas) | Atomically compare and set one metadata key in an exact local store |
@@ -430,6 +431,39 @@ gc beads city use-managed [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dry-run` | bool |  | show the canonical changes without writing files |
+
+## gc beads guarded-metadata-batch
+
+Read raw metadata with opaque revisions, or patch existing rows in one
+native transaction. Select one local store with --store-ref=city:&lt;name&gt; or
+--store-ref=rig:&lt;name&gt; and exactly one of --snapshot=&lt;IDs&gt; and --request=&lt;file&gt;.
+Use --json for the canonical machine-output contract.
+
+A request contains admission &#123;session_id, instance_token, claimed_bead_id&#125; and
+rows with id, expected_revision, require_change, string-valued set and delete
+keys. Optional expected_status and expected_assignee predicates are preserved.
+The retained native claim must be a changing guard with its in-progress status
+and current assignee. Session admission reads the authoritative city session
+class; every transaction row remains in the selected work store.
+
+An optional close_reason on a row closes it with normal dependency policy and
+the admitted native session in the same transaction. Close reasons must be nonempty.
+The complete request is limited to 100 native items: each unique row costs one,
+and each close costs one more. Every designated metadata guard must change.
+Unsupported providers, stale guards and uncertain commit results fail
+without ordinary writes, chunking or a search in another work store. Session
+admission is a preflight check; row revisions fence the native transaction.
+
+```
+gc beads guarded-metadata-batch [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | emit the canonical JSON result |
+| `--request` | string |  | file containing the retained admission and guarded row patches |
+| `--snapshot` | stringSlice |  | exact physical IDs to read (comma-separated, at most 100) |
+| `--store-ref` | string |  | exact local store: city:&lt;name&gt; or rig:&lt;name&gt; |
 
 ## gc beads health
 
@@ -5422,12 +5456,15 @@ Ensure or verify agent workspace worktrees.
 
 gc worktree is the single transactional owner for workspace provisioning.
 Postconditions: the path is a direct child of the configured per-rig root and
-the root of a worktree of the given repository, with the bead's uniquely named
-branch checked out on an attached HEAD (never detached). Durable provenance is
+the root of a worktree of the given repository. HEAD is attached to the requested
+branch by default; --mode detached requires an empty branch.
+--placement within-repo-root permits the selected primary or bare control root as
+an ancestor while excluding Git administration and other worktrees. Durable provenance is
 stored in the worktree's private git directory and returned as JSON so callers
 can atomically publish the same evidence on the bead. A new branch is created
-from --base, resolved verbatim against the local repository. Failed creation
-rolls back everything it created; --dry-run plans without mutating anything.
+from --base, resolved verbatim against the local repository. Detached creation
+uses that resolved commit without creating a branch. Failed creation rolls back
+only untouched state; --dry-run plans without mutating anything.
 
 ```
 gc worktree
@@ -5443,7 +5480,7 @@ gc worktree
 
 Remove an owned worktree after all safety gates pass.
 
-Cleanup verifies the canonical repository, path, branch, and durable ownership
+Cleanup verifies the canonical repository, path, HEAD mode, and durable ownership
 provenance before acting. It refuses dirty worktrees, commits reachable from no
 branch, tag, or remote-tracking ref, and commits not merged into --base.
 --attempt-id binds the removal to one exact provisioning attempt, so a stale
@@ -5462,13 +5499,16 @@ gc worktree cleanup [flags]
 | `--base` | string |  | exact base ref used for this worktree (required) |
 | `--base-sha` | string |  | recorded base SHA to verify when reusing a worktree |
 | `--bead` | string |  | work bead bound to this worktree (required) |
-| `--branch` | string |  | branch that must be checked out (required) |
+| `--branch` | string |  | branch that must be checked out (required in attached mode) |
 | `--creator` | string |  | mechanism creating the worktree (required) |
 | `--generation` | string |  | provisioning generation fence (required) |
 | `--json` | bool |  | emit the report as JSON |
 | `--lifecycle` | string | `active` | worktree lifecycle state |
+| `--lock-timeout` | duration | `30s` | maximum wait for the workspace lock (must be positive; does not limit the transaction) |
+| `--mode` | string |  | attached or detached HEAD (default attached; explicit modes record schema 2 provenance) |
 | `--owner` | string |  | single selected provisioning owner (required) |
 | `--path` | string |  | worktree path (required) |
+| `--placement` | string |  | outside-worktrees or within-repo-root (default outside-worktrees) |
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |
@@ -5487,14 +5527,17 @@ gc worktree ensure [flags]
 | `--base` | string |  | exact base ref used for this worktree (required) |
 | `--base-sha` | string |  | recorded base SHA to verify when reusing a worktree |
 | `--bead` | string |  | work bead bound to this worktree (required) |
-| `--branch` | string |  | branch that must be checked out (required) |
+| `--branch` | string |  | branch that must be checked out (required in attached mode) |
 | `--creator` | string |  | mechanism creating the worktree (required) |
 | `-n`, `--dry-run` | bool |  | plan without mutating anything |
 | `--generation` | string |  | provisioning generation fence (required) |
 | `--json` | bool |  | emit the report as JSON |
 | `--lifecycle` | string | `active` | worktree lifecycle state |
+| `--lock-timeout` | duration | `30s` | maximum wait for the workspace lock (must be positive; does not limit the transaction) |
+| `--mode` | string |  | attached or detached HEAD (default attached; explicit modes record schema 2 provenance) |
 | `--owner` | string |  | single selected provisioning owner (required) |
 | `--path` | string |  | worktree path (required) |
+| `--placement` | string |  | outside-worktrees or within-repo-root (default outside-worktrees) |
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |
@@ -5512,13 +5555,15 @@ gc worktree verify [flags]
 | `--base` | string |  | exact base ref used for this worktree (required) |
 | `--base-sha` | string |  | recorded base SHA to verify when reusing a worktree |
 | `--bead` | string |  | work bead bound to this worktree (required) |
-| `--branch` | string |  | branch that must be checked out (required) |
+| `--branch` | string |  | branch that must be checked out (required in attached mode) |
 | `--creator` | string |  | mechanism creating the worktree (required) |
 | `--generation` | string |  | provisioning generation fence (required) |
 | `--json` | bool |  | emit the report as JSON |
 | `--lifecycle` | string | `active` | worktree lifecycle state |
+| `--mode` | string |  | attached or detached HEAD (default attached; explicit modes record schema 2 provenance) |
 | `--owner` | string |  | single selected provisioning owner (required) |
 | `--path` | string |  | worktree path (required) |
+| `--placement` | string |  | outside-worktrees or within-repo-root (default outside-worktrees) |
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -208,10 +209,11 @@ type poolEvalWork struct {
 }
 
 type defaultScaleCheckTarget struct {
-	template string
-	storeKey string
-	store    beads.Store
-	err      error
+	template         string
+	storeKey         string
+	worktreeStoreRef string
+	store            beads.Store
+	err              error
 }
 
 type scaleCheckDemand struct {
@@ -222,6 +224,7 @@ type scaleCheckDemand struct {
 	Workspaces     map[string]string
 	StoreRefs      map[string]string
 	WorktreeSpecs  map[string]*worktree.Spec
+	WorktreeRefs   map[string]*worktreeReference
 	WorktreeErrors map[string]string
 	// ParentSIDs maps work-bead id → gc.brain_parent_sid, carrying the fork
 	// parent through to the new pool session bead so the launch path can fork
@@ -741,6 +744,7 @@ func buildDesiredStateWithSessionBeadsAt(
 			poolDecisionTime,
 			trace,
 		)
+		bindAssignedWorktreeReferences(cfg, poolDesiredStates, assignedWorkBeads, assignedWorkStoreRefs)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		recordDemandSubPhase(trace, "demand_snapshot.compute_pool_desired", subPhaseStart, map[string]any{
 			"pools":      len(poolDesiredStates),
@@ -1156,7 +1160,7 @@ func buildDemandTargets(
 		}
 		out := make([]defaultScaleCheckTarget, 0, len(cityLegs))
 		for _, leg := range cityLegs {
-			out = append(out, defaultScaleCheckTarget{template: template, store: leg.store, storeKey: "city"})
+			out = append(out, defaultScaleCheckTarget{template: template, store: leg.store, storeKey: "city", worktreeStoreRef: leg.ref})
 		}
 		return out
 	}
@@ -1305,7 +1309,7 @@ func buildDemandTargets(
 			}
 			if store != nil && isCold && !storeScopedControlDispatcher {
 				for _, source := range activeStores {
-					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref}
+					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, worktreeStoreRef: source.ref}
 					// Mirror the generic-pool cold-wake probe below (vp-s37 /
 					// #3078): a custom scale_check that is cold and asleep
 					// cannot see routed demand, so probe every active store
@@ -1412,7 +1416,7 @@ func buildDemandTargets(
 		// it itself, or the pool will churn at the warm/cold boundary.
 		if store != nil && isCold && !storeScopedControlDispatcher {
 			for _, source := range activeStores {
-				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref})
+				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, worktreeStoreRef: source.ref})
 			}
 			coldWakeTemplates[template] = true
 		}
@@ -2211,9 +2215,10 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	}
 
 	type scaleStoreGroup struct {
-		store     beads.Store
-		storeKey  string
-		templates map[string]struct{}
+		store            beads.Store
+		storeKey         string
+		worktreeStoreRef string
+		templates        map[string]struct{}
 		// byTemplate is the group's ready rows bucketed by the template each one
 		// is servable to, in the store's own order.
 		byTemplate map[string][]beads.Bead
@@ -2257,7 +2262,7 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 		gk := scaleStoreGroupKey{key: key, store: target.store}
 		group := groups[gk]
 		if group == nil {
-			group = &scaleStoreGroup{store: target.store, storeKey: key, templates: make(map[string]struct{})}
+			group = &scaleStoreGroup{store: target.store, storeKey: key, worktreeStoreRef: firstNonEmpty(target.worktreeStoreRef, canonicalWorktreeStoreRef(cfg, key)), templates: make(map[string]struct{})}
 			groups[gk] = group
 			groupOrder = append(groupOrder, group)
 		}
@@ -2344,7 +2349,10 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 					entry.StoreRefs = make(map[string]string)
 				}
 				entry.StoreRefs[b.ID] = group.storeKey
-				spec, specErr := worktreeSpecForBead(b, group.storeKey)
+				spec, ref, specErr := worktreeBindingForBead(group.store, b, group.worktreeStoreRef)
+				if _, declared := b.Metadata[beadmeta.WorktreeRefMetadataKey]; !declared {
+					spec, specErr = worktreeSpecForBead(b, group.storeKey)
+				}
 				if specErr != nil {
 					if entry.WorktreeErrors == nil {
 						entry.WorktreeErrors = make(map[string]string)
@@ -2355,6 +2363,12 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 						entry.WorktreeSpecs = make(map[string]*worktree.Spec)
 					}
 					entry.WorktreeSpecs[b.ID] = spec
+					if ref != nil {
+						if entry.WorktreeRefs == nil {
+							entry.WorktreeRefs = make(map[string]*worktreeReference)
+						}
+						entry.WorktreeRefs[b.ID], entry.StoreRefs[b.ID] = ref, ref.StoreRef
+					}
 				}
 				if parentSID := strings.TrimSpace(b.Metadata[beadmeta.BrainParentSIDMetadataKey]); parentSID != "" {
 					if entry.ParentSIDs == nil {
@@ -2507,6 +2521,9 @@ func mergeScaleCheckDemand(existing, incoming scaleCheckDemand, count int) scale
 	if existing.WorktreeSpecs == nil && len(incoming.WorktreeSpecs) > 0 {
 		existing.WorktreeSpecs = make(map[string]*worktree.Spec, len(incoming.WorktreeSpecs))
 	}
+	if existing.WorktreeRefs == nil && len(incoming.WorktreeRefs) > 0 {
+		existing.WorktreeRefs = make(map[string]*worktreeReference)
+	}
 	if existing.WorktreeErrors == nil && len(incoming.WorktreeErrors) > 0 {
 		existing.WorktreeErrors = make(map[string]string, len(incoming.WorktreeErrors))
 	}
@@ -2536,6 +2553,9 @@ func mergeScaleCheckDemand(existing, incoming scaleCheckDemand, count int) scale
 			if spec := incoming.WorktreeSpecs[id]; spec != nil {
 				existing.WorktreeSpecs[id] = spec
 			}
+		}
+		if incoming.WorktreeRefs != nil {
+			existing.WorktreeRefs[id] = incoming.WorktreeRefs[id]
 		}
 		if incoming.WorktreeErrors != nil {
 			if worktreeErr := incoming.WorktreeErrors[id]; worktreeErr != "" {
@@ -3457,7 +3477,27 @@ func resolveDiscoveredSessionTemplate(bp *agentBuildParams, cfg *config.City, cf
 		}
 		tp.Env["GC_SESSION_ORIGIN"] = "named"
 	}
+	applyClientProviderChatStartupPrompt(bp, cfgAgent, resolveAgent, sessionQualifiedName, info.Alias, &tp)
 	return tp, nil
+}
+
+// applyClientProviderChatStartupPrompt applies the SessionStart hook's
+// predicate (see doPrimeWithHookFormatOpts) to the launch channel: when tp, the
+// resolved template of one of cfgAgent's sessions, is a client's provider chat
+// (isClientProviderChat), the chat starts, and resumes, with the beacon alone.
+// The beacon is still a delivered prompt, which stands the hook down, and it
+// drops the "Run `gc prime`" instruction, since an explicit `gc prime` hands
+// the worker persona back. It drops the assigned-skills appendix as well, which
+// only describes skills the session still materializes. Both resolutions of a
+// manual session's template call it, resolveDiscoveredSessionTemplate and the
+// pool realization of a session resumed for work assigned to it, so the two
+// cannot drift. identity is the session's qualified name, alias its GC_ALIAS.
+func applyClientProviderChatStartupPrompt(bp *agentBuildParams, cfgAgent, resolveAgent *config.Agent, identity, alias string, tp *TemplateParams) {
+	if !isClientProviderChat(cfgAgent, templateParamsSessionOrigin(*tp), alias) {
+		return
+	}
+	beacon := runtime.FormatBeaconAt(bp.cityName, identity, false, bp.beaconTime)
+	tp.Prompt = composeStartupPrompt(beacon, "", suppressStartupPromptForAgent(resolveAgent))
 }
 
 // overlayVerdict is classifyOverlaySession's answer for one open session row.
@@ -4029,6 +4069,7 @@ func realizePoolDesiredSessionsAt(
 		} else {
 			applyPoolInstanceIdentity(&tp, cfgAgent, qualifiedInstance, poolSlot, sbInfo)
 		}
+		applyClientProviderChatStartupPrompt(bp, cfgAgent, resolveAgent, qualifiedInstance, sbInfo.Alias, &tp)
 		segmentStart = bp.realizeNow()
 		installAgentSideEffects(bp, resolveAgent, tp, stderr)
 		stats.sideEffects += bp.realizeNow().Sub(segmentStart)
@@ -4076,6 +4117,9 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		if strings.TrimSpace(info.BrainParentSID) != "" {
 			metadata[beadmeta.BrainParentSIDMetadataKey] = ""
 		}
+		if info.WorktreeReference != "" {
+			metadata[beadmeta.WorktreeRefMetadataKey] = ""
+		}
 		return metadata
 	}
 	oldWorkBeadID := strings.TrimSpace(info.TriggerBeadID)
@@ -4094,6 +4138,15 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = workStoreRef
 	} else if workStoreRef == "" && oldWorkBeadID != workBeadID && strings.TrimSpace(info.TriggerBeadStoreRef) != "" {
 		metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = ""
+	}
+	nativeRef := ""
+	if request.WorktreeRef != nil {
+		if raw, err := json.Marshal(request.WorktreeRef); err == nil {
+			nativeRef = string(raw)
+		}
+	}
+	if info.WorktreeReference != nativeRef {
+		metadata[beadmeta.WorktreeRefMetadataKey] = nativeRef
 	}
 	if pack := strings.TrimSpace(request.WorkPack); strings.TrimSpace(info.Pack) != pack {
 		metadata[beadmeta.PackMetadataKey] = pack
@@ -4121,7 +4174,7 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 			request.SessionBeadID == info.ID &&
 			info.State == session.StateActive &&
 			info.WakeMode != "fresh"
-		if existingWorkDir != "" && (oldWorkBeadID == workBeadID || liveResumeContinuation) {
+		if request.WorktreeRef == nil && existingWorkDir != "" && (oldWorkBeadID == workBeadID || liveResumeContinuation) {
 			targetWorkDir = existingWorkDir
 		}
 		if strings.TrimSpace(info.WorkDirCanonical) != targetWorkDir {
@@ -4158,6 +4211,12 @@ func bindPoolSessionTriggerBead(bp *agentBuildParams, cfgAgent *config.Agent, qu
 	workDir, err := verifiedPoolTriggerWorkDir(bp, cfgAgent, qualifiedName, request)
 	if err != nil {
 		return info, err
+	}
+	if request.WorktreeRef != nil && info.State == session.StateActive && workDir != "" {
+		current := firstNonEmpty(info.WorkDirCanonical, info.WorkDir)
+		if current != "" && current != workDir {
+			return info, fmt.Errorf("%w: active session directory differs from the referenced owner", errPoolTriggerWorktreeEvidence)
+		}
 	}
 	patch := computePoolTriggerBindingPatch(info, request, workDir)
 	if len(patch) == 0 {
@@ -4285,6 +4344,16 @@ func verifiedPoolTriggerWorkDir(bp *agentBuildParams, cfgAgent *config.Agent, qu
 	if strings.TrimSpace(request.WorktreeError) != "" {
 		return "", fmt.Errorf("%w invalid: %s", errPoolTriggerWorktreeEvidence, request.WorktreeError)
 	}
+	if request.WorktreeRef != nil {
+		ref := request.WorktreeRef
+		if ref.BindingStepID != request.WorkBeadID || ref.StoreRef != request.WorkStoreRef {
+			return "", fmt.Errorf("%w: reference step/store mismatch", errPoolTriggerWorktreeEvidence)
+		}
+		if bp != nil && bp.planOnly {
+			return "", nil
+		}
+		return verifyPoolTriggerWorktree(bp, request.WorktreeSpec, ref)
+	}
 	if request.WorktreeSpec == nil {
 		return poolTriggerWorkDir(bp, cfgAgent, qualifiedName, request), nil
 	}
@@ -4304,16 +4373,33 @@ func verifiedPoolTriggerWorkDir(bp *agentBuildParams, cfgAgent *config.Agent, qu
 		// gc.work_dir before it writes the row.
 		return "", nil
 	}
-	return verifyPoolTriggerWorktree(bp, spec)
+	return verifyPoolTriggerWorktree(bp, &spec, nil)
 }
 
-// verifyPoolTriggerWorktree verifies spec's worktree on disk and in git,
+// verifyPoolTriggerWorktree verifies the native reference or spec on disk and in git,
 // counting the probe: a realize's, never a plan's (verifiedPoolTriggerWorkDir).
-func verifyPoolTriggerWorktree(bp *agentBuildParams, spec worktree.Spec) (string, error) {
+func verifyPoolTriggerWorktree(bp *agentBuildParams, spec *worktree.Spec, ref *worktreeReference) (string, error) {
+	if ref != nil {
+		if bp == nil {
+			return "", fmt.Errorf("%w: selected work store unavailable", errPoolTriggerWorktreeEvidence)
+		}
+		store, err := selectedNativeWorkStore(bp.cityPath, bp.city, bp.beadStore, bp.sessionCensusRigStores, ref.StoreRef)
+		if err != nil {
+			return "", err
+		}
+		report, err := verifyReferencedWorktree(store, ref.BindingStepID, ref.StoreRef, ref, spec, worktree.Verify)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", errPoolTriggerWorktreeEvidence, err)
+		}
+		return report.Path, nil
+	}
+	if spec == nil {
+		return "", fmt.Errorf("%w: worktree spec unavailable", errPoolTriggerWorktreeEvidence)
+	}
 	if bp != nil && bp.realizeProbe != nil {
 		bp.realizeProbe.worktreeVerifies.Add(1)
 	}
-	report, err := worktree.Verify(spec)
+	report, err := worktree.Verify(*spec)
 	if err != nil {
 		return "", fmt.Errorf("%w: verification failed: %w", errPoolTriggerWorktreeEvidence, err)
 	}
@@ -5024,6 +5110,7 @@ type poolSessionCreatePlan struct {
 	// needs worktree.Verify: metadata then lacks gc.work_dir, and the create
 	// effect verifies the spec and stamps it.
 	worktreeSpec *worktree.Spec
+	worktreeRef  *worktreeReference
 }
 
 func selectOrCreatePoolSessionBead(
@@ -5169,9 +5256,12 @@ func selectOrPlanPoolSessionBead(
 		poolSlot:          poolSlot,
 		metadata:          metadata,
 	}
-	if bp.planOnly && request.WorktreeSpec != nil && metadata != nil {
-		spec := *request.WorktreeSpec
-		plan.worktreeSpec = &spec
+	if bp.planOnly {
+		plan.worktreeRef = request.WorktreeRef
+		if request.WorktreeSpec != nil {
+			spec := *request.WorktreeSpec
+			plan.worktreeSpec = &spec
+		}
 	}
 	return session.Info{}, 0, plan, nil
 }
@@ -5406,6 +5496,13 @@ func poolTriggerMetadata(bp *agentBuildParams, cfgAgent *config.Agent, qualified
 	}
 	if workspace := packWorkspaceSlug(request); workspace != "" {
 		metadata[beadmeta.PackWorkspaceMetadataKey] = workspace
+	}
+	if request.WorktreeRef != nil {
+		raw, err := json.Marshal(request.WorktreeRef)
+		if err != nil {
+			return nil, fmt.Errorf("encoding native worktree reference: %w", err)
+		}
+		metadata[beadmeta.WorktreeRefMetadataKey] = string(raw)
 	}
 	workDir, err := verifiedPoolTriggerWorkDir(bp, cfgAgent, qualifiedName, request)
 	if err != nil {

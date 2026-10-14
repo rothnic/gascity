@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -82,6 +83,40 @@ func TestStoreGetNotFound(t *testing.T) {
 	is := NewStore(store)
 	if _, err := is.Get("missing"); err == nil {
 		t.Fatal("Get(missing): want error, got nil")
+	}
+}
+
+func TestStoreGetExactFreshBypassesCache(t *testing.T) {
+	b := sessionBeadFixture("gc-fresh", "open", map[string]string{"state": "active", "instance_token": "old"})
+	backing := beads.NewMemStoreFrom(1, []beads.Bead{b}, nil)
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	front := NewStore(beads.SessionStore{Store: cache})
+	if err := backing.SetMetadata(b.ID, "instance_token", "replacement"); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := front.Get(b.ID)
+	if err != nil || cached.InstanceToken != "old" {
+		t.Fatalf("control did not retain the old cached token: %+v, %v", cached, err)
+	}
+	fresh, err := front.GetExactFresh(b.ID)
+	if err != nil || fresh.InstanceToken != "replacement" {
+		t.Fatalf("authoritative token = %+v, %v", fresh, err)
+	}
+}
+
+type exactFreshAliasStore struct{ beads.Store }
+
+func (exactFreshAliasStore) Get(string) (beads.Bead, error) {
+	return sessionBeadFixture("gc-successor", "open", map[string]string{"state": "active"}), nil
+}
+
+func TestStoreGetExactFreshRefusesAliasResolution(t *testing.T) {
+	front := NewStore(beads.SessionStore{Store: exactFreshAliasStore{Store: beads.NewMemStore()}})
+	if _, err := front.GetExactFresh("gc-retained"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("a different returned session ID must refuse: %v", err)
 	}
 }
 

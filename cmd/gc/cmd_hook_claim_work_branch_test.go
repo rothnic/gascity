@@ -420,25 +420,32 @@ func TestHookClaimIdentityPatchSkipsSessionFallbackForControlBead(t *testing.T) 
 // INTRODUCING gc.work_dir is what first exposes the bead to its missing-key error
 // and moves it from spawning unmanaged to being starved of a session entirely.
 func TestHookClaimIdentityPatchSkipsSessionFallbackOnPartialWorktreeEvidence(t *testing.T) {
-	bead := beads.Bead{ID: "hw-partial-evidence", Metadata: beads.StringMap{
-		beadmeta.WorktreeRepoMetadataKey: "/rigs/some-repo",
-	}}
-	ops := hookClaimOps{
-		ResolveWorkBranch:     hookClaimBranchByDir(map[string]string{hookClaimWorkBranchSessionDir: "bd-from-session"}),
-		ResolveSessionWorkDir: func(string) string { return hookClaimWorkBranchSessionDir },
-	}
-	opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1"}}
+	for i, metadata := range []beads.StringMap{
+		{beadmeta.WorktreeRepoMetadataKey: "/rigs/some-repo"},
+		{beadmeta.WorktreeModeMetadataKey: ""},
+		{beadmeta.WorktreePlacementMetadataKey: ""},
+		{beadmeta.WorktreeModeMetadataKey: "detached", beadmeta.WorktreePlacementMetadataKey: "outside-worktrees"},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			bead := beads.Bead{ID: "hw-partial-evidence", Metadata: metadata}
+			ops := hookClaimOps{
+				ResolveWorkBranch:     hookClaimBranchByDir(map[string]string{hookClaimWorkBranchSessionDir: "bd-from-session"}),
+				ResolveSessionWorkDir: func(string) string { return hookClaimWorkBranchSessionDir },
+			}
+			opts := hookClaimOptions{Env: []string{"GC_SESSION_ID=mc-sess1"}}
 
-	patch := hookClaimIdentityPatch(bead, opts, ops, hookClaimWorkBranchStoreDir)
+			patch := hookClaimIdentityPatch(bead, opts, ops, hookClaimWorkBranchStoreDir)
 
-	if got, ok := patch[beadmeta.WorkDirMetadataKey]; ok {
-		t.Errorf("stamped %s = %q onto a bead carrying partial worktree-ownership evidence; introducing a path is what makes worktreeSpecForBead hard-error",
-			beadmeta.WorkDirMetadataKey, got)
+			if got, ok := patch[beadmeta.WorkDirMetadataKey]; ok {
+				t.Errorf("stamped %s = %q onto a bead carrying partial worktree-ownership evidence; introducing a path is what makes worktreeSpecForBead hard-error",
+					beadmeta.WorkDirMetadataKey, got)
+			}
+			if got, ok := patch[beadmeta.WorkBranchMetadataKey]; ok {
+				t.Errorf("stamped %s = %q; the branch guard refuses partial evidence too", beadmeta.WorkBranchMetadataKey, got)
+			}
+			assertNoWorkDirConflict(t, bead, patch)
+		})
 	}
-	if got, ok := patch[beadmeta.WorkBranchMetadataKey]; ok {
-		t.Errorf("stamped %s = %q; the branch guard refuses partial evidence too", beadmeta.WorkBranchMetadataKey, got)
-	}
-	assertNoWorkDirConflict(t, bead, patch)
 }
 
 // TestSessionStampableWorkDirRefusesPoolManaged covers gc-j0cfh: the WorkDir of a

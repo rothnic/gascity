@@ -1,19 +1,28 @@
 package worktree
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/git"
 )
 
+// DefaultLockTimeout bounds lock acquisition when Spec.LockTimeout is zero.
+const DefaultLockTimeout = 30 * time.Second
+
+// ErrLockTimeout reports that the acquisition deadline expired. The returned
+// error also wraps context.DeadlineExceeded.
+var ErrLockTimeout = errors.New("worktree lock acquisition timed out")
+
 // pathLock serializes provisioning operations on one workspace path across
-// processes. Acquire it with lockPath and release it with unlock; the
-// acquisition itself is platform-specific and lives in lock_unix.go and
-// lock_windows.go.
+// processes. Acquire it with lockPathContext and release it with unlock;
+// the nonblocking OS operation is platform-specific.
 //
 // Cleanup's safety is a check-then-act sequence: it verifies registration,
 // ownership, cleanliness, reachability, and merge state, and only then removes.
@@ -21,6 +30,70 @@ import (
 // one at the same path in between, and the removal then lands on a workspace
 // none of the checks ever examined. Ensure has the mirror-image race, where two
 // callers both observe a missing path and one loses the creation.
+
+func lockPath(repoDir, path string) (*pathLock, error) {
+	return lockPathContext(context.Background(), repoDir, path, 0)
+}
+
+// lockPathContext bounds acquisition only. After admission the caller retains
+// the lock until its synchronous transaction finishes, even if ctx expires.
+func lockPathContext(ctx context.Context, repoDir, path string, timeout time.Duration) (*pathLock, error) {
+	if timeout < 0 {
+		return nil, errors.New("worktree lock timeout must not be negative")
+	}
+	if timeout == 0 {
+		timeout = DefaultLockTimeout
+	}
+	wait, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := wait.Err(); err != nil {
+		return nil, lockWaitError(path, err)
+	}
+	f, err := openLockFileContext(wait, repoDir, path)
+	if err != nil {
+		if wait.Err() != nil {
+			return nil, lockWaitError(path, wait.Err())
+		}
+		return nil, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = f.Close()
+		}
+	}()
+	lock := &pathLock{f: f}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := wait.Err(); err != nil {
+			return nil, lockWaitError(path, err)
+		}
+		acquired, err := lock.tryLock()
+		if err != nil {
+			return nil, fmt.Errorf("locking worktree %q: %w", path, err)
+		}
+		if acquired {
+			if err := wait.Err(); err != nil {
+				return nil, lockWaitError(path, err)
+			}
+			keep = true
+			return lock, nil
+		}
+		select {
+		case <-wait.Done():
+			return nil, lockWaitError(path, wait.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func lockWaitError(path string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w for %q: %w", ErrLockTimeout, path, err)
+	}
+	return fmt.Errorf("locking worktree %q: %w", path, err)
+}
 
 // openLockFile creates and opens the lock file for a workspace path.
 //
@@ -35,7 +108,11 @@ import (
 // second process is already blocked on, after which a third could create a
 // fresh one and hold "the same" lock simultaneously.
 func openLockFile(repoDir, path string) (*os.File, error) {
-	lockFile, err := lockFilePath(repoDir, path)
+	return openLockFileContext(context.Background(), repoDir, path)
+}
+
+func openLockFileContext(ctx context.Context, repoDir, path string) (*os.File, error) {
+	lockFile, err := lockFilePathContext(ctx, repoDir, path)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +130,11 @@ func openLockFile(repoDir, path string) (*os.File, error) {
 // of the canonical path rather than the path itself, so that no workspace name
 // can produce an invalid or colliding file name.
 func lockFilePath(repoDir, path string) (string, error) {
-	common, err := git.New(repoDir).CommonDir()
+	return lockFilePathContext(context.Background(), repoDir, path)
+}
+
+func lockFilePathContext(ctx context.Context, repoDir, path string) (string, error) {
+	common, err := git.New(repoDir).CommonDirCtx(ctx)
 	if err != nil {
 		return "", fmt.Errorf("locating worktree lock dir for %q: %w", path, err)
 	}

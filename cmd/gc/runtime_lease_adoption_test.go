@@ -340,9 +340,9 @@ func TestLegacyStartReleasesLeasesOnAnEarlyReturn(t *testing.T) {
 	defer cancel()
 	clk := &clock.Fake{Time: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
 	executePlannedStartsTraced(ctx, []startCandidate{f.cand}, f.cfg, f.desired, f.sp, f.store, "test-city", f.city,
-		clk, events.Discard, time.Minute, &f.log, &f.log, nil, withTaskWorkDirResolver(func(startCandidate, *config.City) string {
+		clk, events.Discard, time.Minute, &f.log, &f.log, nil, withTaskWorkDirResolver(func(startCandidate, *config.City) (string, error) {
 			cancel()
-			return ""
+			return "", nil
 		}))
 	if len(f.sp.starts) != 0 {
 		t.Fatalf("a canceled pass started %q", f.sp.starts)
@@ -512,14 +512,14 @@ func TestRecoveryCommitTakesTheRuntimeLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, batch := recoverRunningPendingCreate(city, sessiontest.SeedBead(t, bead), tp, cfg, store, clk, nil); !ok || batch != nil {
+	if ok, batch := recoverRunningPendingCreate(city, sessiontest.SeedBead(t, bead), tp, cfg, store, nil, clk, io.Discard, nil); !ok || batch != nil {
 		t.Fatalf("recovery under a held lease = (%v, %v), want deferred", ok, batch)
 	}
 	if claim := mustGetBead(t, store, bead.ID).Metadata["pending_create_claim"]; claim != "true" {
 		t.Fatalf("pending_create_claim under a held lease = %q, want untouched", claim)
 	}
 	held.Release()
-	if ok, _ := recoverRunningPendingCreate(city, sessiontest.SeedBead(t, mustGetBead(t, store, bead.ID)), tp, cfg, store, clk, nil); !ok {
+	if ok, _ := recoverRunningPendingCreate(city, sessiontest.SeedBead(t, mustGetBead(t, store, bead.ID)), tp, cfg, store, nil, clk, io.Discard, nil); !ok {
 		t.Fatal("recovery with a free lease did not heal")
 	}
 	meta := mustGetBead(t, store, bead.ID).Metadata

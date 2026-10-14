@@ -48,6 +48,7 @@ type createPlan struct {
 	// the spec and stamps the work dir before it writes the row.
 	Metadata     map[string]string
 	WorktreeSpec *worktree.Spec
+	WorktreeRef  *worktreeReference
 	// WorkBeadID is the request's trigger work, which the in-flight entry
 	// reserves until the census shows the row (inFlightStandIns).
 	WorkBeadID string
@@ -120,6 +121,7 @@ func createPlanOf(id, template string, p poolSessionCreatePlan) createPlan {
 		Slot:              p.slot,
 		Metadata:          p.metadata,
 		WorktreeSpec:      p.worktreeSpec,
+		WorktreeRef:       p.worktreeRef,
 	}
 }
 
@@ -139,18 +141,20 @@ func createPlanOf(id, template string, p poolSessionCreatePlan) createPlan {
 type createPass struct {
 	cfg *config.City
 	// sp answers transport capability checks; no effect probes it, except
-	// that a named AdoptLive stamps the adopted runtime's identity (LL5).
+	// that a named AdoptLive stamps the adopted runtime's identity (LL5) and
+	// a named reopen confirms its name free (nameConfirmedFree).
 	sp                runtime.Provider
 	store             beads.Store
 	rigStores         map[string]beads.Store
 	suspendedRigPaths map[string]bool
 	planning          []session.Info
+	worktreeLegs      WorkLegs
 }
 
 // newCreatePass is the create inputs of the pass that gathered w: its
 // config and provider, the stores the census read, and its canonical rows.
 func newCreatePass(w *World) *createPass {
-	p := &createPass{store: w.SessionsStore, rigStores: w.RigStores, suspendedRigPaths: w.SuspendedRigPaths}
+	p := &createPass{worktreeLegs: w.WorkLegs.readOnly(), store: w.SessionsStore, rigStores: w.RigStores, suspendedRigPaths: w.SuspendedRigPaths}
 	if w.Env != nil {
 		p.cfg, p.sp = w.Env.Cfg, w.Env.SP
 	}
@@ -239,15 +243,16 @@ func (p *createProgress) afterWrite(ctx context.Context, rowID string) error {
 // Create effect stages. A no-write failure names the stage it failed in as
 // its refusal's cause (ineligible:create-refused:<cause>).
 const (
-	createStageStalePlan = "stale-plan" // the plan's template or identity left config
-	createStageWorktree  = "worktree"   // the plan's worktree evidence failed verification
-	createStagePrepare   = "prepare"    // transport, tmux alias, identifiers
-	createStageLock      = "lock"       // the city identifier locks
-	createStageFence     = "fence"      // the locked re-census and availability checks
-	createStageFenceRead = "fence-read" // a pool create's locked failure that proves no name taken
-	createStagePanic     = "panic"      // a panic before the write
-	createStageResolve   = "resolve"    // a named create's read-only template resolution
-	createStageNoWriter  = "no-writer"  // a named reopen whose store resolves no conditional writer (v5 C2)
+	createStageStalePlan = "stale-plan"   // the plan's template or identity left config
+	createStageWorktree  = "worktree"     // the plan's worktree evidence failed verification
+	createStagePrepare   = "prepare"      // transport, tmux alias, identifiers
+	createStageLock      = "lock"         // the city identifier locks
+	createStageFence     = "fence"        // the locked re-census and availability checks
+	createStageFenceRead = "fence-read"   // a pool create's locked failure that proves no name taken
+	createStagePanic     = "panic"        // a panic before the write
+	createStageResolve   = "resolve"      // a named create's read-only template resolution
+	createStageNoWriter  = "no-writer"    // a named reopen whose store resolves no conditional writer (v5 C2)
+	createStageRedecided = causeRedecided // a named reopen whose fresh read finds a live runtime under the name
 )
 
 // createProgress is how far one effect got: the stage a no-write failure
@@ -300,7 +305,7 @@ func (x *createEffects) run(ctx context.Context, pass *createPass, p createPlan,
 		return
 	}
 	prog.stage = createStageWorktree
-	metadata, err := x.verifiedMetadata(p, &prog)
+	metadata, err := x.verifiedMetadata(pass, p, &prog)
 	if err != nil {
 		return
 	}
@@ -331,12 +336,26 @@ func (x *createEffects) run(ctx context.Context, pass *createPass, p createPlan,
 // #34). It reports the verdict in the settlement: on a failure, which writes
 // nothing, the planner stops binding the work while the same evidence stands
 // (C6.5(a)); on a success, it forgets an earlier refusal.
-func (x *createEffects) verifiedMetadata(p createPlan, prog *createProgress) (map[string]string, error) {
-	if p.WorktreeSpec == nil {
+func (x *createEffects) verifiedMetadata(pass *createPass, p createPlan, prog *createProgress) (map[string]string, error) {
+	if p.WorktreeSpec == nil && p.WorktreeRef == nil {
 		return p.Metadata, nil
 	}
-	report, err := x.host.verify(*p.WorktreeSpec)
-	prog.work = &workVerdict{BeadID: p.WorktreeSpec.BeadID, Fingerprint: specFingerprint(*p.WorktreeSpec), Refused: err != nil}
+	var report worktree.Report
+	var err error
+	if p.WorktreeRef != nil {
+		var store beads.Store
+		store, err = pass.worktreeLegs.nativeStore(p.WorktreeRef.StoreRef)
+		if err == nil {
+			report, err = verifyReferencedWorktree(store, p.WorktreeRef.BindingStepID, p.WorktreeRef.StoreRef, p.WorktreeRef, p.WorktreeSpec, x.host.verify)
+		}
+	} else {
+		report, err = x.host.verify(*p.WorktreeSpec)
+	}
+	legacyID := ""
+	if p.WorktreeSpec != nil {
+		legacyID = p.WorktreeSpec.BeadID
+	}
+	prog.work = &workVerdict{BeadID: referenceWorkKey(p.WorktreeRef, legacyID), Fingerprint: referenceFingerprint(p.WorktreeRef, p.WorktreeSpec), Refused: err != nil}
 	if err != nil {
 		return nil, fmt.Errorf("%w: verification failed: %w", errPoolTriggerWorktreeEvidence, err)
 	}

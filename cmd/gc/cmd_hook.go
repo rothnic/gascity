@@ -535,6 +535,7 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		claimOpts := hookClaimOptions{
 			Assignee:           assignee,
 			SessionID:          sessionID,
+			VerifiedSession:    fencedSession,
 			IdentityCandidates: identityCandidates,
 			RouteTargets:       routeTargets,
 			Env:                queryEnv,

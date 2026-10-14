@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -27,7 +28,10 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/closeorder"
 	"github.com/gastownhall/gascity/internal/citylayout"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/coordclass"
+	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
@@ -264,6 +268,107 @@ func workflowMatchesSource(root beads.Bead, sourceBeadID, sourceStoreRef, rootSt
 		return false
 	}
 	return sameStoreRef(rootStoreRef, sourceStoreRef)
+}
+
+// readinessSourceStore keeps convoy membership reads on the authoritative
+// handle while preserving the source store's mutation boundary.
+type readinessSourceStore struct {
+	beads.Store
+}
+
+// Get reads the authoritative source row.
+func (s readinessSourceStore) Get(id string) (beads.Bead, error) {
+	return beads.HandlesFor(s.Store).Live.Get(id)
+}
+
+// List reads authoritative source membership.
+func (s readinessSourceStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	return beads.HandlesFor(s.Store).Live.List(query)
+}
+
+// DepList reads authoritative source dependencies.
+func (s readinessSourceStore) DepList(id, direction string) ([]beads.Dep, error) {
+	return beads.HandlesFor(s.Store).Live.DepList(id, direction)
+}
+
+// EntryDependencies copies unsatisfied source prerequisites to recipe entries.
+// A convoy also contributes its open members' prerequisites. Copied targets must
+// remain in the same store: identical IDs in separate stores are unrelated beads.
+func EntryDependencies(sourceStore, workflowStore beads.Store, recipe *formula.Recipe, sourceID string) ([]molecule.ExternalDep, error) {
+	if sourceID == "" {
+		return nil, nil
+	}
+	if sourceStore == nil || workflowStore == nil || recipe == nil {
+		return nil, fmt.Errorf("source %s readiness requires source and workflow stores and a recipe", sourceID)
+	}
+	sourceValue, workflowValue := reflect.ValueOf(sourceStore), reflect.ValueOf(workflowStore)
+	sameStore := sourceValue.Type() == workflowValue.Type() && sourceValue.Comparable() && workflowValue.Comparable() && sourceStore == workflowStore
+	sourceStore = readinessSourceStore{Store: sourceStore}
+	workflowReader := beads.HandlesFor(workflowStore).Live
+	source, err := sourceStore.Get(sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("loading readiness source %s: %w", sourceID, err)
+	}
+	sources := []beads.Bead{source}
+	if source.Type == "convoy" {
+		members, err := convoycore.Members(sourceStore, sourceID, false)
+		if err != nil {
+			return nil, fmt.Errorf("loading readiness sources for convoy %s: %w", sourceID, err)
+		}
+		for _, member := range members {
+			if convoycore.IsUnresolvedTrackedItem(member) {
+				return nil, fmt.Errorf("source convoy %s has unresolved member %s", sourceID, member.ID)
+			}
+		}
+		sources = append(sources, members...)
+	}
+	var blockers []beads.Dep
+	for _, source := range sources {
+		deps, err := sourceStore.DepList(source.ID, "down")
+		if err != nil {
+			return nil, fmt.Errorf("reading readiness dependencies of %s: %w", source.ID, err)
+		}
+		for _, dep := range deps {
+			if !beads.IsReadyBlockingDependencyType(dep.Type) {
+				continue
+			}
+			target, err := sourceStore.Get(dep.DependsOnID)
+			if err != nil {
+				return nil, fmt.Errorf("resolving source %s prerequisite %s: %w", source.ID, dep.DependsOnID, err)
+			}
+			if beads.DependencySatisfied(target.Status, beads.ReadinessWorkOutcome(target.Metadata)) {
+				continue
+			}
+			if _, err := workflowReader.Get(dep.DependsOnID); err != nil {
+				return nil, fmt.Errorf("source %s prerequisite %s is not resolvable in the workflow store: %w", source.ID, dep.DependsOnID, err)
+			}
+			if !sameStore {
+				return nil, fmt.Errorf("source %s prerequisite %s requires the source and workflow to use the same store", source.ID, dep.DependsOnID)
+			}
+			blockers = append(blockers, dep)
+		}
+	}
+	blockedSteps := make(map[string]bool)
+	for _, dep := range recipe.Deps {
+		if beads.IsReadyBlockingDependencyType(dep.Type) {
+			blockedSteps[dep.StepID] = true
+		}
+	}
+	var result []molecule.ExternalDep
+	seen := make(map[molecule.ExternalDep]bool)
+	for _, step := range recipe.Steps {
+		if blockedSteps[step.ID] {
+			continue
+		}
+		for _, blocker := range blockers {
+			dep := molecule.ExternalDep{StepID: step.ID, DependsOnID: blocker.DependsOnID, Type: blocker.Type}
+			if !seen[dep] {
+				seen[dep] = true
+				result = append(result, dep)
+			}
+		}
+	}
+	return result, nil
 }
 
 // ListLiveRoots returns the live (not-closed) workflow roots in store that

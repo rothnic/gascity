@@ -450,22 +450,50 @@ func TestEndpointTicketOnlyOnLaunch(t *testing.T) {
 // (POOL-055, #34): the binding and the verified work dir land in the PreWake
 // CAS; refused evidence refuses the start before PreWake with the verdict.
 func TestPreWakeFoldsVerifiedBinding(t *testing.T) {
-	spec := &worktree.Spec{BeadID: "w-1"}
-	for _, verifyErr := range []error{nil, errors.New("not owned")} {
-		k, _ := launchKit(t, "asleep")
-		k.p.Alloc.Snapshot.Entries[k.it.Key] = &selectionEntry{Binding: &bindingTarget{WorktreeSpec: spec, Patch: session.MetadataPatch{beadmeta.TriggerBeadIDMetadataKey: "w-1"}}}
-		old := verifyWorktree
-		verifyWorktree = func(worktree.Spec) (worktree.Report, error) { return worktree.Report{Path: "/wt/w-1"}, verifyErr }
-		s := k.runKind()
-		verifyWorktree = old
-		switch {
-		case s.Facts.Work == nil || s.Facts.Work.Refused != (verifyErr != nil):
-			t.Fatalf("verify %v: work verdict %+v", verifyErr, s.Facts.Work)
-		case verifyErr == nil && (k.meta(beadmeta.TriggerBeadIDMetadataKey) != "w-1" || k.meta(beadmeta.WorkDirMetadataKey) != "/wt/w-1"):
-			t.Fatalf("the binding and the verified work dir did not land")
-		case verifyErr != nil && (s.Cause != causeWorktree || k.meta("generation") != "3"):
-			t.Fatalf("refused evidence: settlement %+v; want refused before PreWake", s)
-		}
+	for _, mode := range []string{"", worktree.ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			for _, refuseOwner := range []bool{false, true} {
+				repo, base := worktreeTestRepo(t)
+				root := t.TempDir()
+				spec := worktree.Spec{
+					RepoDir: repo, Root: root, Path: filepath.Join(root, "owned"), Branch: "work/owned", Base: base,
+					BeadID: "w-1", StoreRef: "city:city", Creator: "test", Owner: "test", Generation: "1", Lifecycle: worktree.LifecycleActive,
+					Mode: mode,
+				}
+				if mode == worktree.ModeDetached {
+					spec.Branch = ""
+				}
+				created, err := worktree.Ensure(spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				spec.BaseSHA = created.Provenance.BaseSHA
+				if refuseOwner {
+					spec.Owner = "other"
+				}
+				k, _ := launchKit(t, "asleep")
+				k.p.Alloc.Snapshot.Entries[k.it.Key] = &selectionEntry{Binding: &bindingTarget{WorktreeSpec: &spec, Patch: session.MetadataPatch{beadmeta.TriggerBeadIDMetadataKey: "w-1"}}}
+				old := verifyWorktree
+				called := false
+				verifyWorktree = func(got worktree.Spec) (worktree.Report, error) {
+					called = true
+					if !reflect.DeepEqual(got, spec) {
+						t.Errorf("PreWake lost mode/owner input: %+v, want %+v", got, spec)
+					}
+					return worktree.Verify(got)
+				}
+				s := k.runKind()
+				verifyWorktree = old
+				switch {
+				case !called || s.Facts.Work == nil || s.Facts.Work.Refused != refuseOwner:
+					t.Fatalf("refuseOwner %v: work verdict %+v, verifier called %v", refuseOwner, s.Facts.Work, called)
+				case !refuseOwner && (k.meta(beadmeta.TriggerBeadIDMetadataKey) != "w-1" || k.meta(beadmeta.WorkDirMetadataKey) != spec.Path):
+					t.Fatalf("the binding and the verified work dir did not land")
+				case refuseOwner && (s.Cause != causeWorktree || k.meta("generation") != "3"):
+					t.Fatalf("refused evidence: settlement %+v; want refused before PreWake", s)
+				}
+			}
+		})
 	}
 }
 
@@ -602,6 +630,14 @@ func TestLaunchCommitPremise(t *testing.T) {
 		{"an outside close", []string{"closed"}, false, false, causeCommitLost, true},
 		{"an outside close over a zombie", []string{"closed", "zombie"}, false, false, causeCommitLost, true},
 		{"a kill fence over a zombie", []string{"state", "asleep", "sleep_reason", "killed", "zombie", ""}, false, false, causeCommitLost, true},
+		// An operator's suspend during the Start (mc-z1v39, §12.2 row 65: legacy too) moves state, which refuses.
+		{"an operator's suspend", []string{"sleep_intent", "user-hold", "held_until", gatherNow.Add(24 * time.Hour).Format(time.RFC3339), "suspended_at", gatherNow.Format(time.RFC3339), "state", "suspended"}, false, false, causeCommitLost, true},
+		// Pinned: S2's premise is the token and the state, not the hold (FactsCommit: a heartbeat's held_until
+		// during startup must not orphan the runtime), so a held row read awake commits. No v2 writer makes
+		// that shape during a start: the start owns its row (I8), a suspend writes state=suspended with the
+		// hold, and v2's awake heal never revives a held row (TestSoftSuspendIsNoHold "managed",
+		// TestAwakeHealNeverRevivesAnOperatorDormantRow). Legacy's heal pass did, which was mc-z1v39.
+		{"the operator's hold read awake (no v2 writer)", []string{"sleep_intent", "user-hold", "held_until", gatherNow.Add(24 * time.Hour).Format(time.RFC3339), "suspended_at", gatherNow.Format(time.RFC3339), "state", "awake"}, false, true, "", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			k, leaf := launchKit(t, "asleep", "wake_attempts", "1")

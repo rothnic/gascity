@@ -258,3 +258,36 @@ func refuseScope(info sessionpkg.Info, cfg *config.City) RefuseScope {
 	}
 	return RefuseScope{ids: drainAckAssigneeIdentities(info, cfg)}
 }
+
+// nativeStore selects one exact serving leg, without probing other stores
+// after an owner or step lookup misses in the selected one.
+func (l WorkLegs) nativeStore(ref string) (beads.Store, error) {
+	if err := l.unusable(); err != nil {
+		return nil, err
+	}
+	var selected beads.Store
+	count := 0
+	storeref.EachLeg(l.plan, func(leg storeref.Leg, _ storeref.Role, _ storeref.ErrPolicy) { // residency:allow — selects one exact leg from the existing plan
+		if censusRef(l.cfg, leg.Ref, censusRefScoped) == ref {
+			selected = leg.Store
+			count++
+		}
+	})
+	if count != 1 || selected == nil {
+		return nil, errors.New("native worktree reference store is unavailable or ambiguous")
+	}
+	return selected, nil
+}
+
+// nativeRefsForStores keeps each observed store's full registered identity.
+func (l WorkLegs) nativeRefsForStores(stores []beads.Store) []string {
+	refs := make([]string, len(stores))
+	for i, store := range stores {
+		storeref.EachLeg(l.plan, func(leg storeref.Leg, _ storeref.Role, _ storeref.ErrPolicy) { // residency:allow — identifies an already observed leg in the existing plan
+			if store != nil && unwrapClassStore(store) == unwrapClassStore(leg.Store) {
+				refs[i] = censusRef(l.cfg, leg.Ref, censusRefScoped)
+			}
+		})
+	}
+	return refs
+}

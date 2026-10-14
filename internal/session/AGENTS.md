@@ -82,3 +82,20 @@ see `SESSION-HISTORY-EXACT-KEY`.
 A desired manual entry retains a previously discovered conversation; it is not
 a create request. If a close wins before synchronization refreshes the store,
 leave that conversation terminal instead of recreating its alias and runtime.
+
+## Workspace bindings
+
+`gc.worktree_ref` is session launch configuration. Keep its field registry,
+raw `Info` projection and independent set/clear projection tests in sync.
+Launch and resume validate the retained reference before using a directory.
+
+## Work-bead claim history
+
+Claim-time `gc.session_attempt_id` belongs to the work bead. Only the native
+claim fence's verified session identity may supply its instance token; an
+environment token alone cannot authorize the stamp. Retain it with the session
+back-reference in the same metadata patch and validate the expected attempt on
+readback. Keep unknown/tokenless admission unstamped without changing the
+existing claim policy; control and closed work remain unstamped. The owning
+regressions are `TestHookClaim*Attempt*` and the session-store-fault claim control
+in `cmd/gc`.

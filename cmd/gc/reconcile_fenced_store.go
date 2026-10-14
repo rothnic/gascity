@@ -195,10 +195,24 @@ var (
 
 func (s blindWriteRefusingStore) ConditionalWritesResolveTarget() beads.Store { return s.inner }
 
+// Handles preserves the backing read guarantees and refuses blind writes.
+func (s blindWriteRefusingStore) Handles() beads.StoreHandles {
+	handles := beads.HandlesFor(s.inner)
+	handles.Writer = s
+	return handles
+}
+
 // readOnlyStore is what Probes and Calls read through (capReadStores): a
 // blind-write-refusing store that, holding only beads.Store, resolves no
 // conditional writer either.
 type readOnlyStore struct{ beads.Store }
+
+// Handles preserves read consistency while withholding mutation authority.
+func (s readOnlyStore) Handles() beads.StoreHandles {
+	handles := beads.HandlesFor(s.Store)
+	handles.Writer = s
+	return handles
+}
 
 func (s blindWriteRefusingStore) ConditionalWriterHandle() (beads.ConditionalWriter, bool) {
 	return beads.ConditionalWriterForTarget(s.inner)

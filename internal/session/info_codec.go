@@ -131,6 +131,7 @@ var infoKeyCodec = []infoKeySpec{
 	// trigger / brain-parent cluster (canonical gc.* keys via beadmeta)
 	{beadmeta.TriggerBeadIDMetadataKey, func(i *Info, v string) { i.TriggerBeadID = v }},
 	{beadmeta.TriggerBeadStoreRefMetadataKey, func(i *Info, v string) { i.TriggerBeadStoreRef = v }},
+	{beadmeta.WorktreeRefMetadataKey, func(i *Info, v string) { i.WorktreeReference = v }},
 	{beadmeta.BrainParentSIDMetadataKey, func(i *Info, v string) { i.BrainParentSID = v }},
 	{beadmeta.PackMetadataKey, func(i *Info, v string) { i.Pack = v }},
 	{beadmeta.PackWorkspaceMetadataKey, func(i *Info, v string) { i.PackWorkspace = v }},

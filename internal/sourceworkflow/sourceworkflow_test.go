@@ -10,9 +10,127 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
+
+func TestEntryDependenciesRefusesUnresolvableWorkflowTarget(t *testing.T) {
+	sourceStore := beads.NewMemStore()
+	workflowStore := beads.NewMemStore()
+	source, err := sourceStore.Create(beads.Bead{Title: "source", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := sourceStore.Create(beads.Bead{Title: "prerequisite", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.DepAdd(source.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatal(err)
+	}
+	recipe := &formula.Recipe{Steps: []formula.RecipeStep{{ID: "work"}}}
+	deps, err := EntryDependencies(sourceStore, workflowStore, recipe, source.ID)
+	if !errors.Is(err, beads.ErrNotFound) || len(deps) != 0 {
+		t.Fatalf("foreign prerequisite = %+v, %v, want refusal", deps, err)
+	}
+	// An unrelated closed row with the same ID cannot satisfy the source's blocker.
+	workflowStore.HonorExplicitIDs = true
+	if _, err := workflowStore.Create(beads.Bead{ID: blocker.ID, Title: "unrelated", Type: "task"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workflowStore.Close(blocker.ID); err != nil {
+		t.Fatal(err)
+	}
+	deps, err = EntryDependencies(sourceStore, workflowStore, recipe, source.ID)
+	if err == nil || len(deps) != 0 {
+		t.Fatalf("same-ID prerequisite in another store = %+v, %v, want refusal", deps, err)
+	}
+	// A prerequisite already satisfied in its owning store needs no foreign edge.
+	if err := sourceStore.Close(blocker.ID); err != nil {
+		t.Fatal(err)
+	}
+	deps, err = EntryDependencies(sourceStore, workflowStore, recipe, source.ID)
+	if err != nil || len(deps) != 0 {
+		t.Fatalf("satisfied prerequisite = %+v, %v, want no entry dependency", deps, err)
+	}
+}
+
+type entryDependencyReadFailure struct {
+	beads.Store
+	err error
+}
+
+func (s entryDependencyReadFailure) DepList(_, _ string) ([]beads.Dep, error) {
+	return nil, s.err
+}
+
+func TestEntryDependenciesPreservesReadFailure(t *testing.T) {
+	store := beads.NewMemStore()
+	source, err := store.Create(beads.Bead{Title: "source", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readErr := errors.New("source dependency read unavailable")
+	recipe := &formula.Recipe{Steps: []formula.RecipeStep{{ID: "work"}}}
+	deps, err := EntryDependencies(entryDependencyReadFailure{Store: store, err: readErr}, store, recipe, source.ID)
+	if !errors.Is(err, readErr) || len(deps) != 0 {
+		t.Fatalf("dependency read = %+v, %v, want original error", deps, err)
+	}
+}
+
+func TestEntryDependenciesReadsCurrentSources(t *testing.T) {
+	for _, shape := range []string{"task", "convoy", "new convoy member"} {
+		t.Run(shape, func(t *testing.T) {
+			store := beads.NewMemStore()
+			sourceType := "task"
+			if shape != "task" {
+				sourceType = "convoy"
+			}
+			source, err := store.Create(beads.Bead{Title: "source", Type: sourceType})
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocker, err := store.Create(beads.Bead{Title: "prerequisite", Type: "task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			workID := source.ID
+			if shape == "convoy" {
+				member, err := store.Create(beads.Bead{Title: "member", Type: "task"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				workID = member.ID
+				if err := store.DepAdd(source.ID, workID, "tracks"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cached := beads.NewCachingStoreForTest(store, nil)
+			if err := cached.Prime(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if shape == "new convoy member" {
+				member, err := store.Create(beads.Bead{Title: "new member", Type: "task"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				workID = member.ID
+				if err := store.DepAdd(source.ID, workID, "tracks"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.DepAdd(workID, blocker.ID, "blocks"); err != nil {
+				t.Fatal(err)
+			}
+			recipe := &formula.Recipe{Steps: []formula.RecipeStep{{ID: "work"}}}
+			deps, err := EntryDependencies(cached, cached, recipe, source.ID)
+			if err != nil || len(deps) != 1 || deps[0].DependsOnID != blocker.ID {
+				t.Fatalf("current source prerequisites = %+v, %v, want blocker %s", deps, err, blocker.ID)
+			}
+		})
+	}
+}
 
 func TestWithLockHonorsContextWhileWaitingForLocalLock(t *testing.T) {
 	cityPath := t.TempDir()

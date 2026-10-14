@@ -3417,6 +3417,274 @@ title = "Do work"
 	return deps
 }
 
+// A formula may be prepared before its source prerequisites close, but none
+// of its entry work may become Ready ahead of those prerequisites.
+func TestSourceReadinessFormulaLaunches(t *testing.T) {
+	for _, shape := range []string{"explicit", "default", "convoy", "convoy-member", "batch-child"} {
+		t.Run(shape, func(t *testing.T) {
+			deps := graphV2ConvoyFirstSlingTestConfig(t)
+			formulaDir := deps.Cfg.FormulaLayers.City[0]
+			if err := os.WriteFile(filepath.Join(formulaDir, "graph-work.toml"), []byte(`
+formula = "graph-work"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "first"
+title = "First entry"
+
+[[steps]]
+id = "other"
+title = "Other entry"
+
+[[steps]]
+id = "later"
+title = "Later work"
+needs = ["first"]
+`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			sourceType := "task"
+			if shape == "convoy" {
+				sourceType = "convoy"
+			}
+			source, err := deps.Store.Create(beads.Bead{Title: "source", Type: sourceType})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var blockers []string
+			for _, depType := range []string{"blocks", "waits-for"} {
+				blocker, err := deps.Store.Create(beads.Bead{Title: depType + " prerequisite", Type: "task"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := deps.Store.DepAdd(source.ID, blocker.ID, depType); err != nil {
+					t.Fatal(err)
+				}
+				blockers = append(blockers, blocker.ID)
+			}
+			a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+			opts := SlingOpts{Target: a, BeadOrFormula: source.ID, OnFormula: "graph-work"}
+			if shape == "default" {
+				opts.OnFormula = ""
+				opts.Target.DefaultSlingFormula = stringPtr("graph-work")
+			}
+			if shape == "convoy-member" {
+				convoy, err := deps.Store.Create(beads.Bead{Title: "input", Type: "convoy"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := convoycore.TrackItem(deps.Store, convoy.ID, source.ID); err != nil {
+					t.Fatal(err)
+				}
+				opts.BeadOrFormula = convoy.ID
+			}
+			var result SlingResult
+			switch shape {
+			case "convoy", "convoy-member":
+				result, err = DoSlingBatch(opts, deps, deps.Store)
+			case "batch-child":
+				result, err = attachBatchFormula(t.Context(), opts, deps, source, a, "graph-work", "formula", "batch-on", true)
+			default:
+				result, err = DoSling(opts, deps, deps.Store)
+			}
+			if err != nil {
+				t.Fatalf("prepare formula: %v", err)
+			}
+			if result.WorkflowID == "" {
+				t.Fatalf("result = %+v, want prepared workflow", result)
+			}
+			assertSourceWorkflowReady(t, deps.Store, result.WorkflowID, false)
+			if shape == "explicit" {
+				before, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeByID := make(map[string]beads.Bead, len(before))
+				beforeDeps := make(map[string][]beads.Dep)
+				for _, b := range before {
+					beforeByID[b.ID] = b
+					if b.ID == result.WorkflowID || b.Metadata[beadmeta.RootBeadIDMetadataKey] == result.WorkflowID {
+						beforeDeps[b.ID], err = deps.Store.DepList(b.ID, "down")
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				_, err = DoSling(opts, deps, deps.Store)
+				var conflict *sourceworkflow.ConflictError
+				if !errors.As(err, &conflict) || conflict.SourceBeadID != source.ID || !slices.Equal(conflict.WorkflowIDs, []string{result.WorkflowID}) {
+					t.Fatalf("repeat attachment error = %v, want conflict with original workflow %s", err, result.WorkflowID)
+				}
+				after, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, b := range after {
+					original, existed := beforeByID[b.ID]
+					if !existed {
+						if b.Type != "convoy" || b.Status != "closed" || b.Metadata[beadmeta.SyntheticMetadataKey] != "true" {
+							t.Fatalf("repeat created unexpected bead: %+v", b)
+						}
+						continue
+					}
+					if depsBefore, isWorkflowBead := beforeDeps[b.ID]; isWorkflowBead {
+						depsAfter, err := deps.Store.DepList(b.ID, "down")
+						if err != nil || !slices.Equal(depsBefore, depsAfter) || original.Revision == 0 || b.Revision != original.Revision {
+							t.Fatalf("repeat mutated workflow bead %s: revisions %d -> %d, deps %v -> %v, err=%v", b.ID, original.Revision, b.Revision, depsBefore, depsAfter, err)
+						}
+					}
+				}
+				if roots := liveGraphV2Roots(t, deps.Store); len(roots) != 1 || roots[0].ID != result.WorkflowID {
+					t.Fatalf("repeat live roots = %+v, want original workflow", roots)
+				}
+				assertSourceWorkflowReady(t, deps.Store, result.WorkflowID, false)
+			}
+			if err := deps.Store.Close(blockers[0]); err != nil {
+				t.Fatal(err)
+			}
+			assertSourceWorkflowReady(t, deps.Store, result.WorkflowID, false)
+			if err := deps.Store.Close(blockers[1]); err != nil {
+				t.Fatal(err)
+			}
+			assertSourceWorkflowReady(t, deps.Store, result.WorkflowID, true)
+		})
+	}
+}
+
+func assertSourceWorkflowReady(t *testing.T, store beads.Store, rootID string, wantReady bool) {
+	t.Helper()
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []string
+	for _, b := range ready {
+		if b.ID == rootID || b.Metadata[beadmeta.RootBeadIDMetadataKey] == rootID {
+			entries = append(entries, b.ID)
+		}
+	}
+	if (len(entries) > 0) != wantReady {
+		t.Fatalf("workflow %s Ready entries = %v, want ready=%t", rootID, entries, wantReady)
+	}
+}
+
+func TestSourceReadinessSlingDryRunDoesNotDispatch(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%t", batch), func(t *testing.T) {
+			deps := graphV2ConvoyFirstSlingTestConfig(t)
+			runner := newFakeRunner()
+			deps.Runner = runner.run
+			targetType := "task"
+			if batch {
+				targetType = "convoy"
+			}
+			source, err := deps.Store.Create(beads.Bead{Title: "blocked source", Type: targetType})
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocker, err := deps.Store.Create(beads.Bead{Title: "prerequisite", Type: "task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := deps.Store.DepAdd(source.ID, blocker.ID, "blocks"); err != nil {
+				t.Fatal(err)
+			}
+			before, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := SlingOpts{Target: config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}, BeadOrFormula: source.ID, OnFormula: "graph-work", DryRun: true, Nudge: true}
+			var result SlingResult
+			if batch {
+				result, err = DoSlingBatch(opts, deps, deps.Store)
+			} else {
+				result, err = DoSling(opts, deps, deps.Store)
+			}
+			if err != nil || !result.DryRun {
+				t.Fatalf("dry-run = %+v, %v", result, err)
+			}
+			after, err := deps.Store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+			if err != nil || len(after) != len(before) || len(runner.calls) != 0 || result.NudgeAgent != nil {
+				t.Fatalf("dry-run effects: beads %d -> %d, calls=%v nudge=%v err=%v", len(before), len(after), runner.calls, result.NudgeAgent, err)
+			}
+		})
+	}
+}
+
+func TestSourceReadinessNativeDependencySemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name, depType, status, outcome, stepOutcome, stepRef string
+		wantReady                                            bool
+	}{
+		{name: "conditional blocker", depType: "conditional-blocks", status: "open"},
+		{name: "closed prerequisite", depType: "blocks", status: "closed", wantReady: true},
+		{name: "closed blocked work", depType: "blocks", status: "closed", outcome: beadmeta.WorkOutcomeBlocked},
+		{name: "plain pass still blocked", depType: "blocks", status: "closed", outcome: beadmeta.WorkOutcomeBlocked, stepOutcome: beadmeta.OutcomePass},
+		{name: "passed control step", depType: "waits-for", status: "closed", outcome: beadmeta.WorkOutcomeBlocked, stepOutcome: beadmeta.OutcomePass, stepRef: "prior.check", wantReady: true},
+		{name: "informational relation", depType: "related", status: "open", wantReady: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := graphV2ConvoyFirstSlingTestConfig(t)
+			blocker, err := deps.Store.Create(beads.Bead{
+				Title: "prerequisite", Type: "task", Status: tc.status,
+				Metadata: map[string]string{beadmeta.WorkOutcomeMetadataKey: tc.outcome, beadmeta.OutcomeMetadataKey: tc.stepOutcome, beadmeta.StepRefMetadataKey: tc.stepRef},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.status == "closed" {
+				if err := deps.Store.Close(blocker.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source, err := deps.Store.Create(beads.Bead{Title: "source", Type: "task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := deps.Store.DepAdd(source.ID, blocker.ID, tc.depType); err != nil {
+				t.Fatal(err)
+			}
+			result, err := DoSling(SlingOpts{Target: config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}, BeadOrFormula: source.ID, OnFormula: "graph-work"}, deps, deps.Store)
+			if err != nil {
+				t.Fatalf("prepare formula: %v", err)
+			}
+			if result.WorkflowID == "" {
+				t.Fatalf("result = %+v, want prepared workflow", result)
+			}
+			assertSourceWorkflowReady(t, deps.Store, result.WorkflowID, tc.wantReady)
+			if tc.status == "closed" && !tc.wantReady {
+				if err := deps.Store.SetMetadata(blocker.ID, beadmeta.WorkOutcomeMetadataKey, ""); err != nil {
+					t.Fatal(err)
+				}
+				assertSourceWorkflowReady(t, deps.Store, result.WorkflowID, true)
+			}
+		})
+	}
+}
+
+func TestSourceReadinessRefusesUnresolvedBlockers(t *testing.T) {
+	for _, blockerID := range []string{"gc-missing", "foreign-42", "external:github/1"} {
+		t.Run(blockerID, func(t *testing.T) {
+			deps := graphV2ConvoyFirstSlingTestConfig(t)
+			source, err := deps.Store.Create(beads.Bead{Title: "source", Type: "task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := deps.Store.DepAdd(source.ID, blockerID, "blocks"); err != nil {
+				t.Fatal(err)
+			}
+			_, err = DoSling(SlingOpts{Target: config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}, BeadOrFormula: source.ID, OnFormula: "graph-work"}, deps, deps.Store)
+			if err == nil || !strings.Contains(err.Error(), source.ID) || !strings.Contains(err.Error(), blockerID) {
+				t.Fatalf("unresolved source blocker error = %v, want source %s and blocker %s", err, source.ID, blockerID)
+			}
+			if roots := liveGraphV2Roots(t, deps.Store); len(roots) != 0 {
+				t.Fatalf("unresolved blocker created live workflows: %+v", roots)
+			}
+		})
+	}
+}
+
 // TestSlingAttachGraphFormulaConvoyFirstNoExistingRootProceeds is the
 // no-false-positive counterpart of
 // TestSlingAttachGraphFormulaSecondBareBeadTargetLaunchBlocksAsDuplicate: a

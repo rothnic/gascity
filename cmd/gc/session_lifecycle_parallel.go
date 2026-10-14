@@ -437,7 +437,7 @@ type startExecutionOptions struct {
 
 type startExecutionOption func(*startExecutionOptions)
 
-type taskWorkDirResolver func(startCandidate, *config.City) string
+type taskWorkDirResolver func(startCandidate, *config.City) (string, error)
 
 func withAsyncStartExecution() startExecutionOption {
 	return func(opts *startExecutionOptions) {
@@ -526,15 +526,6 @@ func withWarmClaimProbe(probe warmClaimTriggerProbe) startExecutionOption {
 func withTriggerBeadResolver(resolve warmClaimTriggerResolver) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.dispatchOptionSources.trigger = resolve
-	}
-}
-
-// withClaimedWorkProbe installs the claimed-work probe that keeps a session
-// holding claimed work on any leg from launching with its trigger bead's opt_*
-// pins. Nil (or the option omitted) consults the session store only.
-func withClaimedWorkProbe(probe claimedWorkProbe) startExecutionOption {
-	return func(opts *startExecutionOptions) {
-		opts.dispatchOptionSources.claimedWork = probe
 	}
 }
 
@@ -1169,6 +1160,10 @@ func buildPreparedStartWithTranscript(
 	dispatchSources dispatchOptionSources,
 	transcript *sessTranscriptState,
 ) (*preparedStart, sessionpkg.Info, error) {
+	taskDir, taskErr := resolvePreparedTaskWorkDir(candidate, cityPath, cfg, store, workDirResolver, dispatchSources)
+	if taskErr != nil {
+		return nil, candidate.info, taskErr
+	}
 	tp := candidate.tp
 	agentCfg, delivery, err := templateParamsToConfigWithDelivery(tp)
 	if err != nil {
@@ -1221,8 +1216,8 @@ func buildPreparedStartWithTranscript(
 	if _, err := repairConcretePoolTemplateWorkDirOverride(&candidate, cityPath, cfg, repairStore); err != nil {
 		return nil, candidate.info, err
 	}
-	if wd := resolvePreparedTaskWorkDir(candidate, cityPath, cfg, store, workDirResolver); wd != "" {
-		agentCfg.WorkDir = wd
+	if taskDir != "" {
+		agentCfg.WorkDir = taskDir
 	} else if wd := preparedStartSessionWorkDir(candidate.info); wd != "" {
 		agentCfg.WorkDir = resolveWorkDirAgainstCity(cityPath, wd)
 	}
@@ -1644,30 +1639,61 @@ func applySchemaOptionOverridesForLaunch(agentCfg *runtime.Config, tp *TemplateP
 	}
 }
 
-func resolvePreparedTaskWorkDir(
-	candidate startCandidate,
-	cityPath string,
-	cfg *config.City,
-	store beads.Store,
-	workDirResolver taskWorkDirResolver,
-) string {
-	// Prepared drain items only: the item step's copied metadata can still name
-	// the launcher checkout before prepare-worktree runs. Deliberately NOT the
-	// full resolveTaskBeadWorkDir chain — that would put the trigger bead ahead
-	// of the snapshot resolver for every pool session.
-	if triggerID := strings.TrimSpace(candidate.info.TriggerBeadID); triggerID != "" && store != nil {
-		if trigger, err := store.Get(triggerID); err == nil {
-			if workDir := resolveDrainSourceWorkDir(cityPath, store, trigger); workDir != "" {
-				return workDir
+func resolvePreparedTaskWorkDir(candidate startCandidate, cityPath string, cfg *config.City, store beads.Store, resolver taskWorkDirResolver, sources dispatchOptionSources) (string, error) {
+	if candidate.info.WorktreeReference != "" && strings.TrimSpace(candidate.info.TriggerBeadID) == "" {
+		return "", errors.New("native worktree reference lacks its invoking trigger")
+	}
+	if id := strings.TrimSpace(candidate.info.TriggerBeadID); id != "" {
+		selected := store
+		storeRef := canonicalWorktreeStoreRef(cfg, candidate.info.TriggerBeadStoreRef)
+		var err error
+		if sources.nativeWorkStore != nil {
+			selected, err = sources.nativeWorkStore(storeRef)
+		} else if storeRef != "city:"+censusCityName(cfg) {
+			selected = nil
+		}
+		if err != nil || selected == nil {
+			if candidate.info.WorktreeReference != "" {
+				if err != nil {
+					return "", fmt.Errorf("native worktree reference selected store %q: %w", storeRef, err)
+				}
+				return "", errors.New("native worktree reference selected store is unavailable")
+			}
+		} else {
+			trigger, readErr := beads.HandlesFor(selected).Live.Get(id)
+			if readErr != nil {
+				if candidate.info.WorktreeReference != "" {
+					return "", fmt.Errorf("native worktree reference trigger read: %w", readErr)
+				}
+			} else {
+				if candidate.info.WorktreeReference != "" {
+					var expected *worktreeReference
+					if err := json.Unmarshal([]byte(candidate.info.WorktreeReference), &expected); err != nil {
+						return "", fmt.Errorf("native worktree reference binding decode: %w", err)
+					}
+					actual, err := worktreeReferenceForBead(trigger, storeRef)
+					if err != nil {
+						return "", err
+					}
+					if expected == nil || actual == nil || *expected != *actual {
+						return "", errors.New("native worktree reference changed since trigger binding")
+					}
+				}
+				if dir, present, err := nativeReferenceWorkDir(selected, trigger, storeRef); present {
+					return dir, err
+				}
+				if dir, err := resolveDrainSourceWorkDir(cityPath, selected, storeRef, trigger); dir != "" || err != nil {
+					return dir, err
+				}
 			}
 		}
 	}
-	if workDirResolver != nil {
-		if workDir := workDirResolver(candidate, cfg); workDir != "" {
-			return workDir
+	if resolver != nil {
+		if dir, err := resolver(candidate, cfg); dir != "" || err != nil {
+			return dir, err
 		}
 	}
-	return resolveTaskWorkDir(cityPath, store, taskWorkDirAssignees(candidate, cfg)...)
+	return resolveTaskWorkDir(cityPath, store, "city:"+censusCityName(cfg), taskWorkDirAssignees(candidate, cfg)...)
 }
 
 // generatedPreStartPrefixes are the exact command prefixes
@@ -2922,7 +2948,17 @@ func commitStartResultTraced(
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "runtime_mcp_snapshot_failed", result.started, result.finished, err, result.phases)
 		return startCommitFailed
 	}
-	applied, err := sessFront.CommitStartedIfCurrentUnder(info, metadata, result.prepared.candidate.lease)
+	applied, err := sessFront.CommitStartedIfCurrentUnder(info, metadata, result.prepared.candidate.lease, sessionpkg.StartCommitRefusingHolds())
+	if errors.Is(err, sessionpkg.ErrStartCommitHeld) {
+		// An operator's suspend landed while the start ran (CONTRACT S1
+		// v5.6, §12.2 row 65): nothing commits, the in-flight lease is still
+		// this start's to release, and the caller stops the runtime it
+		// spawned as a stale start's.
+		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
+		fmt.Fprintf(stderr, "session reconciler: discarding the start of %s: %v\n", name, err) //nolint:errcheck
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "user_held", result.started, result.finished, nil, result.phases)
+		return startCommitStale
+	}
 	if err != nil {
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		fmt.Fprintf(stderr, "session reconciler: storing hashes for %s: %v\n", name, err) //nolint:errcheck
@@ -3401,14 +3437,19 @@ func recordStartupHealthFailure(info sessionpkg.Info, name string, err error, se
 //
 // The heal is a start's commit, so it runs under the runtime lease like one
 // (I-LEASE): taken without waiting before the rebuild's writes, and the
-// commit is refused once the lease was taken over.
+// commit is refused once the lease was taken over. Like the async commit, it
+// refuses a row an operator suspended (StartCommitRefusingHolds) and stops
+// the start's runtime through sp, as a stale start's (CONTRACT S1 v5.6,
+// §12.2 row 65).
 func recoverRunningPendingCreate(
 	cityPath string,
 	info sessionpkg.Info,
 	tp TemplateParams,
 	cfg *config.City,
 	store beads.Store,
+	sp runtime.Provider,
 	clk clock.Clock,
+	stderr io.Writer,
 	trace *sessionReconcilerTraceCycle,
 ) (bool, map[string]string) {
 	if strings.TrimSpace(info.ID) == "" || store == nil {
@@ -3500,7 +3541,20 @@ func recoverRunningPendingCreate(
 		PrimedAt:            primedAt,
 		PromptHash:          promptHash,
 	})
-	applied, err := sessionFrontDoor(store).CommitStartedIfCurrentUnder(prepared.candidate.info, metadata, lease)
+	applied, err := sessionFrontDoor(store).CommitStartedIfCurrentUnder(prepared.candidate.info, metadata, lease, sessionpkg.StartCommitRefusingHolds())
+	if errors.Is(err, sessionpkg.ErrStartCommitHeld) {
+		// An operator suspended the row before its start committed (CONTRACT
+		// S1 v5.6, §12.2 row 65): the heal never stamps the start over the
+		// hold, and the runtime the suspend did not stop is stopped as the
+		// start's own, under the lease still held.
+		stopStaleAsyncStartRuntime(startResult{prepared: *prepared}, sp, stderr)
+		if trace != nil {
+			trace.RecordDecision(TraceSiteReconcilerPendingCreate, TraceReasonPendingCreateSuperseded, TraceOutcomeSkipped, tp.TemplateName, tp.SessionName, traceRecordPayload{
+				"user_held": true,
+			})
+		}
+		return true, pendingCreateResidueFold(prepared.candidate.info)
+	}
 	if err != nil {
 		if trace != nil {
 			trace.RecordDecision(TraceSiteReconcilerPendingCreate, TraceReasonPendingCreateCommitFailed, TraceOutcomeFailed, tp.TemplateName, tp.SessionName, traceRecordPayload{

@@ -1084,6 +1084,110 @@ func runGitForFormulaTest(t *testing.T, dir string, args ...string) {
 	}
 }
 
+func TestSourceReadinessFormulaCookAttach(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("GC_SESSION", "fake")
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(withBuiltinProviderAliasesTOMLForTest(`
+[workspace]
+name = "my-city"
+provider = "claude"
+
+[daemon]
+formula_v2 = true
+`, "claude")+testControlDispatcherAgentTOML("")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	formulaDir := filepath.Join(cityDir, "formulas")
+	if err := os.MkdirAll(formulaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(formulaDir, "graph-work.formula.toml"), []byte(`
+formula = "graph-work"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "first"
+title = "First entry"
+
+[[steps]]
+id = "other"
+title = "Other entry"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	store, err := openStoreAtForCity(cityDir, cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.Create(beads.Bead{Title: "input", Type: "convoy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := store.Create(beads.Bead{Title: "prerequisite", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DepAdd(source.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatal(err)
+	}
+	runCook := func() formulaCookJSONResult {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		cmd := newFormulaCookCmd(&stdout, &stderr)
+		cmd.SetArgs([]string{"graph-work", "--attach", source.ID, "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("cook attach: %v\nstdout=%s\nstderr=%s", err, &stdout, &stderr)
+		}
+		var result formulaCookJSONResult
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("cook result: %v: %s", err, &stdout)
+		}
+		if !result.OK || result.RootID == "" {
+			t.Fatalf("cook result = %+v", result)
+		}
+		return result
+	}
+	first := runCook()
+	assertReady := func(want bool) {
+		t.Helper()
+		ready, err := store.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entries []string
+		for _, b := range ready {
+			if b.ID == first.RootID || b.Metadata[beadmeta.RootBeadIDMetadataKey] == first.RootID {
+				entries = append(entries, b.ID)
+			}
+		}
+		if (len(entries) > 0) != want {
+			t.Fatalf("workflow %s Ready entries = %v, want ready=%t", first.RootID, entries, want)
+		}
+	}
+	assertReady(false)
+	second := runCook()
+	if second.RootID != first.RootID {
+		t.Fatalf("repeat attach root = %s, want %s", second.RootID, first.RootID)
+	}
+	roots, err := store.List(beads.ListQuery{Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}})
+	if err != nil || len(roots) != 1 {
+		t.Fatalf("repeat attach roots = %+v, %v, want one", roots, err)
+	}
+	assertReady(false)
+	if err := store.Close(blocker.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertReady(true)
+}
+
 func TestFormulaCookAttachGraphV2CreatesFreshRootForBareBeadTarget(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	t.Setenv("GC_HOME", t.TempDir())

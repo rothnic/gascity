@@ -196,6 +196,7 @@ go_test(
         "testenv_import_test.go",
         "wait_test.go",
         "worktree_lifecycle_test.go",
+        "worktree_lock_unix_test.go",
         "worktree_test.go",
     ],
     # The SOLO_TESTS run in targets of their own (below), never here.

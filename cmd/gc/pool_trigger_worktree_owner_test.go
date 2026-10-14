@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"maps"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,101 +13,119 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/testutil"
 	"github.com/gastownhall/gascity/internal/worktree"
 )
 
 func TestBindPoolSessionTriggerBeadVerifiesManagedWorktreeBeforePublishing(t *testing.T) {
-	repo, base := worktreeTestRepo(t)
-	root := t.TempDir()
-	path := filepath.Join(root, "gc-test")
-	spec := worktree.Spec{
-		RepoDir: repo, Root: root, Path: path, Branch: "work/gc-test", Base: base,
-		BeadID: "gc-test", StoreRef: "rig:gascity", Creator: "gc-sling",
-		Owner: "gc-sling", Generation: "1", Lifecycle: worktree.LifecycleActive,
-	}
-	report, err := worktree.Ensure(spec)
-	if err != nil {
-		t.Fatalf("Ensure: %v", err)
-	}
-	spec.BaseSHA = report.Provenance.BaseSHA
+	for _, mode := range []string{"", worktree.ModeAttached, worktree.ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			repo, base := worktreeTestRepo(t)
+			root := t.TempDir()
+			path := filepath.Join(root, "gc-test")
+			spec := worktree.Spec{
+				RepoDir: repo, Root: root, Path: path, Branch: "work/gc-test", Base: base,
+				BeadID: "gc-test", StoreRef: "rig:gascity", Creator: "gc-sling",
+				Owner: "gc-sling", Generation: "1", Lifecycle: worktree.LifecycleActive,
+			}
+			spec.Mode = mode
+			if mode == worktree.ModeDetached {
+				spec.Branch = ""
+			}
+			report, err := worktree.Ensure(spec)
+			if err != nil {
+				t.Fatalf("Ensure: %v", err)
+			}
+			spec.BaseSHA = report.Provenance.BaseSHA
 
-	store := beads.NewMemStore()
-	sessionBead, err := store.Create(beads.Bead{ID: "session-1", Type: "session"})
-	if err != nil {
-		t.Fatalf("Create session bead: %v", err)
-	}
-	info, err := sessionFrontDoor(store).Get(sessionBead.ID)
-	if err != nil {
-		t.Fatalf("Get session info: %v", err)
-	}
-	cfg := &config.City{
-		Workspace: config.Workspace{Name: "city"},
-		Agents: []config.Agent{{
-			Name: "worker", WorkDir: filepath.Join(root, "slot"),
-		}},
-	}
-	bp := newAgentBuildParams("city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), store, &bytes.Buffer{})
+			store := beads.NewMemStore()
+			sessionBead, err := store.Create(beads.Bead{ID: "session-1", Type: "session"})
+			if err != nil {
+				t.Fatalf("Create session bead: %v", err)
+			}
+			info, err := sessionFrontDoor(store).Get(sessionBead.ID)
+			if err != nil {
+				t.Fatalf("Get session info: %v", err)
+			}
+			cfg := &config.City{
+				Workspace: config.Workspace{Name: "city"},
+				Agents: []config.Agent{{
+					Name: "worker", WorkDir: filepath.Join(root, "slot"),
+				}},
+			}
+			bp := newAgentBuildParams("city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), store, &bytes.Buffer{})
 
-	bound, err := bindPoolSessionTriggerBead(bp, &cfg.Agents[0], "worker", info, SessionRequest{
-		WorkBeadID: "gc-test", WorkStoreRef: "rig:gascity", WorktreeSpec: &spec,
-	})
-	if err != nil {
-		t.Fatalf("bind: %v", err)
-	}
-	if bound.WorkDirCanonical != path || bound.WorkDir != path {
-		t.Fatalf("bound work dirs = canonical %q legacy %q, want verified %q", bound.WorkDirCanonical, bound.WorkDir, path)
-	}
-	persisted, err := store.Get(sessionBead.ID)
-	if err != nil {
-		t.Fatalf("Get persisted session: %v", err)
-	}
-	if persisted.Metadata[beadmeta.WorkDirMetadataKey] != path ||
-		persisted.Metadata[beadmeta.LegacyWorkDirMetadataKey] != path {
-		t.Fatalf("persisted metadata = %+v, want verified work dir twins", persisted.Metadata)
+			bound, err := bindPoolSessionTriggerBead(bp, &cfg.Agents[0], "worker", info, SessionRequest{
+				WorkBeadID: "gc-test", WorkStoreRef: "rig:gascity", WorktreeSpec: &spec,
+			})
+			if err != nil {
+				t.Fatalf("bind: %v", err)
+			}
+			if bound.WorkDirCanonical != path || bound.WorkDir != path {
+				t.Fatalf("bound work dirs = canonical %q legacy %q, want verified %q", bound.WorkDirCanonical, bound.WorkDir, path)
+			}
+			persisted, err := store.Get(sessionBead.ID)
+			if err != nil {
+				t.Fatalf("Get persisted session: %v", err)
+			}
+			if persisted.Metadata[beadmeta.WorkDirMetadataKey] != path ||
+				persisted.Metadata[beadmeta.LegacyWorkDirMetadataKey] != path {
+				t.Fatalf("persisted metadata = %+v, want verified work dir twins", persisted.Metadata)
+			}
+		})
 	}
 }
 
 func TestBindPoolSessionTriggerBeadRejectsCompetingOwnerBeforeMetadata(t *testing.T) {
-	repo, base := worktreeTestRepo(t)
-	root := t.TempDir()
-	path := filepath.Join(root, "gc-test")
-	spec := worktree.Spec{
-		RepoDir: repo, Root: root, Path: path, Branch: "work/gc-test", Base: base,
-		BeadID: "gc-test", StoreRef: "rig:gascity", Creator: "gc-sling",
-		Owner: "gc-sling", Generation: "1", Lifecycle: worktree.LifecycleActive,
-	}
-	report, err := worktree.Ensure(spec)
-	if err != nil {
-		t.Fatalf("Ensure: %v", err)
-	}
-	spec.BaseSHA = report.Provenance.BaseSHA
-	spec.Owner = "formula"
+	for _, mode := range []string{"", worktree.ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			repo, base := worktreeTestRepo(t)
+			root := t.TempDir()
+			path := filepath.Join(root, "gc-test")
+			spec := worktree.Spec{
+				RepoDir: repo, Root: root, Path: path, Branch: "work/gc-test", Base: base,
+				BeadID: "gc-test", StoreRef: "rig:gascity", Creator: "gc-sling",
+				Owner: "gc-sling", Generation: "1", Lifecycle: worktree.LifecycleActive,
+			}
+			spec.Mode = mode
+			if mode == worktree.ModeDetached {
+				spec.Branch = ""
+			}
+			report, err := worktree.Ensure(spec)
+			if err != nil {
+				t.Fatalf("Ensure: %v", err)
+			}
+			spec.BaseSHA = report.Provenance.BaseSHA
+			spec.Owner = "formula"
 
-	store := beads.NewMemStore()
-	sessionBead, err := store.Create(beads.Bead{ID: "session-1", Type: "session"})
-	if err != nil {
-		t.Fatalf("Create session bead: %v", err)
-	}
-	info, err := sessionFrontDoor(store).Get(sessionBead.ID)
-	if err != nil {
-		t.Fatalf("Get session info: %v", err)
-	}
-	cfg := &config.City{Workspace: config.Workspace{Name: "city"}, Agents: []config.Agent{{Name: "worker"}}}
-	bp := newAgentBuildParams("city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), store, &bytes.Buffer{})
+			store := beads.NewMemStore()
+			sessionBead, err := store.Create(beads.Bead{ID: "session-1", Type: "session"})
+			if err != nil {
+				t.Fatalf("Create session bead: %v", err)
+			}
+			info, err := sessionFrontDoor(store).Get(sessionBead.ID)
+			if err != nil {
+				t.Fatalf("Get session info: %v", err)
+			}
+			cfg := &config.City{Workspace: config.Workspace{Name: "city"}, Agents: []config.Agent{{Name: "worker"}}}
+			bp := newAgentBuildParams("city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), store, &bytes.Buffer{})
 
-	if _, err := bindPoolSessionTriggerBead(bp, &cfg.Agents[0], "worker", info, SessionRequest{
-		WorkBeadID: "gc-test", WorkStoreRef: "rig:gascity", WorktreeSpec: &spec,
-	}); err == nil {
-		t.Fatal("bind accepted competing worktree owner")
-	}
-	persisted, err := store.Get(sessionBead.ID)
-	if err != nil {
-		t.Fatalf("Get persisted session: %v", err)
-	}
-	if persisted.Metadata[beadmeta.WorkDirMetadataKey] != "" ||
-		persisted.Metadata[beadmeta.LegacyWorkDirMetadataKey] != "" ||
-		persisted.Metadata[beadmeta.TriggerBeadIDMetadataKey] != "" {
-		t.Fatalf("failed verification published partial metadata: %+v", persisted.Metadata)
+			if _, err := bindPoolSessionTriggerBead(bp, &cfg.Agents[0], "worker", info, SessionRequest{
+				WorkBeadID: "gc-test", WorkStoreRef: "rig:gascity", WorktreeSpec: &spec,
+			}); err == nil {
+				t.Fatal("bind accepted competing worktree owner")
+			}
+			persisted, err := store.Get(sessionBead.ID)
+			if err != nil {
+				t.Fatalf("Get persisted session: %v", err)
+			}
+			if persisted.Metadata[beadmeta.WorkDirMetadataKey] != "" ||
+				persisted.Metadata[beadmeta.LegacyWorkDirMetadataKey] != "" ||
+				persisted.Metadata[beadmeta.TriggerBeadIDMetadataKey] != "" {
+				t.Fatalf("failed verification published partial metadata: %+v", persisted.Metadata)
+			}
+		})
 	}
 }
 
@@ -141,6 +161,20 @@ func TestWorktreeSpecForBeadRequiresCompletePublishedEvidence(t *testing.T) {
 		spec.Lifecycle != metadata[beadmeta.WorktreeLifecycleMetadataKey] {
 		t.Fatalf("spec = %+v, want exact published evidence", spec)
 	}
+	for _, mode := range []string{worktree.ModeAttached, worktree.ModeDetached} {
+		published := maps.Clone(metadata)
+		published[beadmeta.WorktreeModeMetadataKey] = mode
+		published[beadmeta.WorktreePlacementMetadataKey] = worktree.PlacementOutsideWorktrees
+		if mode == worktree.ModeDetached {
+			delete(published, beadmeta.WorkBranchMetadataKey)
+		}
+		decoded, err := worktreeSpecForBead(beads.Bead{ID: bead.ID, Metadata: published}, "rig:gascity")
+		if err != nil || decoded == nil || decoded.Mode != mode || decoded.Placement != worktree.PlacementOutsideWorktrees ||
+			decoded.BeadID != bead.ID || decoded.BaseSHA != spec.BaseSHA || decoded.Owner != spec.Owner ||
+			(mode == worktree.ModeDetached && decoded.Branch != "") {
+			t.Fatalf("mode-aware published input = %+v, %v", decoded, err)
+		}
+	}
 
 	delete(metadata, beadmeta.WorktreeOwnerMetadataKey)
 	if _, err := worktreeSpecForBead(bead, "rig:gascity"); err == nil ||
@@ -151,6 +185,24 @@ func TestWorktreeSpecForBeadRequiresCompletePublishedEvidence(t *testing.T) {
 	delete(metadata, beadmeta.WorkDirMetadataKey)
 	if spec, err := worktreeSpecForBead(bead, "rig:gascity"); err != nil || spec != nil {
 		t.Fatalf("bead without work_dir = spec %+v err %v, want no managed workspace", spec, err)
+	}
+}
+
+func TestWorktreeSpecForBeadRejectsInvalidModeEvidence(t *testing.T) {
+	for _, metadata := range []map[string]string{
+		{beadmeta.WorktreeModeMetadataKey: ""},
+		{beadmeta.WorktreePlacementMetadataKey: ""},
+		{beadmeta.WorkDirMetadataKey: "/worktrees/owned", beadmeta.WorktreeModeMetadataKey: worktree.ModeDetached},
+		{beadmeta.WorkDirMetadataKey: "/worktrees/owned", beadmeta.WorktreeModeMetadataKey: "unknown", beadmeta.WorktreePlacementMetadataKey: worktree.PlacementOutsideWorktrees},
+		{beadmeta.WorkDirMetadataKey: "/worktrees/owned", beadmeta.WorktreeModeMetadataKey: worktree.ModeDetached, beadmeta.WorktreePlacementMetadataKey: "within-repo-root"},
+		{beadmeta.WorktreeModeMetadataKey: worktree.ModeDetached, beadmeta.WorktreePlacementMetadataKey: worktree.PlacementOutsideWorktrees},
+		{beadmeta.WorkDirMetadataKey: "/worktrees/owned", beadmeta.WorktreeModeMetadataKey: worktree.ModeDetached, beadmeta.WorktreePlacementMetadataKey: worktree.PlacementOutsideWorktrees},
+		{beadmeta.WorkDirMetadataKey: "/worktrees/owned", beadmeta.WorkBranchMetadataKey: "ambient", beadmeta.WorktreeModeMetadataKey: worktree.ModeDetached, beadmeta.WorktreePlacementMetadataKey: worktree.PlacementOutsideWorktrees},
+		{beadmeta.WorkDirMetadataKey: "/worktrees/owned", beadmeta.WorkBranchMetadataKey: "ambient", beadmeta.WorktreeModeMetadataKey: worktree.ModeAttached, beadmeta.WorktreePlacementMetadataKey: worktree.PlacementOutsideWorktrees},
+	} {
+		if spec, err := worktreeSpecForBead(beads.Bead{ID: "gc-test", Metadata: metadata}, "rig:gascity"); err == nil || spec != nil {
+			t.Fatalf("new mode declaration fell through to unmanaged: metadata=%v, spec=%+v, err=%v", metadata, spec, err)
+		}
 	}
 }
 
@@ -291,5 +343,238 @@ func TestWorktreeSpecForBeadPrefersCanonicalStoreRef(t *testing.T) {
 	}
 	if fallback.StoreRef != "city" {
 		t.Fatalf("fallback StoreRef = %q, want the caller's %q", fallback.StoreRef, "city")
+	}
+}
+
+func TestWorktreeReferencePresenceRefusesUnmanagedCompatibility(t *testing.T) {
+	for _, raw := range []string{"", "null", "{}", "{", `{"version":2}`, `{"version":1,"generation":"1"}`} {
+		t.Run(raw, func(t *testing.T) {
+			bead := beads.Bead{ID: "step", Metadata: map[string]string{"gc.worktree_ref": raw, "work_dir": t.TempDir()}}
+			if spec, err := worktreeSpecForBead(bead, "city:fixture"); err == nil || spec != nil {
+				t.Fatalf("declared reference reached unmanaged compatibility: %+v, %v", spec, err)
+			}
+		})
+	}
+}
+
+func TestPoolTriggerNativeReferencePlanOnlyDefersVerification(t *testing.T) {
+	ref := &worktreeReference{BindingStepID: "step", StoreRef: "city:fixture"}
+	request := SessionRequest{WorkBeadID: "step", WorkStoreRef: ref.StoreRef, WorktreeRef: ref}
+	plan := &agentBuildParams{planOnly: true}
+	if dir, err := verifiedPoolTriggerWorkDir(plan, nil, "worker", request); dir != "" || err != nil {
+		t.Fatalf("plan-only native reference read a missing work store: dir=%q err=%v", dir, err)
+	}
+	request.WorkBeadID = "other-step"
+	if _, err := verifiedPoolTriggerWorkDir(plan, nil, "worker", request); err == nil {
+		t.Fatal("plan-only reference accepted another invoking step")
+	}
+	request.WorkBeadID = "step"
+	request.WorkStoreRef = "rig:other"
+	if _, err := verifiedPoolTriggerWorkDir(plan, nil, "worker", request); err == nil {
+		t.Fatal("plan-only reference accepted another selected store")
+	}
+}
+
+func TestSharedWorktreeReferenceBinding(t *testing.T) {
+	repo, base := worktreeTestRepo(t)
+	parent := t.TempDir()
+	spec := worktree.Spec{
+		RepoDir: repo, Root: parent, Path: filepath.Join(parent, "owner"), Mode: worktree.ModeDetached,
+		Base: base, BeadID: "physical-workspace", StoreRef: "city:fixture", Creator: "test", Owner: "stable-owner", Generation: "1", Lifecycle: worktree.LifecycleActive,
+	}
+	report, err := worktree.Ensure(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := beads.NewMemStore()
+	store.HonorExplicitIDs = true
+	if _, err := store.Create(beads.Bead{ID: "session", Type: sessionpkg.BeadType}); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := store.Create(beads.Bead{ID: spec.BeadID, Metadata: map[string]string{
+		beadmeta.WorkDirMetadataKey: spec.Path, beadmeta.WorktreeRepoMetadataKey: spec.RepoDir,
+		beadmeta.WorktreeRootMetadataKey: spec.Root, beadmeta.WorktreeBaseRefMetadataKey: spec.Base,
+		beadmeta.WorktreeBaseSHAMetadataKey: report.Provenance.BaseSHA, beadmeta.WorktreeCreatorMetadataKey: spec.Creator,
+		beadmeta.WorktreeOwnerMetadataKey: spec.Owner, beadmeta.WorktreeGenerationMetadataKey: spec.Generation,
+		beadmeta.WorktreeLifecycleMetadataKey: spec.Lifecycle, beadmeta.RootBeadIDMetadataKey: "workflow-root",
+		beadmeta.RootStoreRefMetadataKey: spec.StoreRef, beadmeta.WorktreeModeMetadataKey: spec.Mode,
+		beadmeta.WorktreePlacementMetadataKey: worktree.PlacementOutsideWorktrees,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"member-a", "member-b"} {
+		ref := map[string]any{
+			"version": 1, "binding_step_id": id, "workflow_root_id": "workflow-root", "generation": 1,
+			"workspace_owner_id": spec.Owner, "workspace_bead_id": owner.ID, "store_ref": spec.StoreRef, "native_attempt_id": report.Provenance.AttemptID,
+		}
+		raw, err := json.Marshal(ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		step, err := store.Create(beads.Bead{ID: id, Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: "workflow-root", beadmeta.RootStoreRefMetadataKey: spec.StoreRef, "gc.worktree_ref": string(raw)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, binding, err := worktreeBindingForBead(store, step, spec.StoreRef)
+		if err != nil || got == nil || binding == nil || got.BeadID != owner.ID || got.Owner != spec.Owner {
+			t.Fatalf("member %s binding = %+v, %+v, %v", id, got, binding, err)
+		}
+		if verified, err := verifyReferencedWorktree(store, id, spec.StoreRef, binding, got, worktree.Verify); err != nil || verified.Path != spec.Path {
+			t.Fatalf("member %s verification = %+v, %v", id, verified, err)
+		}
+		encodedBinding, err := json.Marshal(binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := startCandidate{info: sessionpkg.Info{ID: "session", TriggerBeadID: id, TriggerBeadStoreRef: spec.StoreRef, WorktreeReference: string(encodedBinding), SessionKey: "preserved"}}
+		if dir, err := resolvePreparedTaskWorkDir(candidate, "", &config.City{Workspace: config.Workspace{Name: "fixture"}}, store, nil, dispatchOptionSources{}); err != nil || dir != spec.Path {
+			t.Fatalf("prepared shared workspace = %q, %v", dir, err)
+		}
+		for _, change := range []string{"unchanged", "removed", "rebound"} {
+			t.Run(id+"/assigned-"+change, func(t *testing.T) {
+				status, assignee := "in_progress", "session"
+				if err := store.Update(id, beads.UpdateOpts{Status: &status, Assignee: &assignee, Metadata: map[string]string{
+					beadmeta.WorktreeRefMetadataKey: string(raw), beadmeta.LegacyWorkDirMetadataKey: spec.Path,
+					beadmeta.RootBeadIDMetadataKey: "workflow-root",
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				observed, err := store.Get(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg := &config.City{Workspace: config.Workspace{Name: "fixture"}}
+				resolver := newAssignedTaskWorkDirResolver("", []beads.Bead{observed}, []string{spec.StoreRef}, func(string) (beads.Store, error) { return store, nil })
+				switch change {
+				case "removed":
+					replacement := observed
+					replacement.Metadata = maps.Clone(observed.Metadata)
+					delete(replacement.Metadata, beadmeta.WorktreeRefMetadataKey)
+					if err := store.Delete(id); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := store.Create(replacement); err != nil {
+						t.Fatal(err)
+					}
+				case "rebound":
+					rebound := maps.Clone(ref)
+					rebound["workflow_root_id"] = "replacement-root"
+					encoded, err := json.Marshal(rebound)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := store.SetMetadataBatch(id, map[string]string{beadmeta.WorktreeRefMetadataKey: string(encoded), beadmeta.RootBeadIDMetadataKey: "replacement-root"}); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.SetMetadata(owner.ID, beadmeta.RootBeadIDMetadataKey, "replacement-root"); err != nil {
+						t.Fatal(err)
+					}
+					fresh, err := store.Get(id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, present, err := nativeReferenceWorkDir(store, fresh, spec.StoreRef); !present || err != nil {
+						t.Fatalf("replacement must be independently valid: present=%v, err=%v", present, err)
+					}
+				}
+				candidate := startCandidate{info: sessionpkg.Info{ID: assignee, SessionKey: "preserved"}, tp: TemplateParams{TemplateName: "worker", SessionName: "worker", Command: "agent"}}
+				prepared, returned, err := buildPreparedStartWithWorkDirResolver(candidate, "", cfg, store, resolver, dispatchOptionSources{})
+				if change == "unchanged" {
+					if err != nil || prepared == nil || prepared.cfg.WorkDir != spec.Path {
+						t.Fatalf("unchanged assigned reference: prepared=%v, err=%v", prepared, err)
+					}
+				} else if err == nil || prepared != nil || returned.SessionKey != "preserved" {
+					t.Fatalf("changed reference reached preparation or reset: prepared=%v, key=%q, err=%v", prepared, returned.SessionKey, err)
+				}
+				if err := store.SetMetadata(owner.ID, beadmeta.RootBeadIDMetadataKey, "workflow-root"); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.SetMetadataBatch(id, map[string]string{beadmeta.WorktreeRefMetadataKey: string(raw), beadmeta.RootBeadIDMetadataKey: "workflow-root"}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+		for _, changedID := range []string{id, owner.ID} {
+			t.Run(id+"/cached-"+changedID, func(t *testing.T) {
+				cache := beads.NewCachingStore(store, nil)
+				for _, key := range []string{id, owner.ID} {
+					if _, err := beads.HandlesFor(cache).Cached.Get(key); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg := &config.City{Workspace: config.Workspace{Name: "fixture"}}
+				selected, err := workLegsFromCensus("", cfg, cityWorkLeg{store: cache}, nil).readOnly().nativeStore(spec.StoreRef)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := beads.HandlesFor(selected).Writer.SetMetadata(changedID, "unexpected", "write"); err == nil {
+					t.Fatal("read-only handles exposed the original writer")
+				}
+				current, err := store.Get(changedID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.Delete(changedID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := verifyReferencedWorktree(selected, id, spec.StoreRef, binding, got, worktree.Verify); err == nil {
+					t.Fatal("read-only cache authorized a removed step or owner")
+				}
+				if _, err := store.Create(current); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+		for _, field := range []string{"binding_step_id", "workflow_root_id", "generation", "workspace_owner_id", "workspace_bead_id", "store_ref", "native_attempt_id"} {
+			t.Run(id+"/"+field, func(t *testing.T) {
+				bad := maps.Clone(ref)
+				if field == "generation" {
+					bad[field] = 2
+				} else {
+					bad[field] = "foreign"
+				}
+				encoded, err := json.Marshal(bad)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.SetMetadata(id, "gc.worktree_ref", string(encoded)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := verifyReferencedWorktree(store, id, spec.StoreRef, binding, got, worktree.Verify); err == nil {
+					t.Fatalf("changed %s passed cached binding", field)
+				}
+				if err := store.SetMetadata(id, "gc.worktree_ref", string(raw)); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+	if got := testutil.RunGit(t, spec.Path, "rev-parse", "HEAD"); got != report.Head {
+		t.Fatal("reference verification changed HEAD")
+	}
+	if got := testutil.RunGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(got, spec.Path) {
+		t.Fatal("reference verification removed workspace")
+	}
+}
+
+func TestPreparedNativeReferenceRefusesLegacyDirectory(t *testing.T) {
+	for _, raw := range []string{"", "null", "{", `{"version":2}`} {
+		t.Run(raw, func(t *testing.T) {
+			store := beads.NewMemStore()
+			store.HonorExplicitIDs = true
+			if _, err := store.Create(beads.Bead{ID: "session", Type: sessionpkg.BeadType}); err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			if _, err := store.Create(beads.Bead{ID: "step", Metadata: map[string]string{beadmeta.WorktreeRefMetadataKey: raw, beadmeta.LegacyWorkDirMetadataKey: dir}}); err != nil {
+				t.Fatal(err)
+			}
+			candidate := startCandidate{info: sessionpkg.Info{ID: "session", TriggerBeadID: "step", TriggerBeadStoreRef: "city:fixture", WorkDir: dir, SessionKey: "preserved"}}
+			prepared, returned, err := buildPreparedStartWithWorkDirResolver(candidate, "", &config.City{Workspace: config.Workspace{Name: "fixture"}}, store, func(startCandidate, *config.City) (string, error) { return dir, nil }, dispatchOptionSources{})
+			if err == nil || !strings.Contains(err.Error(), "reference") || prepared != nil || returned.SessionKey != "preserved" {
+				t.Fatalf("invalid native reference reached directory fallback: prepared=%v key=%q err=%v", prepared, returned.SessionKey, err)
+			}
+		})
 	}
 }

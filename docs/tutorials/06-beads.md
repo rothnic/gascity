@@ -259,16 +259,47 @@ The dependency types:
 | Edge                | Means                                       |
 | ------------------- | ------------------------------------------- |
 | **`blocks`**        | must close before the other can start       |
+| **`waits-for`**     | prerequisite must satisfy the readiness rule |
+| **`conditional-blocks`** | prerequisite must satisfy the readiness rule |
 | **`tracks`**        | informational — "I care about this"         |
 | **`related`**       | loose association                           |
 | **`parent-child`**  | containment (via `parent_id`)               |
 | **`discovered-from`** | work surfaced while doing other work      |
 
-Only `blocks` affects work visibility — it expresses *ordering* ("do A before
-B"). The rest express *grouping* ("these beads belong together"): v2 workflow
+`blocks`, `waits-for`, and `conditional-blocks` affect work visibility. A
+prerequisite must close with a satisfied outcome before dependent work becomes
+ready. A closed work bead whose `gc.work_outcome` is `blocked` still holds its
+dependents. The other edges express *grouping*: v2 workflow
 steps `tracks` their root, convoys `tracks` their members, and v1 molecules use
 `parent-child`. A convoy's members don't depend on each other; they're just the
 same batch.
+
+### Prepare a formula before prerequisites finish
+
+You can attach a v2 formula to `mc-xp7` while `mc-a4l` still blocks it:
+
+```shell
+~/my-city
+$ gc sling worker mc-xp7 --on pancakes
+```
+
+The workflow's entry steps inherit the source bead's unsatisfied prerequisites
+when Gas City creates them. The workflow exists immediately, but its entry work
+stays out of ready queries until those prerequisites are satisfied. An agent's
+default formula and `gc formula cook pancakes --attach mc-xp7` use the same rule.
+A convoy launch also waits for the prerequisites of its open members.
+
+Gas City refuses the launch if a prerequisite is missing or unresolved, or if an
+unsatisfied prerequisite belongs to a different store from the workflow. Matching
+bead IDs across stores do not establish a shared dependency. Inspect the source
+with `bd dep list mc-xp7`. `gc sling --dry-run` previews the launch without dispatch.
+Prerequisites are copied at creation time. If you add one later, add the same
+dependency to each workflow entry step as well.
+
+Readiness proves that prerequisites have satisfied their dependency rules.
+Your formula still owns source integration, tests, review, and acceptance of the
+result. See the [formula runtime reference](/reference/specs/formula-spec-v2#3-runtime)
+for the exact attachment rules.
 
 ## Convoys
 

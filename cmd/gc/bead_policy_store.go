@@ -214,6 +214,27 @@ func (s *beadPolicyStore) GetExactBatch(ids []string) (map[string]beads.Bead, []
 	return getter.GetExactBatch(ids)
 }
 
+// Guarded metadata reads and writes keep the inner native capability; policy
+// shapes creation and listing, not metadata patches to exact physical rows.
+func (s *beadPolicyStore) SnapshotMetadata(ids []string) ([]beads.MetadataSnapshot, error) {
+	batch, ok := s.Store.(beads.GuardedMetadataBatchStore)
+	if !ok {
+		return nil, beads.ErrConditionalWriteUnsupported
+	}
+	return batch.SnapshotMetadata(ids)
+}
+
+func (s *beadPolicyStore) ApplyGuardedMetadataBatch(request beads.GuardedMetadataBatchRequest) ([]beads.GuardedMetadataRowResult, error) {
+	if reporter, ok := s.Store.(beads.ReadOnlyReporter); ok && reporter.ReadOnly() {
+		return nil, beads.ErrProxiedNativeReadOnly
+	}
+	batch, ok := s.Store.(beads.GuardedMetadataBatchStore)
+	if !ok {
+		return nil, beads.ErrConditionalWriteUnsupported
+	}
+	return batch.ApplyGuardedMetadataBatch(request)
+}
+
 var (
 	_ beads.ExactBatchGetter = (*beadPolicyStore)(nil)
 	_ beads.ExactBatchGetter = (*beadPolicyGraphStore)(nil)

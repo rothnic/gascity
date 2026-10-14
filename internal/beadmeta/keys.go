@@ -130,7 +130,15 @@ const (
 	// epoch fence committing. Cleared on activation; a root still carrying it
 	// is a pre-fence candidate that idempotency recovery either activates
 	// (deterministically, when it is the surviving candidate) or neutralizes.
-	AttachFencePendingMetadataKey        = "gc.attach_fence_pending"
+	AttachFencePendingMetadataKey = "gc.attach_fence_pending"
+	// AttachRootIDMetadataKey is stamped on every non-root bead of a sub-DAG
+	// molecule.Attach creates, holding that sub-DAG's root ID. It is consumed
+	// by existingAttachIDMapping, which scopes idempotency recovery's step-ref
+	// match to one attachment so it never adopts a sibling attachment's bead
+	// under the same workflow root. It is deliberately not MoleculeIDMetadataKey:
+	// ResolveRunID ranks that key above RootBeadIDMetadataKey, so reusing it
+	// would re-root these beads' run chain at the sub-DAG.
+	AttachRootIDMetadataKey              = "gc.attach_root_id"
 	DeferredAssigneeMetadataKey          = "gc.deferred_assignee"
 	DeferredExecutionRoutedToMetadataKey = "gc.deferred_execution_routed_to"
 	DeferredRoutedToMetadataKey          = "gc.deferred_routed_to"
@@ -248,7 +256,10 @@ const (
 	ScopeRefMetadataKey                 = "gc.scope_ref"
 	ScopeRoleMetadataKey                = "gc.scope_role"
 	SessionAffinityMetadataKey          = "gc.session_affinity"
-	SessionIDMetadataKey                = "gc.session_id"
+	// SessionAttemptIDMetadataKey retains the opaque admitted claim incarnation
+	// on work beads after the session's instance token rotates.
+	SessionAttemptIDMetadataKey = "gc.session_attempt_id"
+	SessionIDMetadataKey        = "gc.session_id"
 	// StrandedMetadataKey ("true"), StrandedSessionMetadataKey (the closed
 	// session's bead ID) and StrandedAssigneeMetadataKey (the claim's assignee
 	// when it was kept) mark a claim a close kept because no lane serves it
@@ -327,7 +338,10 @@ const (
 	WorktreeCreatorMetadataKey     = "gc.worktree_creator"
 	WorktreeGenerationMetadataKey  = "gc.worktree_generation"
 	WorktreeLifecycleMetadataKey   = "gc.worktree_lifecycle"
+	WorktreeRefMetadataKey         = "gc.worktree_ref"
+	WorktreeModeMetadataKey        = "gc.worktree_mode"
 	WorktreeOwnerMetadataKey       = "gc.worktree_owner"
+	WorktreePlacementMetadataKey   = "gc.worktree_placement"
 	WorktreeRepoMetadataKey        = "gc.worktree_repo"
 	WorktreeRootMetadataKey        = "gc.worktree_root"
 	WorkflowIDMetadataKey          = "gc.workflow_id"
@@ -532,6 +546,7 @@ var KnownMetadataKeys = []string{
 	CurrentRunIDMetadataKey,
 	CwdMetadataKey,
 	AttachFencePendingMetadataKey,
+	AttachRootIDMetadataKey,
 	DeferredAssigneeMetadataKey,
 	DeferredExecutionRoutedToMetadataKey,
 	DeferredRoutedToMetadataKey,
@@ -633,6 +648,7 @@ var KnownMetadataKeys = []string{
 	ScopeRefMetadataKey,
 	ScopeRoleMetadataKey,
 	SessionAffinityMetadataKey,
+	SessionAttemptIDMetadataKey,
 	SessionIDMetadataKey,
 	StrandedMetadataKey,
 	StrandedSessionMetadataKey,
@@ -670,6 +686,9 @@ var KnownMetadataKeys = []string{
 	WorktreeCreatorMetadataKey,
 	WorktreeGenerationMetadataKey,
 	WorktreeLifecycleMetadataKey,
+	WorktreeModeMetadataKey,
+	WorktreePlacementMetadataKey,
+	WorktreeRefMetadataKey,
 	WorktreeOwnerMetadataKey,
 	WorktreeRepoMetadataKey,
 	WorktreeRootMetadataKey,

@@ -605,7 +605,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 				Title:            opts.Title,
 				Vars:             formulaVars,
 				PriorityOverride: BeadPriorityOverride(deps.Store, graphInv.InputConvoy),
-			}, "", opts.ScopeKind, opts.ScopeRef, a, deps, opts.Force)
+			}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps, opts.Force)
 			if err != nil {
 				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 			}

@@ -544,44 +544,57 @@ func (s *residueListQuerySpyStore) List(q beads.ListQuery) ([]beads.Bead, error)
 // Round 3 (ga-dkfmdu) test cases below.
 
 func TestExecutorIdentityResidueCheckPreservesWorkDirOnWorktreeOwningBead(t *testing.T) {
-	cityDir := t.TempDir()
-	cfg := &config.City{}
-	cityStore := beads.NewMemStoreFrom(0, []beads.Bead{
-		{ID: "CITY-1", Title: "worktree-owning bead, retired-slot session_name", Type: "task", Status: "open", Metadata: map[string]string{
-			"gc.routed_to":      "gascity/reviewer",
-			"gc.session_name":   "gascity--builder-9",
-			"gc.work_dir":       "/worktrees/gascity/builder-1",
-			"work_dir":          "/legacy/worktrees/gascity/builder-1",
-			"gc.worktree_root":  "/worktrees/gascity/builder-1",
-			"gc.worktree_repo":  "gascity",
-			"gc.worktree_owner": "builder-1",
-		}},
-	}, nil)
+	for i, evidence := range []map[string]string{
+		{"gc.worktree_root": "/worktrees/gascity/builder-1", "gc.worktree_repo": "gascity", "gc.worktree_owner": "builder-1"},
+		{"gc.worktree_mode": "detached", "gc.worktree_placement": "outside-worktrees"},
+		{"gc.worktree_mode": ""},
+		{"gc.worktree_placement": ""},
+	} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			cityDir := t.TempDir()
+			cfg := &config.City{}
+			metadata := map[string]string{
+				"gc.routed_to": "gascity/reviewer", "gc.session_name": "gascity--builder-9",
+				"gc.work_dir": "/worktrees/gascity/builder-1", "work_dir": "/legacy/worktrees/gascity/builder-1",
+			}
+			for key, value := range evidence {
+				metadata[key] = value
+			}
+			cityStore := beads.NewMemStoreFrom(0, []beads.Bead{
+				{ID: "CITY-1", Title: "worktree-owning bead, retired-slot session_name", Type: "task", Status: "open", Metadata: metadata},
+			}, nil)
 
-	check := newExecutorIdentityResidueCheck(cfg, cityDir, func(path string) (beads.Store, error) {
-		if path != cityDir {
-			return nil, fmt.Errorf("unexpected store path %q", path)
-		}
-		return cityStore, nil
-	})
+			check := newExecutorIdentityResidueCheck(cfg, cityDir, func(path string) (beads.Store, error) {
+				if path != cityDir {
+					return nil, fmt.Errorf("unexpected store path %q", path)
+				}
+				return cityStore, nil
+			})
 
-	result := check.Run(&doctor.CheckContext{})
-	if result.Status != doctor.StatusWarning {
-		t.Fatalf("status = %v, want warning (the retired-slot gc.session_name is a genuine independent finding): %#v", result.Status, result)
-	}
+			result := check.Run(&doctor.CheckContext{})
+			if result.Status != doctor.StatusWarning {
+				t.Fatalf("status = %v, want warning (the retired-slot gc.session_name is a genuine independent finding): %#v", result.Status, result)
+			}
 
-	if err := check.Fix(&doctor.CheckContext{}); err != nil {
-		t.Fatalf("Fix returned error: %v", err)
-	}
-	bd, err := cityStore.Get("CITY-1")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if bd.Metadata["gc.work_dir"] != "/worktrees/gascity/builder-1" || bd.Metadata["work_dir"] != "/legacy/worktrees/gascity/builder-1" {
-		t.Fatalf("Fix must not clear work_dir keys on a bead carrying worktree-ownership evidence (clearing them defeats worktreeSpecForBead's fail-closed legacy/canonical conflict check by erasing the evidence it inspects), got %+v", bd.Metadata)
-	}
-	if bd.Metadata["gc.session_name"] != "" {
-		t.Fatalf("Fix must still clear the independently-stale gc.session_name, got %q", bd.Metadata["gc.session_name"])
+			if err := check.Fix(&doctor.CheckContext{}); err != nil {
+				t.Fatalf("Fix returned error: %v", err)
+			}
+			bd, err := cityStore.Get("CITY-1")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if bd.Metadata["gc.work_dir"] != "/worktrees/gascity/builder-1" || bd.Metadata["work_dir"] != "/legacy/worktrees/gascity/builder-1" {
+				t.Fatalf("Fix must not clear work_dir keys on a bead carrying worktree-ownership evidence (clearing them defeats worktreeSpecForBead's fail-closed legacy/canonical conflict check by erasing the evidence it inspects), got %+v", bd.Metadata)
+			}
+			if bd.Metadata["gc.session_name"] != "" {
+				t.Fatalf("Fix must still clear the independently-stale gc.session_name, got %q", bd.Metadata["gc.session_name"])
+			}
+			for key, value := range evidence {
+				if got, ok := bd.Metadata[key]; !ok || got != value {
+					t.Fatalf("Fix erased declared worktree evidence %s=%q", key, value)
+				}
+			}
+		})
 	}
 }
 

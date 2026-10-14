@@ -520,40 +520,59 @@ func TestCreateEffect_WorktreeEvidenceFailureNoWriteAndWorkBackoff(t *testing.T)
 // spec; the effect verifies it and stamps both work-dir keys, as legacy's
 // poolTriggerMetadata does outside planOnly.
 func TestCreateEffect_VerifiesPlanOnlyWorktreeSpecAndStampsWorkDir(t *testing.T) {
-	cfg := &config.City{Agents: []config.Agent{{Name: "worker", MaxActiveSessions: intPtr(3)}}}
-	root := t.TempDir()
-	spec := worktree.Spec{
-		RepoDir: filepath.Join(root, "repo"), Path: filepath.Join(root, "wt"), Root: root, Branch: "b",
-		BeadID: "w-1", StoreRef: "city:city",
-	}
-	planner := newPlanOnlyHarness(t, cfg, nil)
-	_, _, planned, err := selectOrPlanPoolSessionBead(planner.bp, &cfg.Agents[0], "worker", nil,
-		SessionRequest{WorkBeadID: "w-1", WorkStoreRef: "city", WorktreeSpec: &spec}, time.Time{}, map[string]bool{}, map[int]bool{})
-	if err != nil || planned == nil || planned.worktreeSpec == nil {
-		t.Fatalf("plan-only select = (%+v, %v), want a plan carrying the worktree spec", planned, err)
-	}
-	plan := createPlanOf("c1", "worker", *planned)
-	store := beads.NewMemStore()
-	h := newCreateHarness(t, func(host *createEffectHost) {
-		host.verify = func(s worktree.Spec) (worktree.Report, error) { return worktree.Report{Path: s.Path}, nil }
-	})
-	h.reserve(t, "c1")
+	for _, mode := range []string{"", worktree.ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			cfg := &config.City{Agents: []config.Agent{{Name: "worker", MaxActiveSessions: intPtr(3)}}}
+			repo, base := worktreeTestRepo(t)
+			root := t.TempDir()
+			spec := worktree.Spec{
+				RepoDir: repo, Path: filepath.Join(root, "wt"), Root: root, Branch: "b", Base: base,
+				BeadID: "w-1", StoreRef: "city:city", Creator: "test", Owner: "test", Generation: "1", Lifecycle: worktree.LifecycleActive,
+			}
+			spec.Mode = mode
+			if mode == worktree.ModeDetached {
+				spec.Branch = ""
+			}
+			created, err := worktree.Ensure(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec.BaseSHA = created.Provenance.BaseSHA
+			planner := newPlanOnlyHarness(t, cfg, nil)
+			_, _, planned, err := selectOrPlanPoolSessionBead(planner.bp, &cfg.Agents[0], "worker", nil,
+				SessionRequest{WorkBeadID: "w-1", WorkStoreRef: "city", WorktreeSpec: &spec}, time.Time{}, map[string]bool{}, map[int]bool{})
+			if err != nil || planned == nil || planned.worktreeSpec == nil {
+				t.Fatalf("plan-only select = (%+v, %v), want a plan carrying the worktree spec", planned, err)
+			}
+			plan := createPlanOf("c1", "worker", *planned)
+			store := beads.NewMemStore()
+			h := newCreateHarness(t, func(host *createEffectHost) {
+				host.verify = func(s worktree.Spec) (worktree.Report, error) {
+					if !reflect.DeepEqual(s, spec) {
+						t.Errorf("create lost published mode/owner input: %+v, want %+v", s, spec)
+					}
+					return worktree.Verify(s)
+				}
+			})
+			h.reserve(t, "c1")
 
-	h.runAll(t, &createPass{cfg: cfg, store: store}, plan)
+			h.runAll(t, &createPass{cfg: cfg, store: store}, plan)
 
-	if w := h.entry(t).Work; w == nil || w.Refused || w.BeadID != "w-1" {
-		t.Fatalf("work verdict = %+v, want w-1 verified, so the planner forgets an earlier refusal", w)
-	}
+			if w := h.entry(t).Work; w == nil || w.Refused || w.BeadID != "w-1" {
+				t.Fatalf("work verdict = %+v, want w-1 verified, so the planner forgets an earlier refusal", w)
+			}
 
-	rows, err := store.ListByLabel(sessionBeadLabel, 0)
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("rows = %+v (%v), want one", rows, err)
-	}
-	if got := rows[0].Metadata; got["gc.work_dir"] != spec.Path || got["work_dir"] != spec.Path || got["gc.trigger_bead_id"] != "w-1" {
-		t.Fatalf("row metadata = %v, want the trigger and both work-dir keys at %q", got, spec.Path)
-	}
-	if _, ok := plan.Metadata["gc.work_dir"]; ok {
-		t.Fatal("the effect stamped the plan's shared metadata map")
+			rows, err := store.ListByLabel(sessionBeadLabel, 0)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("rows = %+v (%v), want one", rows, err)
+			}
+			if got := rows[0].Metadata; got["gc.work_dir"] != spec.Path || got["work_dir"] != spec.Path || got["gc.trigger_bead_id"] != "w-1" {
+				t.Fatalf("row metadata = %v, want the trigger and both work-dir keys at %q", got, spec.Path)
+			}
+			if _, ok := plan.Metadata["gc.work_dir"]; ok {
+				t.Fatal("the effect stamped the plan's shared metadata map")
+			}
+		})
 	}
 }
 

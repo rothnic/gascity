@@ -33,6 +33,7 @@ import (
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/worktree"
 )
 
 const maxIdleSleepProbesPerTick = 3
@@ -1894,12 +1895,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	capacityGuard := reconcileOpts.capacityGuard
 	effectiveStartOptions := startOptions
 	if !storeQueryPartial && reconcileOpts.workDirResolver == nil && len(assignedWorkBeads) > 0 {
-		effectiveStartOptions = append(append([]startExecutionOption(nil), startOptions...), withTaskWorkDirResolver(newAssignedTaskWorkDirResolver(cityPath, assignedWorkBeads)))
+		var refs []string
+		var resolve func(string) (beads.Store, error)
+		if sw != nil {
+			refs, resolve = sw.legs.nativeRefsForStores(reconcileOpts.assignedWorkStores), sw.legs.nativeStore
+		}
+		effectiveStartOptions = append(append([]startExecutionOption(nil), startOptions...), withTaskWorkDirResolver(newAssignedTaskWorkDirResolver(cityPath, assignedWorkBeads, refs, resolve)))
 	}
 	// Starts and launch-drift relaunches read the same dispatch option sources, so
 	// a relaunch applies the trigger-bead pins its fresh start would.
 	dispatchSources := reconcileDispatchOptionSources(reconcileOpts, sw)
-	effectiveStartOptions = append(append([]startExecutionOption(nil), effectiveStartOptions...), withClaimedWorkProbe(dispatchSources.claimedWork))
+	effectiveStartOptions = append(append([]startExecutionOption(nil), effectiveStartOptions...), func(o *startExecutionOptions) { o.dispatchOptionSources = dispatchSources })
 	if startupTimeout <= 0 && cfg != nil {
 		startupTimeout = cfg.Session.StartupTimeoutDuration()
 	}
@@ -3687,7 +3693,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// (session_key/continuation_reset_pending) stay unthreaded — neither has a
 			// same-tick Info reader whose verdict the residue changes — and self-heal on
 			// the next tick's store reload.
-			ok, commitBatch := recoverRunningPendingCreate(cityPath, infoByID[id], tp, cfg, store, clk, trace)
+			ok, commitBatch := recoverRunningPendingCreate(cityPath, infoByID[id], tp, cfg, store, sp, clk, stderr, trace)
 			if !ok {
 				fmt.Fprintf(stderr, "session reconciler: recovering pending create %s: metadata repair incomplete\n", name) //nolint:errcheck
 			}
@@ -6862,9 +6868,9 @@ func resolveWorkDirAgainstCity(cityPath, workDir string) string {
 // on disk, that path is returned. This lets the reconciler start the agent
 // in the worktree that the previous session (or this session's prior run)
 // created, without any prompt-side logic.
-func resolveTaskWorkDir(cityPath string, store beads.Store, assignees ...string) string {
+func resolveTaskWorkDir(cityPath string, store beads.Store, storeRef string, assignees ...string) (string, error) {
 	if store == nil {
-		return ""
+		return "", nil
 	}
 	seen := make(map[string]bool, len(assignees))
 	for _, assignee := range assignees {
@@ -6884,17 +6890,20 @@ func resolveTaskWorkDir(cityPath string, store beads.Store, assignees ...string)
 			continue
 		}
 		for _, b := range assigned {
-			if workDir := resolveTaskBeadWorkDir(cityPath, store, b); workDir != "" {
-				return workDir
+			if workDir, err := resolveTaskBeadWorkDir(cityPath, store, storeRef, b); workDir != "" || err != nil {
+				return workDir, err
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
-func resolveTaskBeadWorkDir(cityPath string, store beads.Store, bead beads.Bead) string {
-	if sourceWorkDir := resolveDrainSourceWorkDir(cityPath, store, bead); sourceWorkDir != "" {
-		return sourceWorkDir
+func resolveTaskBeadWorkDir(cityPath string, store beads.Store, storeRef string, bead beads.Bead) (string, error) {
+	if dir, present, err := nativeReferenceWorkDir(store, bead, storeRef); present {
+		return dir, err
+	}
+	if sourceWorkDir, err := resolveDrainSourceWorkDir(cityPath, store, storeRef, bead); sourceWorkDir != "" || err != nil {
+		return sourceWorkDir, err
 	}
 	// Only the legacy `work_dir` key is launch authority: it is the worktree
 	// CREATOR's record. `gc.work_dir` is deliberately NOT read here — it is an
@@ -6908,35 +6917,38 @@ func resolveTaskBeadWorkDir(cityPath string, store beads.Store, bead beads.Bead)
 	// correct it.
 	workDir := strings.TrimSpace(bead.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	if workDir == "" {
-		return ""
+		return "", nil
 	}
 	resolved := resolveWorkDirAgainstCity(cityPath, workDir)
 	if info, err := os.Stat(resolved); err == nil && info.IsDir() {
-		return resolved
+		return resolved, nil
 	}
-	return ""
+	return "", nil
 }
 
 // resolveDrainSourceWorkDir returns the prepared source anchor's worktree for
 // a drain item step. The drain recipe is materialized before prepare-worktree
 // creates that directory, so copied step metadata can still name the launcher
 // checkout. The source anchor is the durable post-prepare authority.
-func resolveDrainSourceWorkDir(cityPath string, store beads.Store, bead beads.Bead) string {
+func resolveDrainSourceWorkDir(cityPath string, store beads.Store, storeRef string, bead beads.Bead) (string, error) {
 	root := bead
 	if rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey]); rootID != "" && rootID != bead.ID {
 		resolvedRoot, err := store.Get(rootID)
 		if err != nil {
-			return ""
+			return "", nil
 		}
 		root = resolvedRoot
 	}
 	memberID := strings.TrimSpace(root.Metadata[beadmeta.DrainMemberIDMetadataKey])
 	if memberID == "" {
-		return ""
+		return "", nil
 	}
 	source, err := store.Get(memberID)
 	if err != nil {
-		return ""
+		return "", nil
+	}
+	if dir, present, err := nativeReferenceWorkDir(store, source, storeRef); present {
+		return dir, err
 	}
 	for _, key := range []string{beadmeta.LegacyWorkDirMetadataKey, beadmeta.WorkDirMetadataKey} {
 		workDir := strings.TrimSpace(source.Metadata[key])
@@ -6945,10 +6957,10 @@ func resolveDrainSourceWorkDir(cityPath string, store beads.Store, bead beads.Be
 		}
 		resolved := resolveWorkDirAgainstCity(cityPath, workDir)
 		if info, err := os.Stat(resolved); err == nil && info.IsDir() {
-			return resolved
+			return resolved, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // dispatchOptionMetadataKey returns the bead-metadata key carrying a
@@ -7012,8 +7024,9 @@ type claimedWorkProbe func(info sessionpkg.Info) (bool, error)
 // the trigger. A nil trigger reads the session store only for a same-store stamp; a
 // nil claimedWork leaves the session-store claim check as the only one.
 type dispatchOptionSources struct {
-	trigger     warmClaimTriggerResolver
-	claimedWork claimedWorkProbe
+	trigger         warmClaimTriggerResolver
+	claimedWork     claimedWorkProbe
+	nativeWorkStore func(string) (beads.Store, error)
 }
 
 // reconcileDispatchOptionSources returns the dispatch option sources a reconcile
@@ -7024,6 +7037,9 @@ type dispatchOptionSources struct {
 // beat the trigger.
 func reconcileDispatchOptionSources(opts startExecutionOptions, sw *SeatWork) dispatchOptionSources {
 	sources := opts.dispatchOptionSources
+	if sources.nativeWorkStore == nil && sw != nil {
+		sources.nativeWorkStore = sw.legs.nativeStore
+	}
 	if sources.claimedWork == nil {
 		sources.claimedWork = reachableClaimedWorkProbe(sw)
 	}
@@ -7179,44 +7195,76 @@ func workBeadOptionOverrides(b beads.Bead, rp *config.ResolvedProvider) (map[str
 }
 
 type assignedTaskWorkDir struct {
-	path      string
-	createdAt time.Time
+	path     string
+	bead     beads.Bead
+	storeRef string
 }
 
-// newAssignedTaskWorkDirResolver resolves work_dir values from the
-// reconciler's snapshot; misses intentionally fall back to the live lookup.
-func newAssignedTaskWorkDirResolver(cityPath string, assignedWorkBeads []beads.Bead) taskWorkDirResolver {
+// newAssignedTaskWorkDirResolver keeps the observed step/store identity,
+// so a cached directory cannot bypass a newly declared native reference.
+func newAssignedTaskWorkDirResolver(cityPath string, assigned []beads.Bead, refs []string, resolveStore func(string) (beads.Store, error)) taskWorkDirResolver {
 	index := make(map[string]assignedTaskWorkDir)
-	for _, bead := range assignedWorkBeads {
-		if bead.Status != "in_progress" {
+	for i, bead := range assigned {
+		if bead.Status != "in_progress" || strings.TrimSpace(bead.Assignee) == "" {
 			continue
 		}
-		assignee := strings.TrimSpace(bead.Assignee)
-		if assignee == "" {
-			continue
-		}
-		workDir := strings.TrimSpace(bead.Metadata["work_dir"])
-		if workDir == "" {
-			continue
-		}
-		workDir = resolveWorkDirAgainstCity(cityPath, workDir)
-		info, err := os.Stat(workDir)
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		current, ok := index[assignee]
-		if ok && !bead.CreatedAt.After(current.createdAt) {
-			continue
-		}
-		index[assignee] = assignedTaskWorkDir{path: workDir, createdAt: bead.CreatedAt}
-	}
-	return func(candidate startCandidate, cfg *config.City) string {
-		for _, assignee := range taskWorkDirAssignees(candidate, cfg) {
-			if workDir := index[strings.TrimSpace(assignee)].path; workDir != "" {
-				return workDir
+		path := resolveWorkDirAgainstCity(cityPath, strings.TrimSpace(bead.Metadata[beadmeta.LegacyWorkDirMetadataKey]))
+		_, declared := bead.Metadata[beadmeta.WorktreeRefMetadataKey]
+		if !declared {
+			if info, err := os.Stat(path); err != nil || !info.IsDir() {
+				continue
 			}
 		}
-		return ""
+		assignee := strings.TrimSpace(bead.Assignee)
+		if current, ok := index[assignee]; ok && !bead.CreatedAt.After(current.bead.CreatedAt) {
+			continue
+		}
+		ref := ""
+		if i < len(refs) {
+			ref = refs[i]
+		}
+		index[assignee] = assignedTaskWorkDir{path: path, bead: bead, storeRef: ref}
+	}
+	return func(candidate startCandidate, cfg *config.City) (string, error) {
+		for _, assignee := range taskWorkDirAssignees(candidate, cfg) {
+			item, ok := index[strings.TrimSpace(assignee)]
+			if !ok {
+				continue
+			}
+			_, declared := item.bead.Metadata[beadmeta.WorktreeRefMetadataKey]
+			if resolveStore != nil {
+				ref := canonicalWorktreeStoreRef(cfg, item.storeRef)
+				store, err := resolveStore(ref)
+				if err != nil {
+					if declared {
+						return "", err
+					}
+					continue
+				}
+				if declared {
+					expected, err := worktreeReferenceForBead(item.bead, ref)
+					if err != nil {
+						return "", err
+					}
+					report, err := verifyReferencedWorktree(store, item.bead.ID, ref, expected, nil, worktree.Verify)
+					return report.Path, err
+				}
+				fresh, err := beads.HandlesFor(store).Live.Get(item.bead.ID)
+				if err != nil {
+					continue
+				}
+				if _, present := fresh.Metadata[beadmeta.WorktreeRefMetadataKey]; present {
+					return resolveTaskBeadWorkDir(cityPath, store, ref, fresh)
+				}
+			}
+			if declared {
+				return "", errors.New("native worktree reference has no observed work-store resolver")
+			}
+			if item.path != "" {
+				return item.path, nil
+			}
+		}
+		return "", nil
 	}
 }
 

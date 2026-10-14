@@ -3,11 +3,16 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/testutil"
 	"github.com/gastownhall/gascity/internal/worktree"
 )
@@ -30,6 +35,60 @@ func managedWorktreeCmdOpts(repo, root, path, base string) worktreeCmdOpts {
 		Owner:      "gc-sling",
 		Generation: "1",
 		Lifecycle:  worktree.LifecycleActive,
+	}
+}
+
+func TestCmdWorktreeLockTimeoutFlagContract(t *testing.T) {
+	for _, cmd := range newWorktreeCmd(&bytes.Buffer{}, &bytes.Buffer{}).Commands() {
+		if cmd.Name() == "verify" {
+			if cmd.Flags().Lookup("lock-timeout") != nil {
+				t.Fatal("read-only Verify exposes a mutation lock wait")
+			}
+			continue
+		}
+		if timeout, err := cmd.Flags().GetDuration("lock-timeout"); err != nil || timeout != 30*time.Second {
+			t.Errorf("%s lock timeout = %s, %v; want bounded 30s default", cmd.Name(), timeout, err)
+		}
+	}
+}
+
+func TestCmdWorktreeInvalidLockTimeoutIsInert(t *testing.T) {
+	clearCityEnv(t)
+	t.Setenv("GIT_OPTIONAL_LOCKS", "0")
+	repo, base := worktreeTestRepo(t)
+	root := t.TempDir()
+	before := testutil.RunGit(t, repo, "for-each-ref", "--format=%(refname):%(objectname)")
+	for _, action := range []string{"ensure", "cleanup"} {
+		for _, timeout := range []string{"0", "-1s", "invalid", "9223372036854775808ns"} {
+			t.Run(action+"/"+timeout, func(t *testing.T) {
+				var stdout, stderr bytes.Buffer
+				cmd := newWorktreeCmd(&stdout, &stderr)
+				args := []string{
+					action, "--repo", repo, "--root", root, "--path", filepath.Join(root, "wt"),
+					"--branch", "work/gc-test", "--base", base, "--bead", "gc-test", "--store-ref", "gascity",
+					"--creator", "test", "--owner", "gc-sling", "--generation", "1", "--lock-timeout=" + timeout,
+				}
+				if action == "cleanup" {
+					args = append(args, "--attempt-id", "unused")
+				}
+				cmd.SetArgs(args)
+				if err := cmd.ExecuteContext(t.Context()); err == nil ||
+					((timeout == "0" || timeout == "-1s") && !strings.Contains(err.Error(), "must be positive")) {
+					t.Fatalf("invalid timeout returned %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+				}
+				if after := testutil.RunGit(t, repo, "for-each-ref", "--format=%(refname):%(objectname)"); after != before {
+					t.Fatal("invalid timeout changed repository refs")
+				}
+				if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+					t.Fatalf("invalid timeout changed workspace root: %v, %v", entries, err)
+				}
+				for _, dir := range []string{"gc-worktree-locks", "worktrees"} {
+					if _, err := os.Stat(filepath.Join(repo, ".git", dir)); !os.IsNotExist(err) {
+						t.Fatalf("invalid timeout prepared %s: %v", dir, err)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -261,7 +320,10 @@ func TestCmdWorktreeEnsureStrictJSONContract(t *testing.T) {
 		Action        string `json:"action"`
 		Path          string `json:"path"`
 		Provenance    *struct {
-			AttemptID string `json:"attempt_id"`
+			SchemaVersion int     `json:"schema_version"`
+			Mode          *string `json:"mode"`
+			Placement     *string `json:"placement"`
+			AttemptID     string  `json:"attempt_id"`
 		} `json:"provenance"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
@@ -269,10 +331,208 @@ func TestCmdWorktreeEnsureStrictJSONContract(t *testing.T) {
 	}
 	if result.SchemaVersion != "1" || !result.OK || result.Command != "worktree ensure" ||
 		result.Action != "ensure" || result.Path != wt ||
-		result.Provenance == nil || result.Provenance.AttemptID == "" {
+		result.Provenance == nil || result.Provenance.AttemptID == "" ||
+		result.Provenance.SchemaVersion != 1 || result.Provenance.Mode != nil || result.Provenance.Placement != nil {
 		t.Fatalf("JSON result = %+v, want declared structured ensure output", result)
 	}
+	if ref, err := git.New(wt).HeadSymbolicRef(); err != nil || ref != "refs/heads/work/gc-test" {
+		t.Fatalf("omitted mode HEAD = %q, err = %v, want attached work/gc-test", ref, err)
+	}
 	validateJSONAgainstResultSchema(t, []string{"worktree", "ensure"}, stdout.Bytes())
+}
+
+func TestCmdWorktreeEnsureDetachedExactBase(t *testing.T) {
+	t.Setenv("GC_JSON_CONTRACT_STRICT", "1")
+	repo, _ := worktreeTestRepo(t)
+	base := testutil.RunGit(t, repo, "rev-parse", "HEAD")
+	root := t.TempDir()
+	wt := filepath.Join(root, "wt")
+	refsBefore := testutil.RunGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
+	args := []string{
+		"worktree", "ensure", "--json", "--mode", "detached",
+		"--repo", repo,
+		"--root", root,
+		"--path", wt,
+		"--base", base,
+		"--base-sha", base,
+		"--bead", "gc-test",
+		"--store-ref", "gascity",
+		"--creator", "test",
+		"--owner", "gc-sling",
+		"--generation", "1",
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("detached ensure exit = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	}
+	var rep worktree.Report
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal detached ensure output %q: %v", stdout.String(), err)
+	}
+	if rep.Path != wt || rep.Mode != "detached" || rep.Branch != "" || rep.Head != base || !rep.Created || rep.BranchCreated {
+		t.Fatalf("report = %+v, want detached creation at exact base without a branch", rep)
+	}
+	wtGit := git.New(wt)
+	if ref, err := wtGit.HeadSymbolicRef(); err == nil {
+		t.Fatalf("detached HEAD is symbolic: %q", ref)
+	} else {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			t.Fatalf("symbolic-ref error = %v, want detached exit 1", err)
+		}
+	}
+	if got := testutil.RunGit(t, wt, "rev-parse", "HEAD"); got != base {
+		t.Fatalf("actual HEAD = %s, want supplied base %s", got, base)
+	}
+	if got := testutil.RunGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/"); got != refsBefore {
+		t.Fatalf("detached creation changed branch refs: before = %q, after = %q", refsBefore, got)
+	}
+	wantPath, err := filepath.EvalSymlinks(wt)
+	if err != nil {
+		t.Fatalf("canonical worktree path: %v", err)
+	}
+	common, err := git.New(repo).CommonDir()
+	if err != nil {
+		t.Fatalf("repository common dir: %v", err)
+	}
+	wantRepo, err := filepath.EvalSymlinks(common)
+	if err != nil {
+		t.Fatalf("canonical repository identity: %v", err)
+	}
+	p := rep.Provenance
+	if p == nil || p.SchemaVersion != 2 || p.Mode != "detached" || p.Placement != "outside-worktrees" ||
+		p.RepoIdentity != wantRepo || p.Path != wantPath || p.Branch != "" || p.BaseRef != base || p.BaseSHA != base ||
+		p.BeadID != "gc-test" || p.StoreRef != "gascity" || p.Creator != "test" || p.Owner != "gc-sling" ||
+		p.Generation != "1" || p.Lifecycle != worktree.LifecycleActive || p.AttemptID == "" || p.CreatedAt == nil {
+		t.Fatalf("provenance = %+v, want complete detached owner/base/attempt identity", p)
+	}
+	gitDir, err := wtGit.GitDir()
+	if err != nil {
+		t.Fatalf("worktree private Git dir: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(gitDir, "gascity-worktree-provenance.json"))
+	if err != nil {
+		t.Fatalf("read durable provenance: %v", err)
+	}
+	var durable worktree.Provenance
+	if err := json.Unmarshal(body, &durable); err != nil {
+		t.Fatalf("unmarshal durable provenance: %v", err)
+	}
+	if !reflect.DeepEqual(*p, durable) {
+		t.Fatalf("reported provenance = %+v, durable provenance = %+v", *p, durable)
+	}
+	entries, err := git.New(repo).WorktreeList()
+	if err != nil {
+		t.Fatalf("list registered worktrees: %v", err)
+	}
+	matches := 0
+	for _, entry := range entries {
+		path, err := filepath.EvalSymlinks(entry.Path)
+		if err != nil {
+			t.Fatalf("canonical registered path: %v", err)
+		}
+		if path == wantPath {
+			matches++
+			if entry.Head != base || entry.Branch != "" {
+				t.Fatalf("registration = %+v, want exact detached base", entry)
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("matching registrations = %d, want 1", matches)
+	}
+	validateJSONAgainstResultSchema(t, []string{"worktree", "ensure"}, stdout.Bytes())
+	createdJSON := append([]byte(nil), stdout.Bytes()...)
+	for _, action := range []string{"ensure", "verify"} {
+		args[1] = action
+		stdout.Reset()
+		stderr.Reset()
+		if code := run(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("detached %s exit %d: %s", action, code, stderr.String())
+		}
+		var reused worktreeJSONResult
+		if err := json.Unmarshal(stdout.Bytes(), &reused); err != nil || reused.Created || reused.BranchCreated ||
+			reused.Mode != worktree.ModeDetached || reused.Head != base || !reflect.DeepEqual(reused.Provenance, rep.Provenance) {
+			t.Fatalf("detached reuse/verify = %+v, %v", reused, err)
+		}
+		validateJSONAgainstResultSchema(t, []string{"worktree", action}, stdout.Bytes())
+	}
+	for _, change := range []func(map[string]any){
+		func(v map[string]any) { v["mode"] = "unknown" },
+		func(v map[string]any) { delete(v["provenance"].(map[string]any), "mode") },
+		func(v map[string]any) { v["provenance"].(map[string]any)["schema_version"] = 1 },
+		func(v map[string]any) { v["provenance"].(map[string]any)["placement"] = "within-repo-root" },
+		func(v map[string]any) { v["branch"] = "unexpected-branch" },
+		func(v map[string]any) { v["branch_created"] = true },
+	} {
+		var invalid map[string]any
+		if err := json.Unmarshal(createdJSON, &invalid); err != nil {
+			t.Fatal(err)
+		}
+		change(invalid)
+		body, err := json.Marshal(invalid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateJSONAgainstResultSchemaE([]string{"worktree", "ensure"}, body); err == nil {
+			t.Fatalf("schema accepted conflicting detached evidence: %s", body)
+		}
+	}
+	for _, invalidMode := range []string{"", "unknown"} {
+		bad := append([]string(nil), args...)
+		bad[1], bad[4] = "ensure", invalidMode
+		stdout.Reset()
+		stderr.Reset()
+		cmd := newWorktreeCmd(&stdout, &stderr)
+		cmd.SetArgs(bad[1:])
+		err := cmd.ExecuteContext(t.Context())
+		if err == nil {
+			t.Fatalf("raw Cobra accepted --mode %q", invalidMode)
+		}
+		if !strings.Contains(err.Error()+stderr.String(), "mode") {
+			t.Fatalf("invalid mode failed for another reason: %v; stderr=%q", err, stderr.String())
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(gitDir, "gascity-worktree-provenance.json")); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("reuse/refusal changed durable provenance: %v", err)
+	}
+	args[1] = "cleanup"
+	args = append(args, "--attempt-id", p.AttemptID)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("detached cleanup exit %d: %s", code, stderr.String())
+	}
+	var removed worktreeCleanupJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &removed); err != nil || !removed.Removed || removed.Mode != worktree.ModeDetached || removed.Branch != "" {
+		t.Fatalf("detached cleanup = %+v, %v", removed, err)
+	}
+	validateJSONAgainstResultSchema(t, []string{"worktree", "cleanup"}, stdout.Bytes())
+	t.Run("explicit attached schema 2", func(t *testing.T) {
+		attached := append([]string(nil), args[:len(args)-2]...)
+		attached[1], attached[4] = "ensure", worktree.ModeAttached
+		attachedPath := filepath.Join(root, "attached")
+		for i, arg := range attached {
+			if arg == "--path" {
+				attached[i+1] = attachedPath
+			}
+		}
+		attached = append(attached, "--branch", "work/explicit-attached")
+		var stdout, stderr bytes.Buffer
+		if code := run(attached, &stdout, &stderr); code != 0 {
+			t.Fatalf("explicit attached ensure exit %d: %s", code, stderr.String())
+		}
+		var result worktreeJSONResult
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.Created || !result.BranchCreated ||
+			result.Mode != worktree.ModeAttached || result.Provenance == nil || result.Provenance.SchemaVersion != 2 ||
+			result.Provenance.Mode != worktree.ModeAttached || result.Provenance.Placement != worktree.PlacementOutsideWorktrees {
+			t.Fatalf("explicit attached report = %+v, %v", result, err)
+		}
+		if ref, err := git.New(attachedPath).HeadSymbolicRef(); err != nil || ref != "refs/heads/work/explicit-attached" {
+			t.Fatalf("explicit attached HEAD = %q, %v", ref, err)
+		}
+		validateJSONAgainstResultSchema(t, []string{"worktree", "ensure"}, stdout.Bytes())
+	})
 }
 
 // ensureAttemptID provisions the worktree described by opts and returns the
@@ -303,42 +563,50 @@ func ensureAttemptID(t *testing.T, opts *worktreeCmdOpts) string {
 }
 
 func TestCmdWorktreeCleanupJSONReportsPendingSafetyRefusal(t *testing.T) {
-	repo, base := worktreeTestRepo(t)
-	root := t.TempDir()
-	wt := filepath.Join(root, "wt")
-	opts := managedWorktreeCmdOpts(repo, root, wt, base)
-	opts.AttemptID = ensureAttemptID(t, &opts)
-	if err := os.WriteFile(filepath.Join(wt, "keep.txt"), []byte("keep"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	for _, mode := range []string{"", worktree.ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			repo, base := worktreeTestRepo(t)
+			root := t.TempDir()
+			wt := filepath.Join(root, "wt")
+			opts := managedWorktreeCmdOpts(repo, root, wt, base)
+			opts.Mode = mode
+			if mode == worktree.ModeDetached {
+				opts.Branch = ""
+			}
+			opts.AttemptID = ensureAttemptID(t, &opts)
+			if err := os.WriteFile(filepath.Join(wt, "keep.txt"), []byte("keep"), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
 
-	opts.JSON = true
-	var stdout, stderr bytes.Buffer
-	code := runWorktreeCleanup(opts, &stdout, &stderr)
-	if code == 0 {
-		t.Fatal("runWorktreeCleanup dirty worktree returned 0, want nonzero")
-	}
-	var result struct {
-		SchemaVersion  string `json:"schema_version"`
-		OK             bool   `json:"ok"`
-		Command        string `json:"command"`
-		Action         string `json:"action"`
-		CleanupPending bool   `json:"cleanup_pending"`
-		Error          *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		t.Fatalf("unmarshal cleanup output %q: %v", stdout.String(), err)
-	}
-	if result.SchemaVersion != "1" || result.OK || result.Command != "worktree cleanup" ||
-		result.Action != "cleanup" || !result.CleanupPending || result.Error == nil ||
-		result.Error.Code != worktree.CleanupErrorDirty || result.Error.Message == "" {
-		t.Fatalf("cleanup result = %+v, want structured cleanup_pending dirty refusal", result)
-	}
-	if _, err := os.Stat(filepath.Join(wt, "keep.txt")); err != nil {
-		t.Fatalf("cleanup safety refusal removed WIP: %v", err)
+			opts.JSON = true
+			var stdout, stderr bytes.Buffer
+			code := runWorktreeCleanup(opts, &stdout, &stderr)
+			if code == 0 {
+				t.Fatal("runWorktreeCleanup dirty worktree returned 0, want nonzero")
+			}
+			var result struct {
+				SchemaVersion  string `json:"schema_version"`
+				OK             bool   `json:"ok"`
+				Command        string `json:"command"`
+				Action         string `json:"action"`
+				CleanupPending bool   `json:"cleanup_pending"`
+				Error          *struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+				t.Fatalf("unmarshal cleanup output %q: %v", stdout.String(), err)
+			}
+			if result.SchemaVersion != "1" || result.OK || result.Command != "worktree cleanup" ||
+				result.Action != "cleanup" || !result.CleanupPending || result.Error == nil ||
+				result.Error.Code != worktree.CleanupErrorDirty || result.Error.Message == "" {
+				t.Fatalf("cleanup result = %+v, want structured cleanup_pending dirty refusal", result)
+			}
+			if _, err := os.Stat(filepath.Join(wt, "keep.txt")); err != nil {
+				t.Fatalf("cleanup safety refusal removed WIP: %v", err)
+			}
+		})
 	}
 }
 

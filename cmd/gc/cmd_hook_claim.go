@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
 	"github.com/gastownhall/gascity/internal/git"
+	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/worktree"
 )
 
 const hookClaimCommandName = "hook"
@@ -161,7 +164,10 @@ type hookClaimOptions struct {
 	// alias/agent form that read paths query through GC_AGENT, but a continuation
 	// pin means "run this on THIS session", which only a session identity can
 	// express. See continuationPinAssignee.
-	SessionID          string
+	SessionID string
+	// VerifiedSession is admitted by the native claim fence; Env alone grants
+	// no authority to retain an incarnation on a work bead.
+	VerifiedSession    *session.Info
 	IdentityCandidates []string
 	RouteTargets       []string
 	Env                []string
@@ -1691,10 +1697,12 @@ func hookClaimThroughStore(beadID, assignee string, claim func() (beads.Bead, bo
 func stampHookClaimIdentity(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) (beads.Bead, bool) {
 	patch := hookClaimIdentityPatch(bead, opts, ops, dir)
 	sessionID := hookClaimSessionID(opts.Env)
+	attemptID := hookClaimSessionAttemptID(bead, opts)
 	needsLifecycleIdentity := sessionID != "" && !beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]))
 	if len(patch) == 0 {
 		return bead, needsLifecycleIdentity && strings.EqualFold(strings.TrimSpace(bead.Status), "in_progress") &&
-			strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]) == sessionID
+			strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]) == sessionID &&
+			(attemptID == "" || bead.Metadata[beadmeta.SessionAttemptIDMetadataKey] == attemptID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
@@ -1711,7 +1719,8 @@ func stampHookClaimIdentity(bead beads.Bead, opts hookClaimOptions, ops hookClai
 		return beads.Bead{}, false
 	}
 	if !strings.EqualFold(strings.TrimSpace(readback.Status), "in_progress") ||
-		strings.TrimSpace(readback.Metadata[beadmeta.SessionIDMetadataKey]) != sessionID {
+		strings.TrimSpace(readback.Metadata[beadmeta.SessionIDMetadataKey]) != sessionID ||
+		(attemptID != "" && readback.Metadata[beadmeta.SessionAttemptIDMetadataKey] != attemptID) {
 		return beads.Bead{}, false
 	}
 	return readback, true
@@ -1825,11 +1834,41 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 			strings.TrimSpace(bead.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 			patch[beadmeta.SessionNameMetadataKey] = sessionName
 		}
+		if attemptID := hookClaimSessionAttemptID(bead, opts); attemptID != "" &&
+			bead.Metadata[beadmeta.SessionAttemptIDMetadataKey] != attemptID {
+			patch[beadmeta.SessionAttemptIDMetadataKey] = attemptID
+		}
 	}
 	if strings.TrimSpace(bead.Metadata[beadmeta.ClaimedAtMetadataKey]) == "" {
 		patch[beadmeta.ClaimedAtMetadataKey] = time.Now().UTC().Format(time.RFC3339)
 	}
 	return patch
+}
+
+// hookClaimSessionAttemptID binds a claimed work step to its admitted incarnation.
+func hookClaimSessionAttemptID(bead beads.Bead, opts hookClaimOptions) string {
+	info := opts.VerifiedSession
+	if info == nil || info.ID != hookClaimSessionID(opts.Env) ||
+		!strings.EqualFold(strings.TrimSpace(bead.Status), "in_progress") ||
+		beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])) {
+		return ""
+	}
+	token := strings.TrimSpace(info.InstanceToken)
+	if info.ID == "" || token == "" || strings.TrimSpace(bead.ID) == "" {
+		return ""
+	}
+	// Sorted keys, compact UTF-8 JSON, no HTML escaping or trailing newline.
+	var canonical strings.Builder
+	encoder := json.NewEncoder(&canonical)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(map[string]string{
+		"claimed_bead_id": bead.ID,
+		"instance_token":  token,
+		"session_id":      info.ID,
+	}); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("writer-%x", sha256.Sum256([]byte(strings.TrimSuffix(canonical.String(), "\n"))))
 }
 
 // hookClaimRecordsNoWorkDir reports whether bead names no work checkout at all,
@@ -2272,13 +2311,25 @@ var worktreeOwnershipEvidenceKeys = []string{
 // not-yet-published bead) or all eight (evidence already complete; this is
 // just keeping the branch in sync).
 func hookClaimWorktreeEvidenceIsWholeOrAbsent(bead beads.Bead) bool {
+	if _, declared := bead.Metadata[beadmeta.WorktreeRefMetadataKey]; declared {
+		return false
+	}
+	mode, modePresent := bead.Metadata[beadmeta.WorktreeModeMetadataKey]
+	placement, placementPresent := bead.Metadata[beadmeta.WorktreePlacementMetadataKey]
+	if modePresent || placementPresent {
+		// A declared detached mode must never acquire an ambient branch or
+		// session path. Partial/unknown mode evidence is equally inconclusive.
+		if mode != worktree.ModeAttached || (placement != worktree.PlacementOutsideWorktrees && placement != worktree.PlacementWithinRepoRoot) {
+			return false
+		}
+	}
 	present := 0
 	for _, key := range worktreeOwnershipEvidenceKeys {
 		if strings.TrimSpace(bead.Metadata[key]) != "" {
 			present++
 		}
 	}
-	return present == 0 || present == len(worktreeOwnershipEvidenceKeys)
+	return (!modePresent && !placementPresent && present == 0) || present == len(worktreeOwnershipEvidenceKeys)
 }
 
 func hookStampWorkMetaWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error {

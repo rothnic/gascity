@@ -20,6 +20,8 @@
     "action": { "const": "cleanup" },
     "path": { "type": "string" },
     "branch": { "type": "string" },
+    "mode": { "enum": ["attached", "detached"] },
+    "placement": { "enum": ["outside-worktrees", "within-repo-root"] },
     "head": { "type": "string" },
     "removed": { "type": "boolean" },
     "already_absent": { "type": "boolean" },
@@ -42,8 +44,81 @@
         "lifecycle",
         "attempt_id"
       ],
-      "additionalProperties": true
+      "properties": {
+        "schema_version": { "enum": [1, 2] },
+        "bead_id": { "type": "string" },
+        "store_ref": { "type": "string" },
+        "repo_identity": { "type": "string" },
+        "path": { "type": "string" },
+        "branch": { "type": "string" },
+        "mode": { "enum": ["attached", "detached"] },
+        "placement": { "enum": ["outside-worktrees", "within-repo-root"] },
+        "base_ref": { "type": "string" },
+        "base_sha": { "type": "string" },
+        "creator": { "type": "string" },
+        "owner": { "type": "string" },
+        "generation": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "lifecycle": { "type": "string" },
+        "attempt_id": { "type": "string" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "schema_version": { "const": 1 },
+            "branch": { "minLength": 1 }
+          },
+          "not": { "anyOf": [{ "required": ["mode"] }, { "required": ["placement"] }] }
+        },
+        {
+          "properties": { "schema_version": { "const": 2 } },
+          "required": ["mode", "placement"],
+          "if": { "properties": { "mode": { "const": "detached" } } },
+          "then": { "properties": { "branch": { "const": "" } } },
+          "else": { "properties": { "branch": { "minLength": 1 } } }
+        }
+      ],
+      "additionalProperties": false
     }
   },
+  "dependentRequired": { "mode": ["placement"], "placement": ["mode"] },
+  "allOf": [
+    {
+      "if": {
+        "required": ["provenance"],
+        "properties": { "provenance": { "properties": { "schema_version": { "const": 2 } } } }
+      },
+      "then": { "required": ["mode", "placement"] }
+    },
+    {
+      "if": { "required": ["mode"], "properties": { "mode": { "const": "detached" } } },
+      "then": {
+        "properties": {
+          "branch": { "const": "" },
+          "provenance": {
+            "required": ["mode"],
+            "properties": { "schema_version": { "const": 2 }, "mode": { "const": "detached" } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "required": ["mode"], "properties": { "mode": { "const": "attached" } } },
+      "then": {
+        "properties": {
+          "branch": { "minLength": 1 },
+          "provenance": { "properties": { "mode": { "const": "attached" } } }
+        }
+      }
+    },
+    {
+      "if": { "required": ["placement"], "properties": { "placement": { "const": "outside-worktrees" } } },
+      "then": { "properties": { "provenance": { "properties": { "placement": { "const": "outside-worktrees" } } } } }
+    },
+    {
+      "if": { "required": ["placement"], "properties": { "placement": { "const": "within-repo-root" } } },
+      "then": { "properties": { "provenance": { "properties": { "placement": { "const": "within-repo-root" } } } } }
+    }
+  ],
   "additionalProperties": true
 }

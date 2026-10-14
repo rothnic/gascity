@@ -82,6 +82,19 @@ func (s *Store) Get(id string) (Info, error) {
 	return infoFromPersistedBead(b), nil
 }
 
+// GetExactFresh returns the persisted projection from the authoritative read
+// handle. It refuses a lookup that resolves to another session ID.
+func (s *Store) GetExactFresh(id string) (Info, error) {
+	b, err := s.freshBead(id)
+	if err != nil {
+		return Info{}, err
+	}
+	if b.ID != id {
+		return Info{}, fmt.Errorf("%w: requested %q, returned %q", ErrSessionNotFound, id, b.ID)
+	}
+	return infoFromPersistedBead(b), nil
+}
+
 // GetPersistedResponse returns the persisted session.Info paired with the
 // persisted-response projection (status + metadata) for id, in a single store
 // fetch. It is the persisted-read half of the session Get read model — pair it

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/worktree"
 	"github.com/spf13/cobra"
@@ -12,22 +16,42 @@ import (
 
 // worktreeCmdOpts carries the flag values for gc worktree subcommands.
 type worktreeCmdOpts struct {
-	Repo       string
-	Root       string
-	Path       string
-	Branch     string
-	Base       string
-	BaseSHA    string
-	BeadID     string
-	StoreRef   string
-	Creator    string
-	Owner      string
-	Generation string
-	Lifecycle  string
-	AttemptID  string
-	Agent      string
-	DryRun     bool
-	JSON       bool
+	Repo        string
+	Root        string
+	Path        string
+	Branch      string
+	Mode        string
+	Placement   string
+	Base        string
+	BaseSHA     string
+	BeadID      string
+	StoreRef    string
+	Creator     string
+	Owner       string
+	Generation  string
+	Lifecycle   string
+	AttemptID   string
+	Agent       string
+	DryRun      bool
+	JSON        bool
+	LockTimeout time.Duration
+}
+
+func worktreeLockFlagSet(cmd *cobra.Command, opts *worktreeCmdOpts) {
+	cmd.Flags().DurationVar(&opts.LockTimeout, "lock-timeout", worktree.DefaultLockTimeout,
+		"maximum wait for the workspace lock (must be positive; does not limit the transaction)")
+	previousPreRun := cmd.PreRunE
+	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+		if previousPreRun != nil {
+			if err := previousPreRun(cmd, args); err != nil {
+				return err
+			}
+		}
+		if opts.LockTimeout <= 0 {
+			return errors.New("--lock-timeout must be positive")
+		}
+		return nil
+	}
 }
 
 // newWorktreeCmd returns the gc worktree command group. It is the CLI face
@@ -42,12 +66,15 @@ func newWorktreeCmd(stdout, stderr io.Writer) *cobra.Command {
 
 gc worktree is the single transactional owner for workspace provisioning.
 Postconditions: the path is a direct child of the configured per-rig root and
-the root of a worktree of the given repository, with the bead's uniquely named
-branch checked out on an attached HEAD (never detached). Durable provenance is
+the root of a worktree of the given repository. HEAD is attached to the requested
+branch by default; --mode detached requires an empty branch.
+--placement within-repo-root permits the selected primary or bare control root as
+an ancestor while excluding Git administration and other worktrees. Durable provenance is
 stored in the worktree's private git directory and returned as JSON so callers
 can atomically publish the same evidence on the bead. A new branch is created
-from --base, resolved verbatim against the local repository. Failed creation
-rolls back everything it created; --dry-run plans without mutating anything.`,
+from --base, resolved verbatim against the local repository. Detached creation
+uses that resolved commit without creating a branch. Failed creation rolls back
+only untouched state; --dry-run plans without mutating anything.`,
 	}
 	cmd.AddCommand(newWorktreeEnsureCmd(stdout, stderr))
 	cmd.AddCommand(newWorktreeVerifyCmd(stdout, stderr))
@@ -59,7 +86,9 @@ func worktreeFlagSet(cmd *cobra.Command, opts *worktreeCmdOpts) {
 	cmd.Flags().StringVar(&opts.Repo, "repo", "", "repository directory the worktree belongs to (required)")
 	cmd.Flags().StringVar(&opts.Root, "root", "", "configured per-rig worktree root; path must be its direct child (required)")
 	cmd.Flags().StringVar(&opts.Path, "path", "", "worktree path (required)")
-	cmd.Flags().StringVar(&opts.Branch, "branch", "", "branch that must be checked out (required)")
+	cmd.Flags().StringVar(&opts.Branch, "branch", "", "branch that must be checked out (required in attached mode)")
+	cmd.Flags().StringVar(&opts.Mode, "mode", "", "attached or detached HEAD (default attached; explicit modes record schema 2 provenance)")
+	cmd.Flags().StringVar(&opts.Placement, "placement", "", "outside-worktrees or within-repo-root (default outside-worktrees)")
 	cmd.Flags().StringVar(&opts.Base, "base", "", "exact base ref used for this worktree (required)")
 	cmd.Flags().StringVar(&opts.BaseSHA, "base-sha", "", "recorded base SHA to verify when reusing a worktree")
 	cmd.Flags().StringVar(&opts.BeadID, "bead", "", "work bead bound to this worktree (required)")
@@ -70,9 +99,18 @@ func worktreeFlagSet(cmd *cobra.Command, opts *worktreeCmdOpts) {
 	cmd.Flags().StringVar(&opts.Lifecycle, "lifecycle", worktree.LifecycleActive, "worktree lifecycle state")
 	cmd.Flags().BoolVar(&opts.JSON, "json", false, "emit the report as JSON")
 	for _, name := range []string{
-		"repo", "root", "path", "branch", "base", "bead", "store-ref", "creator", "owner", "generation",
+		"repo", "root", "path", "base", "bead", "store-ref", "creator", "owner", "generation",
 	} {
 		_ = cmd.MarkFlagRequired(name) //nolint:errcheck // flags exist
+	}
+	cmd.PreRunE = func(cmd *cobra.Command, _ []string) error {
+		if cmd.Flags().Changed("mode") && opts.Mode == "" {
+			return fmt.Errorf("--mode must be attached or detached")
+		}
+		if cmd.Flags().Changed("placement") && opts.Placement == "" {
+			return fmt.Errorf("--placement must be outside-worktrees or within-repo-root")
+		}
+		return nil
 	}
 }
 
@@ -82,14 +120,15 @@ func newWorktreeEnsureCmd(stdout, stderr io.Writer) *cobra.Command {
 		Use:   "ensure",
 		Short: "Ensure the worktree exists and satisfies all postconditions",
 		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if runWorktreeEnsure(opts, stdout, stderr) != 0 {
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if runWorktreeEnsureContext(cmd.Context(), opts, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	worktreeFlagSet(cmd, &opts)
+	worktreeLockFlagSet(cmd, &opts)
 	cmd.Flags().BoolVarP(&opts.DryRun, "dry-run", "n", false, "plan without mutating anything")
 	cmd.Flags().StringVar(&opts.Agent, "agent", "",
 		"qualified agent identity to best-effort materialize skills for after creation")
@@ -120,7 +159,7 @@ func newWorktreeCleanupCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Remove an owned worktree after all safety gates pass",
 		Long: `Remove an owned worktree after all safety gates pass.
 
-Cleanup verifies the canonical repository, path, branch, and durable ownership
+Cleanup verifies the canonical repository, path, HEAD mode, and durable ownership
 provenance before acting. It refuses dirty worktrees, commits reachable from no
 branch, tag, or remote-tracking ref, and commits not merged into --base.
 --attempt-id binds the removal to one exact provisioning attempt, so a stale
@@ -129,14 +168,15 @@ force mode and no recursive-filesystem fallback. An already-absent,
 unregistered path is an idempotent success. With --json, safety refusals return
 a structured cleanup_pending result for formula automation.`,
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if runWorktreeCleanup(opts, stdout, stderr) != 0 {
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if runWorktreeCleanupContext(cmd.Context(), opts, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	worktreeFlagSet(cmd, &opts)
+	worktreeLockFlagSet(cmd, &opts)
 	cmd.Flags().StringVar(&opts.AttemptID, "attempt-id", "",
 		"attempt id returned by the ensure that created this worktree (required)")
 	_ = cmd.MarkFlagRequired("attempt-id")
@@ -144,6 +184,18 @@ a structured cleanup_pending result for formula automation.`,
 }
 
 func (o worktreeCmdOpts) spec() (worktree.Spec, error) {
+	if o.Placement == worktree.PlacementWithinRepoRoot {
+		for _, path := range []string{o.Repo, o.Root, o.Path} {
+			for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+				if component == ".." {
+					return worktree.Spec{}, fmt.Errorf("within-repo-root paths must not contain traversal")
+				}
+			}
+		}
+	}
+	if o.Placement != "" && o.Mode == "" {
+		o.Mode = worktree.ModeAttached
+	}
 	repo, err := filepath.Abs(o.Repo)
 	if err != nil {
 		return worktree.Spec{}, fmt.Errorf("resolving --repo %q: %w", o.Repo, err)
@@ -157,31 +209,57 @@ func (o worktreeCmdOpts) spec() (worktree.Spec, error) {
 		return worktree.Spec{}, fmt.Errorf("resolving --root %q: %w", o.Root, err)
 	}
 	return worktree.Spec{
-		RepoDir:    repo,
-		Root:       root,
-		Path:       path,
-		Branch:     o.Branch,
-		Base:       o.Base,
-		BaseSHA:    o.BaseSHA,
-		BeadID:     o.BeadID,
-		StoreRef:   o.StoreRef,
-		Creator:    o.Creator,
-		Owner:      o.Owner,
-		Generation: o.Generation,
-		Lifecycle:  o.Lifecycle,
-		AttemptID:  o.AttemptID,
-		DryRun:     o.DryRun,
+		RepoDir:     repo,
+		Root:        root,
+		Path:        path,
+		Branch:      o.Branch,
+		Mode:        o.Mode,
+		Placement:   o.Placement,
+		Base:        o.Base,
+		BaseSHA:     o.BaseSHA,
+		BeadID:      o.BeadID,
+		StoreRef:    o.StoreRef,
+		Creator:     o.Creator,
+		Owner:       o.Owner,
+		Generation:  o.Generation,
+		Lifecycle:   o.Lifecycle,
+		AttemptID:   o.AttemptID,
+		DryRun:      o.DryRun,
+		LockTimeout: o.LockTimeout,
 	}, nil
 }
 
 func runWorktreeEnsure(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
+	return runWorktreeEnsureContext(context.Background(), opts, stdout, stderr)
+}
+
+func runWorktreeEnsureContext(ctx context.Context, opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 	spec, err := opts.spec()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc worktree ensure: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	rep, err := worktree.Ensure(spec)
+	rep, err := worktree.EnsureContext(ctx, spec)
 	if err != nil {
+		code := ""
+		switch {
+		case errors.Is(err, worktree.ErrLockTimeout):
+			code = worktree.CleanupErrorLockTimeout
+		case errors.Is(err, context.Canceled):
+			code = worktree.CleanupErrorCanceled
+		}
+		if opts.JSON && code != "" {
+			result := worktreeJSONResult{
+				SchemaVersion: "1",
+				Command:       "worktree ensure",
+				Action:        "ensure",
+				Report:        worktree.Report{Path: spec.Path, Branch: spec.Branch},
+				Error:         &cliJSONError{Code: code, Message: err.Error(), ExitCode: 1},
+			}
+			if encodeErr := json.NewEncoder(stdout).Encode(result); encodeErr != nil {
+				fmt.Fprintf(stderr, "gc worktree ensure: encoding report: %v\n", encodeErr) //nolint:errcheck
+			}
+		}
 		fmt.Fprintf(stderr, "gc worktree ensure: %v\n", err) //nolint:errcheck
 		return 1
 	}
@@ -235,6 +313,10 @@ func runWorktreeVerify(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 }
 
 func runWorktreeCleanup(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
+	return runWorktreeCleanupContext(context.Background(), opts, stdout, stderr)
+}
+
+func runWorktreeCleanupContext(ctx context.Context, opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 	spec, err := opts.spec()
 	if err != nil {
 		report := worktree.CleanupReport{
@@ -249,7 +331,7 @@ func runWorktreeCleanup(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 		}
 		return writeWorktreeCleanupReport(report, opts, stdout, stderr)
 	}
-	report, cleanupErr := worktree.Cleanup(spec)
+	report, cleanupErr := worktree.CleanupContext(ctx, spec)
 	code := writeWorktreeCleanupReport(report, opts, stdout, stderr)
 	if cleanupErr != nil {
 		return 1
@@ -258,10 +340,11 @@ func runWorktreeCleanup(opts worktreeCmdOpts, stdout, stderr io.Writer) int {
 }
 
 type worktreeJSONResult struct {
-	SchemaVersion string `json:"schema_version"`
-	OK            bool   `json:"ok"`
-	Command       string `json:"command"`
-	Action        string `json:"action"`
+	SchemaVersion string        `json:"schema_version"`
+	OK            bool          `json:"ok"`
+	Command       string        `json:"command"`
+	Action        string        `json:"action"`
+	Error         *cliJSONError `json:"error,omitempty"`
 	worktree.Report
 }
 
@@ -287,9 +370,17 @@ func writeWorktreeReport(action string, rep worktree.Report, opts worktreeCmdOpt
 			fmt.Fprintf(stdout, "  %s\n", action) //nolint:errcheck
 		}
 	case rep.Created:
-		fmt.Fprintf(stdout, "created worktree %s on branch %s at %s\n", rep.Path, rep.Branch, rep.Head) //nolint:errcheck
+		if rep.Mode == worktree.ModeDetached {
+			fmt.Fprintf(stdout, "created detached worktree %s at %s\n", rep.Path, rep.Head) //nolint:errcheck
+		} else {
+			fmt.Fprintf(stdout, "created worktree %s on branch %s at %s\n", rep.Path, rep.Branch, rep.Head) //nolint:errcheck
+		}
 	default:
-		fmt.Fprintf(stdout, "worktree %s on branch %s at %s\n", rep.Path, rep.Branch, rep.Head) //nolint:errcheck
+		if rep.Mode == worktree.ModeDetached {
+			fmt.Fprintf(stdout, "detached worktree %s at %s\n", rep.Path, rep.Head) //nolint:errcheck
+		} else {
+			fmt.Fprintf(stdout, "worktree %s on branch %s at %s\n", rep.Path, rep.Branch, rep.Head) //nolint:errcheck
+		}
 	}
 	return 0
 }
@@ -329,7 +420,11 @@ func writeWorktreeCleanupReport(rep worktree.CleanupReport, opts worktreeCmdOpts
 	case rep.AlreadyAbsent:
 		fmt.Fprintf(stdout, "worktree %s is already absent\n", rep.Path) //nolint:errcheck
 	case rep.Removed:
-		fmt.Fprintf(stdout, "removed worktree %s on branch %s\n", rep.Path, rep.Branch) //nolint:errcheck
+		if rep.Mode == worktree.ModeDetached {
+			fmt.Fprintf(stdout, "removed detached worktree %s\n", rep.Path) //nolint:errcheck
+		} else {
+			fmt.Fprintf(stdout, "removed worktree %s on branch %s\n", rep.Path, rep.Branch) //nolint:errcheck
+		}
 	default:
 		fmt.Fprintf(stdout, "worktree %s required no cleanup\n", rep.Path) //nolint:errcheck
 	}

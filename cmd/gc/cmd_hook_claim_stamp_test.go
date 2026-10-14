@@ -12,7 +12,151 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/session"
 )
+
+func TestHookClaimSessionAttemptHashVectors(t *testing.T) {
+	for _, tc := range []struct{ step, token, sessionID, want string }{
+		{"gcg-run-build", "0123456789abcdef", "mc-session", "writer-ae250fe7244e1d97f7bc60fb3505344ad01df04d9ad7183505c65fa68cb493f6"},
+		{"gcg-é<&", "abcdef", "mc-会", "writer-89a3ee0963f7edb01ec0882adf455a983b5d1e9287adf956cc17c0dada68c9fd"},
+	} {
+		t.Run(tc.step, func(t *testing.T) {
+			opts := hookClaimOptions{
+				Env:             []string{"GC_SESSION_ID=" + tc.sessionID},
+				VerifiedSession: &session.Info{ID: tc.sessionID, InstanceToken: tc.token},
+			}
+			if got := hookClaimSessionAttemptID(beads.Bead{ID: tc.step, Status: "in_progress"}, opts); got != tc.want {
+				t.Fatalf("attempt = %s, want fixed Python canonical-JSON vector %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHookClaimVerifiedAttemptReadback(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateActive, "current-token")
+	setFenceClaimEnv(t, cityDir, sessionID, "current-token")
+	cfg, err := loadCityConfig(cityDir, &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	_, handled, info := fenceHookClaimSession(cityDir, cfg, sessionID, hookCommandOptions{Claim: true}, &stdout, &stderr)
+	if handled || info == nil {
+		t.Fatalf("verified session not admitted: handled=%v stderr=%s", handled, stderr.String())
+	}
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := store.Create(beads.Bead{Title: "build", Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "worker"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := hookClaimOptions{
+		Assignee: "worker-1", IdentityCandidates: []string{"worker-1"}, RouteTargets: []string{"worker"},
+		Env: []string{"GC_SESSION_ID=" + sessionID, "GC_SESSION_NAME=worker-1", "GC_INSTANCE_TOKEN=current-token"}, VerifiedSession: info, JSON: true,
+	}
+	query, err := json.Marshal([]beads.Bead{work})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(query), nil },
+		Claim: func(_ context.Context, _ string, _ []string, id, assignee string) (beads.Bead, bool, error) {
+			status := "in_progress"
+			if err := store.Update(id, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+				return beads.Bead{}, false, err
+			}
+			claimed, err := store.Get(id)
+			return claimed, err == nil, err
+		},
+		ResolveWorkBranch: func(hookClaimWorkTree) string { return "" },
+		StampWorkMeta: func(_ context.Context, _ string, _ []string, id, _ string, patch map[string]string) error {
+			writes++
+			if patch[beadmeta.SessionIDMetadataKey] != sessionID || patch[beadmeta.SessionNameMetadataKey] != "worker-1" || patch[beadmeta.SessionAttemptIDMetadataKey] == "" {
+				t.Fatalf("session and attempt identity must share one patch: %v", patch)
+			}
+			return store.SetMetadataBatch(id, patch)
+		},
+		ReadWorkMeta:  func(_ context.Context, _ string, _ []string, id, _ string) (beads.Bead, error) { return store.Get(id) },
+		PublishRunMap: noopPublishRunMap, StampSessionClaim: noopStampSessionClaim,
+	}
+	if code := doHookClaim("ready", cityDir, opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("claim = %d; stderr=%s", code, stderr.String())
+	}
+	claimed, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := hookClaimSessionAttemptID(claimed, opts)
+	if writes != 1 || want == "" || claimed.Metadata[beadmeta.SessionAttemptIDMetadataKey] != want {
+		t.Fatalf("durable claim identity missing: writes=%d metadata=%v", writes, claimed.Metadata)
+	}
+	if _, ok := stampHookClaimIdentity(claimed, opts, ops, cityDir, &stderr); !ok || writes != 1 {
+		t.Fatalf("unchanged verified identity was rewritten or refused: ok=%v writes=%d", ok, writes)
+	}
+	if err := store.Close(work.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(sessionID, "instance_token", "replacement-token"); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed.Metadata[beadmeta.SessionAttemptIDMetadataKey] != want || hookClaimSessionAttemptID(closed, opts) != "" {
+		t.Fatal("closed producer lost its retained attempt or permits historical backfill")
+	}
+}
+
+func TestHookClaimAttemptReadbackRefusesAnotherIncarnation(t *testing.T) {
+	opts := poolClaimOpts()
+	opts.VerifiedSession = &session.Info{ID: "mc-sess1", InstanceToken: "verified-token"}
+	bead := beads.Bead{ID: "gcg-build", Status: "in_progress", Metadata: map[string]string{beadmeta.SessionIDMetadataKey: "mc-sess1"}}
+	for _, attempt := range []string{"", "writer-another-incarnation"} {
+		t.Run(attempt, func(t *testing.T) {
+			ops := claimedAtNoWorktreeOps()
+			ops.StampWorkMeta = noopStampWorkMeta
+			ops.ReadWorkMeta = func(context.Context, string, []string, string, string) (beads.Bead, error) {
+				return beads.Bead{ID: bead.ID, Status: "in_progress", Metadata: map[string]string{
+					beadmeta.SessionIDMetadataKey: "mc-sess1", beadmeta.SessionAttemptIDMetadataKey: attempt,
+				}}, nil
+			}
+			if _, ok := stampHookClaimIdentity(bead, opts, ops, "", &bytes.Buffer{}); ok {
+				t.Fatal("session ID alone accepted an absent or different attempt")
+			}
+		})
+	}
+}
+
+func TestHookClaimAttemptRequiresVerifiedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, status, kind string
+		info               *session.Info
+	}{
+		{name: "unknown admission", status: "in_progress"},
+		{name: "tokenless", status: "in_progress", info: &session.Info{ID: "mc-sess1"}},
+		{name: "different session", status: "in_progress", info: &session.Info{ID: "mc-other", InstanceToken: "verified"}},
+		{name: "control", status: "in_progress", kind: "check", info: &session.Info{ID: "mc-sess1", InstanceToken: "verified"}},
+		{name: "closed", status: "closed", info: &session.Info{ID: "mc-sess1", InstanceToken: "verified"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := poolClaimOpts()
+			opts.Env = append(opts.Env, "GC_INSTANCE_TOKEN=environment-is-not-admission")
+			opts.VerifiedSession = tc.info
+			patch := hookClaimIdentityPatch(beads.Bead{ID: "gcg-build", Status: tc.status, Metadata: map[string]string{beadmeta.KindMetadataKey: tc.kind}}, opts, claimedAtNoWorktreeOps(), "")
+			if _, stamped := patch[beadmeta.SessionAttemptIDMetadataKey]; stamped {
+				t.Fatalf("unverified, control or historical claim stamped: %v", patch)
+			}
+		})
+	}
+}
 
 // stampMetaSpy captures the (beadID, assignee, patch) a claim writes through the
 // StampWorkMeta seam, and lets a test inject a write error to prove the stamp

@@ -3,7 +3,7 @@
 package worktree
 
 import (
-	"fmt"
+	"errors"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -17,20 +17,16 @@ type pathLock struct {
 	ov windows.Overlapped
 }
 
-// lockPath acquires an exclusive lock for the given workspace path within the
-// given repository, blocking until it is available. The returned lock must be
-// released with unlock.
-func lockPath(repoDir, path string) (*pathLock, error) {
-	f, err := openLockFile(repoDir, path)
-	if err != nil {
-		return nil, err
+func (l *pathLock) tryLock() (bool, error) {
+	err := windows.LockFileEx(windows.Handle(l.f.Fd()),
+		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &l.ov)
+	if err == nil {
+		return true, nil
 	}
-	lock := &pathLock{f: f}
-	if err := windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &lock.ov); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("locking worktree %q: %w", path, err)
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+		return false, nil
 	}
-	return lock, nil
+	return false, err
 }
 
 // unlock releases the lock. It is safe to call on a nil lock so callers can

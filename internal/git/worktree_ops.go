@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -120,6 +121,21 @@ func (g *Git) WorktreeAddExistingBranch(path, branch string) error {
 	return nil
 }
 
+// WorktreeAddDetached creates a branchless worktree at a previously resolved
+// full input OID. It never probes, creates, adopts, or deletes a branch.
+func (g *Git) WorktreeAddDetached(path, baseSHA string) error {
+	if err := validateRefArg("path", path); err != nil {
+		return err
+	}
+	if !isHexObjectID(baseSHA) {
+		return fmt.Errorf("detached base %q must be a full commit OID", baseSHA)
+	}
+	if _, err := g.run("worktree", "add", "--detach", path, baseSHA); err != nil {
+		return fmt.Errorf("adding detached worktree %q from %q: %w", path, baseSHA, err)
+	}
+	return nil
+}
+
 // BranchDeleteIfMerged deletes a local branch only when git can prove the
 // deletion loses nothing, and returns an error when it cannot.
 //
@@ -143,7 +159,12 @@ func (g *Git) BranchDeleteIfMerged(branch string) error {
 // All worktrees of one repository share the same common dir, which makes it
 // the repository-identity anchor for worktree verification.
 func (g *Git) CommonDir() (string, error) {
-	out, err := g.run("rev-parse", "--git-common-dir")
+	return g.CommonDirCtx(context.Background())
+}
+
+// CommonDirCtx is CommonDir with cancelable Git discovery.
+func (g *Git) CommonDirCtx(ctx context.Context) (string, error) {
+	out, err := g.runCtx(ctx, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return "", fmt.Errorf("resolving git common dir: %w", err)
 	}
@@ -201,4 +222,34 @@ func isHexObjectID(s string) bool {
 		}
 	}
 	return true
+}
+
+// IsBareRepository reports Git's explicit repository topology.
+func (g *Git) IsBareRepository() (bool, error) {
+	out, err := g.run("rev-parse", "--is-bare-repository")
+	if err != nil {
+		return false, fmt.Errorf("reading bare repository topology: %w", err)
+	}
+	switch strings.TrimSpace(out) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("invalid bare repository topology %q", out)
+}
+
+// GitPath resolves a repository administration path through native Git.
+func (g *Git) GitPath(name string) (string, error) {
+	if name == "" || strings.HasPrefix(name, "-") {
+		return "", fmt.Errorf("invalid Git path %q", name)
+	}
+	out, err := g.run("rev-parse", "--path-format=absolute", "--git-path", name)
+	if err != nil {
+		return "", fmt.Errorf("resolving Git path %q: %w", name, err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", fmt.Errorf("Git returned an empty administration path")
+	}
+	return filepath.Clean(strings.TrimSpace(out)), nil
 }

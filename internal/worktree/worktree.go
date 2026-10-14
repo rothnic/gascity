@@ -4,17 +4,18 @@
 // a path goes through this owner, the postconditions are uniform:
 //
 //   - the path is the root of a git worktree of the requested repository,
-//   - the requested branch is checked out with an attached HEAD (never
-//     detached),
+//   - HEAD is attached to the requested branch by default, or detached when
+//     explicitly requested,
 //   - an explicit base keeps its verbatim local meaning (no remote
 //     fallback), and
-//   - a failed creation rolls back everything it created.
+//   - a failed creation rolls back only state that has not acquired work.
 //
 // Dry-run is observationally pure: it plans and validates without touching
 // the filesystem or the repository.
 package worktree
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -37,8 +38,18 @@ import (
 var ErrWorktreeMissing = errors.New("worktree path does not exist")
 
 const (
-	provenanceSchemaVersion = 1
-	provenanceFilename      = "gascity-worktree-provenance.json"
+	provenanceSchemaVersion     = 1
+	modeProvenanceSchemaVersion = 2
+	provenanceFilename          = "gascity-worktree-provenance.json"
+
+	// ModeAttached preserves the default branch-backed workspace contract.
+	ModeAttached = "attached"
+	// ModeDetached provisions a branchless workspace at the resolved input.
+	ModeDetached = "detached"
+	// PlacementOutsideWorktrees retains the existing placement policy.
+	PlacementOutsideWorktrees = "outside-worktrees"
+	// PlacementWithinRepoRoot permits the selected primary/control root as an ancestor.
+	PlacementWithinRepoRoot = "within-repo-root"
 
 	// LifecycleActive is the initial lifecycle state of a usable workspace.
 	LifecycleActive = "active"
@@ -47,6 +58,10 @@ const (
 	CleanupErrorInvalidSpec = "invalid_spec"
 	// CleanupErrorAmbiguous reports a path whose registered identity cannot be proven.
 	CleanupErrorAmbiguous = "ambiguous_path"
+	// CleanupErrorLockTimeout reports an expired lock acquisition deadline.
+	CleanupErrorLockTimeout = "lock_timeout"
+	// CleanupErrorCanceled reports caller cancellation before lock admission.
+	CleanupErrorCanceled = "canceled"
 	// CleanupErrorOwnership reports durable provenance that does not match the caller.
 	CleanupErrorOwnership = "ownership_mismatch"
 	// CleanupErrorStaleAttempt reports a worktree owned by the caller but
@@ -88,9 +103,15 @@ type Spec struct {
 	// Root is the configured per-rig worktree root. Managed worktrees must be
 	// direct children of this root; callers must not derive it from their cwd.
 	Root string
-	// Branch must be checked out at Path with an attached HEAD.
+	// Mode defaults to attached when omitted. Explicit modes use provenance
+	// schema 2; legacy callers continue to create schema 1 records.
+	Mode string
+	// Placement defaults to outside-worktrees. Explicit within-repo-root
+	// permits only the selected primary/control repository as an ancestor.
+	Placement string
+	// Branch must be checked out in attached mode and empty in detached mode.
 	Branch string
-	// Base is the ref a NEW branch is created from. It is resolved
+	// Base is the ref a new branch or detached worktree is created from. It is resolved
 	// verbatim against the local repository — "main" means local main,
 	// never a remote fallback. Required only when Branch does not exist.
 	Base string
@@ -122,6 +143,9 @@ type Spec struct {
 	//
 	// Ensure ignores this field; it mints its own.
 	AttemptID string
+	// LockTimeout bounds lock acquisition, not the transaction that follows.
+	// Zero uses DefaultLockTimeout; negative values are invalid.
+	LockTimeout time.Duration
 	// DryRun plans without mutating anything.
 	DryRun bool
 }
@@ -135,6 +159,8 @@ type Provenance struct {
 	RepoIdentity  string `json:"repo_identity"`
 	Path          string `json:"path"`
 	Branch        string `json:"branch"`
+	Mode          string `json:"mode,omitempty"`
+	Placement     string `json:"placement,omitempty"`
 	BaseRef       string `json:"base_ref"`
 	BaseSHA       string `json:"base_sha"`
 	Creator       string `json:"creator"`
@@ -152,8 +178,10 @@ type Provenance struct {
 
 // Report describes the observed or planned workspace state.
 type Report struct {
-	Path   string `json:"path"`
-	Branch string `json:"branch"`
+	Path      string `json:"path"`
+	Branch    string `json:"branch"`
+	Mode      string `json:"mode,omitempty"`
+	Placement string `json:"placement,omitempty"`
 	// Head is the commit SHA at the worktree's HEAD. Empty when a dry-run
 	// only planned creation.
 	Head string `json:"head,omitempty"`
@@ -182,6 +210,8 @@ type CleanupError struct {
 type CleanupReport struct {
 	Path           string        `json:"path"`
 	Branch         string        `json:"branch"`
+	Mode           string        `json:"mode,omitempty"`
+	Placement      string        `json:"placement,omitempty"`
 	Head           string        `json:"head,omitempty"`
 	Removed        bool          `json:"removed"`
 	AlreadyAbsent  bool          `json:"already_absent"`
@@ -191,6 +221,9 @@ type CleanupReport struct {
 }
 
 func (s Spec) validate() error {
+	if s.LockTimeout < 0 {
+		return errors.New("worktree spec: lock timeout must not be negative")
+	}
 	if s.RepoDir == "" {
 		return errors.New("worktree spec: repo dir must not be empty")
 	}
@@ -203,8 +236,17 @@ func (s Spec) validate() error {
 	if !filepath.IsAbs(s.Path) {
 		return fmt.Errorf("worktree spec: path %q must be absolute", s.Path)
 	}
-	if s.Branch == "" {
+	if s.Mode != "" && s.Mode != ModeAttached && s.Mode != ModeDetached {
+		return fmt.Errorf("worktree spec: unknown mode %q", s.Mode)
+	}
+	if s.Placement != "" && (s.Mode == "" || (s.Placement != PlacementOutsideWorktrees && s.Placement != PlacementWithinRepoRoot)) {
+		return fmt.Errorf("worktree spec: placement %q requires an explicit mode and must be %q or %q", s.Placement, PlacementOutsideWorktrees, PlacementWithinRepoRoot)
+	}
+	if s.effectiveMode() == ModeAttached && s.Branch == "" {
 		return errors.New("worktree spec: branch must not be empty")
+	}
+	if s.Mode == ModeDetached && s.Branch != "" {
+		return errors.New("worktree spec: branch must be empty in detached mode")
 	}
 	if s.managed() {
 		required := []struct {
@@ -228,6 +270,11 @@ func (s Spec) validate() error {
 		if !filepath.IsAbs(s.Root) {
 			return fmt.Errorf("worktree spec: root %q must be absolute", s.Root)
 		}
+		if s.Placement == PlacementWithinRepoRoot {
+			if err := validatePlacementSpelling(s.RepoDir, s.Root, s.Path); err != nil {
+				return err
+			}
+		}
 		if err := validateManagedPath(s); err != nil {
 			return err
 		}
@@ -240,11 +287,18 @@ func (s Spec) validate() error {
 
 func (s Spec) managed() bool {
 	return s.Root != "" || s.BeadID != "" || s.StoreRef != "" || s.Creator != "" ||
-		s.Owner != "" || s.Generation != "" || s.Lifecycle != "" || s.BaseSHA != ""
+		s.Owner != "" || s.Generation != "" || s.Lifecycle != "" || s.BaseSHA != "" || s.Mode != "" || s.Placement != ""
+}
+
+func (s Spec) effectiveMode() string {
+	if s.Mode == "" {
+		return ModeAttached
+	}
+	return s.Mode
 }
 
 // Verify checks that the spec's path is the root of a worktree of the
-// spec's repository with the spec's branch checked out on an attached HEAD.
+// spec's repository with the requested HEAD mode and branch.
 // Managed worktrees must also retain the recorded base commit in HEAD's ancestry.
 // It never mutates anything. A missing path returns ErrWorktreeMissing;
 // any other failure describes the postcondition that does not hold.
@@ -270,11 +324,17 @@ func Verify(spec Spec) (Report, error) {
 		return rep, fmt.Errorf("verifying worktree %q: %w", spec.Path, err)
 	}
 	rep.Provenance = &provenance
+	if provenance.SchemaVersion == modeProvenanceSchemaVersion {
+		rep.Mode, rep.Placement = provenance.Mode, provenance.Placement
+	}
 	return rep, nil
 }
 
 func verifyGitState(spec Spec) (Report, error) {
 	rep := Report{Path: spec.Path, Branch: spec.Branch}
+	if spec.Mode != "" {
+		rep.Mode, rep.Placement = spec.Mode, spec.effectivePlacement()
+	}
 
 	if _, err := os.Stat(spec.Path); err != nil {
 		if os.IsNotExist(err) {
@@ -315,12 +375,20 @@ func verifyGitState(spec Spec) (Report, error) {
 		return rep, fmt.Errorf("verifying worktree %q: path is inside worktree rooted at %q, not a worktree root", spec.Path, top)
 	}
 
-	// Branch postcondition: attached HEAD on exactly the requested branch.
+	// Only symbolic-ref's documented exit 1 proves a detached HEAD. Other
+	// failures are inconclusive and cannot satisfy either mode.
 	ref, err := wtGit.HeadSymbolicRef()
-	if err != nil {
+	if spec.Mode == ModeDetached {
+		var exitErr *exec.ExitError
+		if err == nil {
+			return rep, fmt.Errorf("verifying worktree %q: HEAD is attached to %q, want detached", spec.Path, ref)
+		}
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return rep, fmt.Errorf("verifying worktree %q: checking detached HEAD: %w", spec.Path, err)
+		}
+	} else if err != nil {
 		return rep, fmt.Errorf("verifying worktree %q: HEAD is detached: %w", spec.Path, err)
-	}
-	if want := "refs/heads/" + spec.Branch; ref != want {
+	} else if want := "refs/heads/" + spec.Branch; ref != want {
 		return rep, fmt.Errorf("verifying worktree %q: checked-out ref is %q, want %q", spec.Path, ref, want)
 	}
 	head, err := wtGit.RevParseVerifyCommit("HEAD")
@@ -337,14 +405,23 @@ func verifyGitState(spec Spec) (Report, error) {
 //   - an already-valid worktree returns unchanged (Created=false);
 //   - a path that exists in any other state is an error — Ensure never
 //     clobbers or "repairs" state it did not create;
-//   - creation never detaches: a new branch is created from the verbatim
-//     local base, an existing branch is attached as-is;
+//   - attached creation keeps the verbatim local base and branch semantics;
+//     explicit detached creation uses the resolved full base commit;
 //   - a managed existing branch must contain the resolved base before
 //     planning or creation;
 //   - every postcondition is re-verified after creation, and a failure
-//     rolls back the created worktree and any created branch;
+//     rolls back untouched state and retains work acquired during creation;
 //   - with Spec.DryRun, Ensure plans and validates but mutates nothing.
 func Ensure(spec Spec) (Report, error) {
+	return EnsureContext(context.Background(), spec)
+}
+
+// EnsureContext is Ensure with cancelable lock acquisition. Once admitted,
+// the transaction finishes synchronously under the lock even if ctx expires.
+func EnsureContext(ctx context.Context, spec Spec) (Report, error) {
+	if err := ctx.Err(); err != nil {
+		return Report{}, lockWaitError(spec.Path, err)
+	}
 	if err := spec.validate(); err != nil {
 		return Report{}, err
 	}
@@ -361,7 +438,7 @@ func Ensure(spec Spec) (Report, error) {
 	// that blocks on another caller's write would be a worse answer than a
 	// plan that reports the state it saw.
 	if !spec.DryRun {
-		lock, lockErr := lockPath(spec.RepoDir, spec.Path)
+		lock, lockErr := lockPathContext(ctx, spec.RepoDir, spec.Path, spec.LockTimeout)
 		if lockErr != nil {
 			return Report{}, lockErr
 		}
@@ -384,21 +461,22 @@ func Ensure(spec Spec) (Report, error) {
 		return planDryRun(spec, rep, branchExists, resolvedBase)
 	}
 
-	if err := createWorktree(repoGit, spec, branchExists); err != nil {
-		return rep, rollbackResult(err, rollbackAfterFailedCreate(repoGit, spec.Path, spec.Branch, !branchExists, resolvedBase))
+	branchCreated := spec.Mode != ModeDetached && !branchExists
+	if err := createWorktree(repoGit, spec, branchExists, resolvedBase); err != nil {
+		return rep, rollbackResult(err, rollbackAfterFailedCreate(repoGit, spec, branchCreated, resolvedBase))
 	}
 	created, err := verifyCreatedWorktree(spec, branchExists, resolvedBase)
 	if err != nil {
-		return rep, rollbackResult(err, rollbackCreated(repoGit, spec.Path, spec.Branch, !branchExists))
+		return rep, rollbackResult(err, rollbackCreated(repoGit, spec, branchCreated, resolvedBase, nil))
 	}
 	if spec.managed() {
 		created, err = publishAndVerifyProvenance(spec, resolvedBase)
 		if err != nil {
-			return rep, rollbackResult(err, rollbackCreated(repoGit, spec.Path, spec.Branch, !branchExists))
+			return rep, rollbackResult(err, rollbackCreated(repoGit, spec, branchCreated, resolvedBase, created.Provenance))
 		}
 	}
 	created.Created = true
-	created.BranchCreated = !branchExists
+	created.BranchCreated = branchCreated
 	return created, nil
 }
 
@@ -413,7 +491,19 @@ func Ensure(spec Spec) (Report, error) {
 // Cleanup cannot read and verify its worktree-private provenance, so it leaves
 // the registration untouched and reports cleanup_pending.
 func Cleanup(spec Spec) (CleanupReport, error) {
+	return CleanupContext(context.Background(), spec)
+}
+
+// CleanupContext is Cleanup with cancelable lock acquisition. Once admitted,
+// verification and removal finish synchronously under the lock.
+func CleanupContext(ctx context.Context, spec Spec) (CleanupReport, error) {
 	report := CleanupReport{Path: spec.Path, Branch: spec.Branch}
+	if spec.Mode != "" {
+		report.Mode, report.Placement = spec.Mode, spec.effectivePlacement()
+	}
+	if err := ctx.Err(); err != nil {
+		return cleanupLockFailure(report, lockWaitError(spec.Path, err))
+	}
 	if !spec.managed() {
 		return cleanupFailure(report, CleanupErrorInvalidSpec, "cleanup requires a complete managed worktree spec")
 	}
@@ -428,9 +518,9 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	// Hold the path lock across verification AND removal. Every check below is
 	// worthless if the workspace can be replaced between the check and the
 	// remove.
-	lock, err := lockPath(spec.RepoDir, spec.Path)
+	lock, err := lockPathContext(ctx, spec.RepoDir, spec.Path, spec.LockTimeout)
 	if err != nil {
-		return cleanupFailure(report, CleanupErrorAmbiguous, err.Error())
+		return cleanupLockFailure(report, err)
 	}
 	defer lock.unlock()
 
@@ -463,6 +553,7 @@ func Cleanup(spec Spec) (CleanupReport, error) {
 	}
 	report.Head = verified.Head
 	report.Provenance = verified.Provenance
+	report.Mode, report.Placement = verified.Mode, verified.Placement
 
 	// Bind removal to one exact provisioning attempt. Bead, owner, and
 	// generation are all reproduced by a re-provisioned workspace at the same
@@ -516,6 +607,18 @@ func cleanupFailure(report CleanupReport, code, message string) (CleanupReport, 
 	report.CleanupPending = true
 	report.Error = &CleanupError{Code: code, Message: message, ExitCode: 1}
 	return report, errors.New(message)
+}
+
+func cleanupLockFailure(report CleanupReport, err error) (CleanupReport, error) {
+	code := CleanupErrorAmbiguous
+	switch {
+	case errors.Is(err, ErrLockTimeout):
+		code = CleanupErrorLockTimeout
+	case errors.Is(err, context.Canceled):
+		code = CleanupErrorCanceled
+	}
+	report, _ = cleanupFailure(report, code, err.Error())
+	return report, err
 }
 
 func matchingRegisteredWorktrees(repoGit *git.Git, path string) ([]git.Worktree, error) {
@@ -575,9 +678,13 @@ func resolveCreationState(spec Spec) (*git.Git, bool, string, error) {
 	if !repoGit.IsRepo() {
 		return nil, false, "", fmt.Errorf("ensuring worktree %q: repo dir %q is not a git repository", spec.Path, spec.RepoDir)
 	}
-	branchExists, err := repoGit.BranchExists(spec.Branch)
-	if err != nil {
-		return nil, false, "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
+	branchExists := false
+	if spec.Mode != ModeDetached {
+		var err error
+		branchExists, err = repoGit.BranchExists(spec.Branch)
+		if err != nil {
+			return nil, false, "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
+		}
 	}
 	if !branchExists && spec.Base == "" {
 		return nil, false, "", fmt.Errorf("ensuring worktree %q: branch %q does not exist and no base was given", spec.Path, spec.Branch)
@@ -607,9 +714,12 @@ func resolveCreationState(spec Spec) (*git.Git, bool, string, error) {
 }
 
 func planDryRun(spec Spec, rep Report, branchExists bool, resolvedBase string) (Report, error) {
-	if branchExists {
+	switch {
+	case spec.Mode == ModeDetached:
+		rep.Planned = []string{fmt.Sprintf("git worktree add --detach %s %s", spec.Path, resolvedBase)}
+	case branchExists:
 		rep.Planned = []string{fmt.Sprintf("git worktree add %s %s", spec.Path, spec.Branch)}
-	} else {
+	default:
 		rep.Planned = []string{fmt.Sprintf("git worktree add -b %s %s %s", spec.Branch, spec.Path, spec.Base)}
 	}
 	if spec.managed() {
@@ -622,11 +732,14 @@ func planDryRun(spec Spec, rep Report, branchExists bool, resolvedBase string) (
 	return rep, nil
 }
 
-func createWorktree(repoGit *git.Git, spec Spec, branchExists bool) error {
+func createWorktree(repoGit *git.Git, spec Spec, branchExists bool, resolvedBase string) error {
 	var err error
-	if branchExists {
+	switch {
+	case spec.Mode == ModeDetached:
+		err = repoGit.WorktreeAddDetached(spec.Path, resolvedBase)
+	case branchExists:
 		err = repoGit.WorktreeAddExistingBranch(spec.Path, spec.Branch)
-	} else {
+	default:
 		// Preserve the explicit base verbatim so git's own branch-setup
 		// semantics follow the operator's stated intent.
 		err = repoGit.WorktreeAddNewBranch(spec.Path, spec.Branch, spec.Base)
@@ -638,13 +751,13 @@ func createWorktree(repoGit *git.Git, spec Spec, branchExists bool) error {
 }
 
 func verifyCreatedWorktree(spec Spec, branchExists bool, resolvedBase string) (Report, error) {
-	created, err := verifyGitState(Spec{RepoDir: spec.RepoDir, Path: spec.Path, Branch: spec.Branch})
+	created, err := verifyGitState(spec)
 	if err != nil {
 		return Report{}, fmt.Errorf("worktree %q failed post-create verification: %w", spec.Path, err)
 	}
 	if !branchExists && created.Head != resolvedBase {
-		return Report{}, fmt.Errorf("worktree %q: new branch %q is at %s, want base %q = %s",
-			spec.Path, spec.Branch, created.Head, spec.Base, resolvedBase)
+		return Report{}, fmt.Errorf("worktree %q: created HEAD is at %s, want base %q = %s",
+			spec.Path, created.Head, spec.Base, resolvedBase)
 	}
 	return created, nil
 }
@@ -660,14 +773,17 @@ func publishAndVerifyProvenance(spec Spec, resolvedBase string) (Report, error) 
 	if err != nil {
 		return Report{}, fmt.Errorf("worktree %q provenance attempt id failed: %w", spec.Path, err)
 	}
+	// Preserve this attempt's identity for a failed publication rollback.
+	// A different or unreadable record must never be treated as ours.
+	partial := Report{Provenance: &provenance}
 	if err := writeProvenance(spec.Path, provenance); err != nil {
-		return Report{}, fmt.Errorf("worktree %q provenance publish failed: %w", spec.Path, err)
+		return partial, fmt.Errorf("worktree %q provenance publish failed: %w", spec.Path, err)
 	}
 	verifySpec := spec
 	verifySpec.BaseSHA = provenance.BaseSHA
 	verified, err := Verify(verifySpec)
 	if err != nil {
-		return Report{}, fmt.Errorf("worktree %q failed provenance verification: %w", spec.Path, err)
+		return partial, fmt.Errorf("worktree %q failed provenance verification: %w", spec.Path, err)
 	}
 	return verified, nil
 }
@@ -676,6 +792,15 @@ func publishAndVerifyProvenance(spec Spec, resolvedBase string) (Report, error) 
 // report. It fences against stale/cross-owner reports using the durable
 // attempt ID and refuses to remove a worktree that acquired WIP.
 func RollbackAttempt(spec Spec, report Report) error {
+	return RollbackAttemptContext(context.Background(), spec, report)
+}
+
+// RollbackAttemptContext is RollbackAttempt with cancelable lock acquisition.
+// Once admitted, rollback finishes synchronously under the lock.
+func RollbackAttemptContext(ctx context.Context, spec Spec, report Report) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("rollback refused: %w", lockWaitError(spec.Path, err))
+	}
 	// Validate before touching anything. Taking the lock first would resolve
 	// the lock file through an unvalidated RepoDir, and git resolves an empty
 	// dir against the calling process's own working directory: an incomplete
@@ -694,7 +819,7 @@ func RollbackAttempt(spec Spec, report Report) error {
 	// Rollback verifies and then removes, so it needs the same lock Ensure and
 	// Cleanup hold: without it the attempt this call verified can be cleaned up
 	// and replaced before the removal lands, and rollback deletes the successor.
-	lock, lockErr := lockPath(spec.RepoDir, spec.Path)
+	lock, lockErr := lockPathContext(ctx, spec.RepoDir, spec.Path, spec.LockTimeout)
 	if lockErr != nil {
 		return fmt.Errorf("rollback refused: %w", lockErr)
 	}
@@ -707,6 +832,11 @@ func RollbackAttempt(spec Spec, report Report) error {
 	if verified.Provenance == nil || verified.Provenance.AttemptID != report.Provenance.AttemptID {
 		return fmt.Errorf("rollback refused: provenance attempt %q does not match report attempt %q",
 			provenanceAttempt(verified.Provenance), report.Provenance.AttemptID)
+	}
+	if spec.Mode == ModeDetached {
+		if err := verifyDetachedRollback(spec, verified.Provenance.BaseSHA, report.Provenance); err != nil {
+			return fmt.Errorf("rollback refused: %w", err)
+		}
 	}
 	status, err := git.New(spec.Path).StatusPorcelain()
 	if err != nil {
@@ -722,7 +852,7 @@ func RollbackAttempt(spec Spec, report Report) error {
 	if err := repoGit.WorktreePrune(); err != nil {
 		return fmt.Errorf("pruning rolled-back worktree: %w", err)
 	}
-	if report.BranchCreated {
+	if spec.Mode != ModeDetached && report.BranchCreated {
 		if err := repoGit.BranchDeleteIfMerged(spec.Branch); err != nil {
 			return fmt.Errorf("deleting attempt-created branch %q: %w", spec.Branch, err)
 		}
@@ -751,13 +881,25 @@ func RollbackAttempt(spec Spec, report Report) error {
 // anything it cannot show is its own. The branch is removed only when it is
 // still at the base this attempt would have created it from, and only when
 // git agrees it is merged.
-func rollbackAfterFailedCreate(repoGit *git.Git, path, branch string, branchCreated bool, wantBaseSHA string) error {
+func rollbackAfterFailedCreate(repoGit *git.Git, spec Spec, branchCreated bool, wantBaseSHA string) error {
+	path, branch := spec.Path, spec.Branch
 	var errs []error
 	matches, err := matchingRegisteredWorktrees(repoGit, path)
 	switch {
 	case err != nil:
 		errs = append(errs, fmt.Errorf("listing worktrees for rollback: %w", err))
+	case spec.Mode == ModeDetached && len(matches) == 0:
+		if _, statErr := os.Lstat(path); statErr == nil {
+			return fmt.Errorf("refusing detached rollback: path %q is unregistered and ownership is inconclusive", path)
+		} else if !errors.Is(statErr, fs.ErrNotExist) {
+			return fmt.Errorf("refusing detached rollback: path %q is unregistered and ownership is inconclusive: %w", path, statErr)
+		}
 	case len(matches) > 0:
+		if spec.Mode == ModeDetached {
+			if err := verifyDetachedRollback(spec, wantBaseSHA, nil); err != nil {
+				return err
+			}
+		}
 		// Published provenance means a completed Ensure owns this workspace:
 		// this attempt never reaches the publish step, so the registration
 		// belongs to a rival creator and must survive.
@@ -773,13 +915,16 @@ func rollbackAfterFailedCreate(repoGit *git.Git, path, branch string, branchCrea
 			break
 		}
 		if err := repoGit.WorktreeRemove(path, false); err != nil {
+			if spec.Mode == ModeDetached {
+				return err
+			}
 			errs = append(errs, err)
 		}
 		if err := repoGit.WorktreePrune(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if branchCreated {
+	if spec.Mode != ModeDetached && branchCreated {
 		exists, err := repoGit.BranchExists(branch)
 		switch {
 		case err != nil:
@@ -806,20 +951,66 @@ func rollbackAfterFailedCreate(repoGit *git.Git, path, branch string, branchCrea
 // rollbackCreated undoes only artifacts created by the current Ensure call.
 // Removal is never forced: if the new worktree acquired WIP, rollback retains
 // it and reports the cleanup failure.
-func rollbackCreated(repoGit *git.Git, path, branch string, branchCreated bool) error {
+func rollbackCreated(repoGit *git.Git, spec Spec, branchCreated bool, wantBaseSHA string, expected *Provenance) error {
+	path, branch := spec.Path, spec.Branch
+	if spec.Mode == ModeDetached {
+		if err := verifyDetachedRollback(spec, wantBaseSHA, expected); err != nil {
+			return err
+		}
+	}
 	var errs []error
 	if err := repoGit.WorktreeRemove(path, false); err != nil {
+		if spec.Mode == ModeDetached {
+			return err
+		}
 		errs = append(errs, err)
 	}
 	if err := repoGit.WorktreePrune(); err != nil {
 		errs = append(errs, err)
 	}
-	if branchCreated {
+	if spec.Mode != ModeDetached && branchCreated {
 		if err := repoGit.BranchDeleteIfMerged(branch); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// A clean detached checkout can still hold commits no surviving branch
+// protects. Before rollback, prove this exact registration has not advanced
+// beyond the attempt's initial input and carries this attempt's published ownership.
+func verifyDetachedRollback(spec Spec, wantBaseSHA string, expected *Provenance) error {
+	if expected == nil || expected.AttemptID == "" {
+		return errors.New("refusing detached rollback: expected provisioning attempt is missing")
+	}
+	matches, err := matchingRegisteredWorktrees(git.New(spec.RepoDir), spec.Path)
+	if err != nil {
+		return fmt.Errorf("refusing detached rollback: listing registrations for %q: %w", spec.Path, err)
+	}
+	if len(matches) != 1 {
+		return fmt.Errorf("refusing detached rollback: expected one registration for %q, got %d", spec.Path, len(matches))
+	}
+	verified, err := verifyGitState(spec)
+	if err != nil {
+		return fmt.Errorf("refusing detached rollback: %w", err)
+	}
+	if wantBaseSHA == "" || verified.Head != wantBaseSHA || matches[0].Head != verified.Head || matches[0].Branch != "" {
+		return fmt.Errorf("refusing detached rollback: HEAD %s or registration differs from initial base %s", verified.Head, wantBaseSHA)
+	}
+	got, err := readProvenance(spec.Path)
+	if err != nil {
+		return fmt.Errorf("refusing detached rollback: ownership is inconclusive: %w", err)
+	}
+	if got.AttemptID != expected.AttemptID {
+		return errors.New("refusing detached rollback: published provenance belongs to another attempt")
+	}
+	if got.BaseSHA != wantBaseSHA {
+		return errors.New("refusing detached rollback: published base differs from the attempt's initial input")
+	}
+	if err := verifyProvenance(spec, got); err != nil {
+		return fmt.Errorf("refusing detached rollback: %w", err)
+	}
+	return nil
 }
 
 func rollbackResult(cause, rollbackErr error) error {
@@ -871,6 +1062,9 @@ func rejectRegisteredWorktreeAncestor(spec Spec) error {
 	candidate, err := canonicalPathAllowMissing(spec.Path)
 	if err != nil {
 		return fmt.Errorf("worktree spec: canonicalizing candidate path: %w", err)
+	}
+	if spec.Placement == PlacementWithinRepoRoot {
+		return validateWithinRepoPlacement(spec, worktrees, candidate)
 	}
 	for _, existing := range worktrees {
 		existingPath, pathErr := canonicalPathAllowMissing(existing.Path)
@@ -925,7 +1119,7 @@ func plannedProvenance(spec Spec, resolvedBase string) (Provenance, error) {
 	if spec.BaseSHA != "" {
 		resolvedBase = spec.BaseSHA
 	}
-	return Provenance{
+	provenance := Provenance{
 		SchemaVersion: provenanceSchemaVersion,
 		BeadID:        strings.TrimSpace(spec.BeadID),
 		StoreRef:      strings.TrimSpace(spec.StoreRef),
@@ -938,7 +1132,12 @@ func plannedProvenance(spec Spec, resolvedBase string) (Provenance, error) {
 		Owner:         strings.TrimSpace(spec.Owner),
 		Generation:    strings.TrimSpace(spec.Generation),
 		Lifecycle:     strings.TrimSpace(spec.Lifecycle),
-	}, nil
+	}
+	if spec.Mode != "" {
+		provenance.SchemaVersion = modeProvenanceSchemaVersion
+		provenance.Mode, provenance.Placement = spec.Mode, spec.effectivePlacement()
+	}
+	return provenance, nil
 }
 
 func verifyProvenance(spec Spec, got Provenance) error {
@@ -946,8 +1145,29 @@ func verifyProvenance(spec Spec, got Provenance) error {
 	if err != nil {
 		return err
 	}
-	if got.SchemaVersion != provenanceSchemaVersion {
-		return fmt.Errorf("schema version is %d, want %d", got.SchemaVersion, provenanceSchemaVersion)
+	mode := got.Mode
+	switch got.SchemaVersion {
+	case provenanceSchemaVersion:
+		if got.Mode != "" || got.Placement != "" {
+			return errors.New("schema 1 provenance must not declare mode or placement")
+		}
+		mode = ModeAttached
+	case modeProvenanceSchemaVersion:
+		if (got.Mode != ModeAttached && got.Mode != ModeDetached) || (got.Placement != PlacementOutsideWorktrees && got.Placement != PlacementWithinRepoRoot) {
+			return fmt.Errorf("schema 2 provenance has invalid mode %q or placement %q", got.Mode, got.Placement)
+		}
+	default:
+		return fmt.Errorf("unsupported provenance schema version %d", got.SchemaVersion)
+	}
+	placement := got.Placement
+	if got.SchemaVersion == provenanceSchemaVersion {
+		placement = PlacementOutsideWorktrees
+	}
+	if placement != spec.effectivePlacement() {
+		return fmt.Errorf("placement is %q, want %q", placement, spec.effectivePlacement())
+	}
+	if mode != spec.effectiveMode() {
+		return fmt.Errorf("mode is %q, want %q", mode, spec.effectiveMode())
 	}
 	checks := []struct {
 		name string
@@ -1006,6 +1226,17 @@ func readProvenance(worktreePath string) (Provenance, error) {
 	if err := json.Unmarshal(data, &provenance); err != nil {
 		return Provenance{}, fmt.Errorf("decoding %q: %w", path, err)
 	}
+	if provenance.SchemaVersion == provenanceSchemaVersion {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return Provenance{}, fmt.Errorf("decoding %q: %w", path, err)
+		}
+		for key := range fields {
+			if strings.EqualFold(key, "mode") || strings.EqualFold(key, "placement") {
+				return Provenance{}, fmt.Errorf("decoding %q: schema 1 must not declare %s", path, key)
+			}
+		}
+	}
 	return provenance, nil
 }
 
@@ -1056,4 +1287,174 @@ func provenanceAttempt(provenance *Provenance) string {
 		return ""
 	}
 	return provenance.AttemptID
+}
+
+// validateWithinRepoPlacement permits only the selected primary/control
+// registration as an ancestor; a linked checkout never grants that exception.
+func validateWithinRepoPlacement(spec Spec, worktrees []git.Worktree, candidate string) error {
+	g := git.New(spec.RepoDir)
+	common, err := canonicalCommonDir(g)
+	if err != nil {
+		return fmt.Errorf("worktree spec: repository identity: %w", err)
+	}
+	private, err := g.GitDir()
+	if err != nil {
+		return fmt.Errorf("worktree spec: private Git directory: %w", err)
+	}
+	private, err = filepath.EvalSymlinks(private)
+	if err != nil {
+		return fmt.Errorf("worktree spec: canonical private Git directory: %w", err)
+	}
+	if !pathutil.SamePath(private, common) {
+		return errors.New("worktree spec: within-repo-root requires a primary or bare control repository")
+	}
+	bare, err := g.IsBareRepository()
+	if err != nil {
+		return fmt.Errorf("worktree spec: repository topology: %w", err)
+	}
+	control := common
+	if bare {
+		controls := 0
+		for _, entry := range worktrees {
+			if !entry.Bare || entry.Prunable {
+				continue
+			}
+			path, err := canonicalPathAllowMissing(entry.Path)
+			if err != nil {
+				return fmt.Errorf("worktree spec: bare control registration: %w", err)
+			}
+			if !pathutil.SamePath(path, common) && (filepath.Base(common) != ".git" || !pathutil.SamePath(path, filepath.Dir(common))) {
+				continue
+			}
+			identity, err := canonicalCommonDir(git.New(path))
+			if err != nil {
+				return fmt.Errorf("worktree spec: bare control identity: %w", err)
+			}
+			if !pathutil.SamePath(identity, common) {
+				return errors.New("worktree spec: bare control repository identity differs")
+			}
+			control = path
+			controls++
+		}
+		if controls != 1 {
+			return errors.New("worktree spec: bare control registration is ambiguous")
+		}
+	}
+	if !bare {
+		control, err = g.TopLevel()
+		if err != nil {
+			return fmt.Errorf("worktree spec: primary checkout: %w", err)
+		}
+		control, err = filepath.EvalSymlinks(control)
+		if err != nil {
+			return fmt.Errorf("worktree spec: canonical primary checkout: %w", err)
+		}
+	}
+	if pathutil.SamePath(candidate, control) {
+		return errors.New("worktree spec: workspace cannot replace the repository control root")
+	}
+	controlCount, candidateCount := 0, 0
+	for _, existing := range worktrees {
+		path, err := canonicalPathAllowMissing(existing.Path)
+		if err != nil {
+			return fmt.Errorf("worktree spec: registered identity %q: %w", existing.Path, err)
+		}
+		if pathutil.SamePath(path, control) {
+			controlCount++
+			if existing.Bare != bare || existing.Prunable {
+				return errors.New("worktree spec: selected control registration has inconsistent topology or is prunable")
+			}
+		}
+		if pathutil.SamePath(path, candidate) {
+			candidateCount++
+			if existing.Bare || existing.Prunable {
+				return errors.New("worktree spec: candidate registration is bare or prunable")
+			}
+		} else if pathutil.PathWithin(path, candidate) && !pathutil.SamePath(path, control) {
+			return fmt.Errorf("worktree spec: path %q is inside another registered worktree %q", candidate, path)
+		}
+	}
+	if controlCount != 1 || candidateCount > 1 {
+		return errors.New("worktree spec: repository or workspace registration is ambiguous")
+	}
+	if (!bare || !pathutil.SamePath(control, common)) && pathutil.PathWithin(common, candidate) {
+		return errors.New("worktree spec: workspace is inside Git administration")
+	}
+	if bare {
+		for _, name := range []string{"objects", "refs", "logs", "hooks", "info", "branches", "worktrees", "modules", "rr-cache", "rebase-apply", "rebase-merge", "HEAD", "index", "config", "packed-refs", "shallow"} {
+			admin, err := g.GitPath(name)
+			if err != nil {
+				return fmt.Errorf("worktree spec: resolving Git administration %q: %w", name, err)
+			}
+			admin, err = canonicalPathAllowMissing(admin)
+			if err != nil {
+				return fmt.Errorf("worktree spec: canonical Git administration %q: %w", name, err)
+			}
+			if pathutil.PathWithin(admin, candidate) {
+				return fmt.Errorf("worktree spec: workspace is inside Git administration %q", admin)
+			}
+		}
+	}
+	// Probe only existing ancestors that declare a repository marker. A
+	// failed native identity read is a refusal, never an absent repository.
+	for parent := filepath.Dir(candidate); ; parent = filepath.Dir(parent) {
+		_, markerErr := os.Lstat(filepath.Join(parent, ".git"))
+		marker := markerErr == nil
+		if markerErr != nil && !errors.Is(markerErr, fs.ErrNotExist) {
+			return fmt.Errorf("worktree spec: reading ancestor repository marker: %w", markerErr)
+		}
+		bareMarker := false
+		if !marker {
+			bareMarker = true
+			for _, name := range []string{"HEAD", "objects", "refs"} {
+				if _, err := os.Lstat(filepath.Join(parent, name)); errors.Is(err, fs.ErrNotExist) {
+					bareMarker = false
+					break
+				} else if err != nil {
+					return fmt.Errorf("worktree spec: reading bare ancestor marker: %w", err)
+				}
+			}
+		}
+		if marker || bareMarker {
+			identity, err := canonicalCommonDir(git.New(parent))
+			if err != nil {
+				return fmt.Errorf("worktree spec: ancestor repository %q: %w", parent, err)
+			}
+			if !pathutil.SamePath(identity, common) {
+				return fmt.Errorf("worktree spec: foreign repository ancestor %q", parent)
+			}
+			if !pathutil.SamePath(parent, control) && (!bare || !pathutil.SamePath(parent, filepath.Dir(common)) || filepath.Base(common) != ".git") {
+				return fmt.Errorf("worktree spec: unselected repository ancestor %q", parent)
+			}
+		}
+		if parent == filepath.Dir(parent) {
+			break
+		}
+	}
+	return nil
+}
+
+func validatePlacementSpelling(paths ...string) error {
+	for _, path := range paths {
+		for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+			if component == ".." {
+				return errors.New("worktree spec: within-repo-root path must not contain traversal")
+			}
+		}
+		canonical, err := canonicalPathAllowMissing(path)
+		if err != nil {
+			return fmt.Errorf("worktree spec: placement path %q: %w", path, err)
+		}
+		if filepath.Clean(path) != canonical {
+			return fmt.Errorf("worktree spec: within-repo-root path %q uses a symlink alias", path)
+		}
+	}
+	return nil
+}
+
+func (s Spec) effectivePlacement() string {
+	if s.Placement == "" {
+		return PlacementOutsideWorktrees
+	}
+	return s.Placement
 }

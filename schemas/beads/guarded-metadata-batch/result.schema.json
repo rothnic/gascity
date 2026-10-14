@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gc://schemas/beads/guarded-metadata-batch/result.schema.json",
+  "title": "gc beads guarded-metadata-batch result",
+  "description": "Exact-store raw metadata and native closure snapshots or committed guarded metadata batch rows.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "store_ref",
+    "rows"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "ok": {
+      "const": true
+    },
+    "store_ref": {
+      "type": "string",
+      "maxLength": 260,
+      "pattern": "^(city|rig):[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/snapshot"
+          },
+          {
+            "$ref": "#/$defs/committed"
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "revision",
+        "status",
+        "assignee",
+        "type",
+        "labels",
+        "metadata"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque native revision; compare for equality only."
+        },
+        "status": {
+          "type": "string"
+        },
+        "assignee": {
+          "type": "string"
+        },
+        "close_reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional first-class native close reason; never inferred from metadata."
+        },
+        "closed_by_session": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional first-class native session that committed the close."
+        },
+        "type": {
+          "type": "string"
+        },
+        "labels": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "description": "Raw native metadata JSON, including its original value types."
+        }
+      }
+    },
+    "committed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "revision",
+        "changed"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque native revision after the guarded transaction."
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

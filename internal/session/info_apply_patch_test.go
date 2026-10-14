@@ -31,6 +31,7 @@ var allProjectedMetadataKeys = []string{
 	MCPServersSnapshotMetadataKey, "provider_terminal_error", "session_health",
 	"session_health_reason", "session_drainable", beadmeta.TriggerBeadIDMetadataKey,
 	beadmeta.TriggerBeadStoreRefMetadataKey, beadmeta.BrainParentSIDMetadataKey,
+	beadmeta.WorktreeRefMetadataKey,
 	beadmeta.PackMetadataKey, beadmeta.PackWorkspaceMetadataKey, beadmeta.WorkDirMetadataKey,
 	beadmeta.WorkerDirMetadataKey,
 	"pending_create_claim", "pending_create_started_at", "quarantined_until",

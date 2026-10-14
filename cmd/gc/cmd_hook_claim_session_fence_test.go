@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/session"
@@ -386,6 +387,25 @@ func TestHookCommandClaimFailsOpenOnSessionStoreError(t *testing.T) {
 	}
 	if code != 1 {
 		t.Fatalf("code = %d, want 1 (JSON no-work drain without --drain-ack)", code)
+	}
+	cfg, err := loadCityConfig(cityDir, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, handled, info := fenceHookClaimSession(cityDir, cfg, "worker-1", hookCommandOptions{Claim: true}, &stdout, &stderr)
+	if handled || info != nil {
+		t.Fatalf("store fault must leave admission unknown: handled=%v info=%v", handled, info)
+	}
+	spy := &stampMetaSpy{}
+	opts := poolClaimOpts()
+	opts.Env = append(opts.Env, "GC_INSTANCE_TOKEN=any-token")
+	opts.VerifiedSession = info
+	ops := poolClaimOps(`[{"id":"hw-unknown","status":"open","metadata":{"gc.routed_to":"worker"}}]`, map[string]string{"gc.routed_to": "worker"}, "", spy)
+	if code := doHookClaim("ready", "", opts, ops, &stdout, &stderr); code != 0 || spy.calls != 1 {
+		t.Fatalf("legacy fail-open claim changed: code=%d writes=%d stderr=%s", code, spy.calls, stderr.String())
+	}
+	if _, stamped := spy.patch[beadmeta.SessionAttemptIDMetadataKey]; stamped {
+		t.Fatal("session-store fault minted a durable attempt from an unadmitted environment token")
 	}
 }
 

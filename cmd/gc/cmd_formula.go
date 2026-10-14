@@ -882,9 +882,14 @@ store, copy them into the binding with
 						if err != nil {
 							return fmt.Errorf("attach bead %s: %w", attach, err)
 						}
+						entryDeps, err := sourceworkflow.EntryDependencies(store, store, recipe, attach)
+						if err != nil {
+							return err
+						}
 						result, err = molecule.Instantiate(cmd.Context(), store, recipe, molecule.Options{
 							Title:            title,
 							Vars:             cookVars,
+							ExternalDeps:     entryDeps,
 							IdempotencyKey:   graphRootKey,
 							PriorityOverride: cloneFormulaCookPriority(source.Priority),
 						})

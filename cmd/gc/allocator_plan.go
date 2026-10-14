@@ -168,6 +168,7 @@ func (p *decidePass) computePoolDesired() {
 		poolCfg = &clone
 	}
 	p.poolStates = computePoolDesiredStatesAt(poolCfg, p.poolWork, rows, p.merged.ScaleCheckCounts, p.merged.ScaleCheckDemand, p.in.Now, nil)
+	bindAssignedWorktreeReferences(p.cfg, p.poolStates, p.in.Demand.AssignedWork, p.in.Demand.AssignedStoreRefs)
 	p.poolDesired = retainScaleCheckPartialPoolDesired(p.cfg, PoolDesiredCounts(p.poolStates),
 		p.decidableSnapshot(), p.merged.PoolPartialRetention)
 	if p.poolDesired == nil {
@@ -429,7 +430,7 @@ func (p *decidePass) selectPoolRow(cfgAgent *config.Agent, info session.Info, sl
 			p.refuse(cfgAgent.QualifiedName(), ref.QualifiedInstance, k, gateWorktreeRefused)
 			return
 		}
-		if patch := computePoolTriggerBindingPatch(info, request, workDir); len(patch) > 0 {
+		if patch := computePoolTriggerBindingPatch(info, request, workDir); len(patch) > 0 || request.WorktreeRef != nil {
 			sel.binding = bindingOf(request, workDir)
 			sel.binding.Patch = patch
 		}
@@ -580,7 +581,7 @@ func (p *decidePass) planNamed() {
 // namedGate returns why a named plan is refused, or "". It sets the plan's
 // AdoptLive from I3 by the AM-N6 table, on the identity the lane read: an
 // alive runtime is adopted only by adoptableIdentity's rule, and any other
-// identity holds the name.
+// identity holds the name, as another session's dead one does.
 func (p *decidePass) namedGate(ap allocPlan, spec namedSessionSpec) string {
 	plan := ap.Named
 	for _, r := range p.inFlight {
@@ -601,14 +602,23 @@ func (p *decidePass) namedGate(ap allocPlan, spec namedSessionSpec) string {
 		return gateEndpointShut
 	}
 	r := readRuntimeName(p.in.Obs, plan.SessionName, p.in.Now, p.in.ObsMaxAge)
+	// No row exists yet, so any session ID is Foreign (v5 O2).
+	rt := r.obs.Identity
 	switch r.state {
 	case nameUnknown:
 		return gateLivenessUnknown
-	case nameAbsent, nameCorpse, nameZombie:
+	case nameCorpse, nameZombie:
+		// A dead runtime of another session holds the name too: a create
+		// over it would read occupied and roll back, again each pass. The
+		// row stays down until the name frees (CONTRACT v5.10e, §12.2 #23).
+		if compareIdentity(session.Info{}, rt) == identityForeign {
+			return gateNameHeld + strings.TrimSpace(rt.SessionID)
+		}
+		return ""
+	case nameAbsent:
 		return ""
 	}
-	// No row exists yet, so any session ID is Foreign (v5 O2).
-	switch rt := r.obs.Identity; {
+	switch {
 	case adoptableIdentity(rt):
 		plan.AdoptLive = true
 		return ""
@@ -743,11 +753,15 @@ func (p *decidePass) createRefused(ap allocPlan) string {
 // verification and whose backoff is live (#34): the work item is
 // throttled, never the slot.
 func (p *decidePass) worktreeRefused(request SessionRequest) bool {
-	if request.WorktreeSpec == nil {
+	if request.WorktreeSpec == nil && request.WorktreeRef == nil {
 		return false
 	}
-	r, ok := p.in.Backoff[workBackoffKey(request.WorktreeSpec.BeadID)]
-	return ok && r.live(p.in.Now) && r.Fingerprint == specFingerprint(*request.WorktreeSpec)
+	legacyID := ""
+	if request.WorktreeSpec != nil {
+		legacyID = request.WorktreeSpec.BeadID
+	}
+	r, ok := p.in.Backoff[workBackoffKey(referenceWorkKey(request.WorktreeRef, legacyID))]
+	return ok && r.live(p.in.Now) && r.Fingerprint == referenceFingerprint(request.WorktreeRef, request.WorktreeSpec)
 }
 
 // quarantined reports a #46 startup-health episode in quarantine at Now.
@@ -800,6 +814,7 @@ func bindingOf(request SessionRequest, workDir string) *bindingTarget {
 		WorkWorkspace:  packWorkspaceSlug(request),
 		BrainParentSID: strings.TrimSpace(request.BrainParentSID),
 		WorkDir:        workDir,
+		WorktreeRef:    request.WorktreeRef,
 	}
 	if request.WorktreeSpec != nil {
 		spec := *request.WorktreeSpec

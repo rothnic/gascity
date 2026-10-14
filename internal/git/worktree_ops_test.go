@@ -1,7 +1,9 @@
 package git
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -116,6 +118,39 @@ func TestWorktreeAddExistingBranch(t *testing.T) {
 	}
 	if branch != "feature-y" {
 		t.Errorf("worktree branch = %q, want feature-y", branch)
+	}
+}
+
+func TestWorktreeAddDetachedUsesCapturedCommit(t *testing.T) {
+	dir := initTestRepo(t)
+	g := New(dir)
+	base, err := g.RevParseVerifyCommit("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "commit", "--allow-empty", "-m", "later ambient HEAD")
+	refs := runGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)")
+	wt := filepath.Join(t.TempDir(), "detached")
+	for _, invalid := range []string{"HEAD", base[:7], "--force", ""} {
+		if err := g.WorktreeAddDetached(wt, invalid); err == nil {
+			t.Fatalf("accepted a non-full detached input %q", invalid)
+		}
+		if _, err := os.Stat(wt); !os.IsNotExist(err) {
+			t.Fatalf("invalid input created worktree: %v", err)
+		}
+	}
+	if err := g.WorktreeAddDetached(wt, base); err != nil {
+		t.Fatal(err)
+	}
+	if head, err := New(wt).RevParseVerifyCommit("HEAD"); err != nil || head != base {
+		t.Fatalf("detached HEAD = %s, %v; want captured %s", head, err, base)
+	}
+	var exitErr *exec.ExitError
+	if ref, err := New(wt).HeadSymbolicRef(); err == nil || !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("detached symbolic ref = %q, %v", ref, err)
+	}
+	if got := runGit(t, dir, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+		t.Fatalf("detached add changed refs: %s", got)
 	}
 }
 
@@ -273,8 +308,7 @@ func TestWorktreeOpsRefuseOptionInjection(t *testing.T) {
 }
 
 func TestWorktreeAddNeverDetaches(t *testing.T) {
-	// Guard the bead's core invariant at the helper layer: the add helpers
-	// must never produce a detached-HEAD worktree.
+	// Default attached add helpers must keep their existing HEAD contract.
 	dir := initTestRepo(t)
 	g := New(dir)
 	base, err := g.CurrentBranch()

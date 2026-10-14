@@ -673,6 +673,29 @@ inject `convoy_id`, resolve the deprecated `issue` alias to the single
 tracked convoy member, and stamp the root as specified in section 2. The
 reserved-variable rules of section 1.4 are enforced at this point.
 
+**Source prerequisites.** A formula attached by `gc sling --on`, an agent's
+default formula, or `gc formula cook --attach` can be prepared while its source
+is blocked. At creation, every recipe entry with no readiness-blocking recipe
+dependency receives the source's unsatisfied `blocks`, `waits-for`, and
+`conditional-blocks` edges, with their original types. A convoy contributes its
+own prerequisites and those of its open members. Later recipe steps wait through
+their existing dependencies.
+
+A prerequisite satisfies readiness when it is closed and its effective work
+outcome is not `blocked`. A formula step closed with `gc.outcome=pass` satisfies
+readiness even if its `gc.work_outcome` says `blocked`. That exception requires
+`gc.step_ref` and does not apply to a plain work bead. Informational dependencies
+such as `tracks` and `related` do not hold entry work.
+
+An unresolved source, convoy member, or prerequisite causes an explicit refusal.
+An unsatisfied prerequisite must resolve in the same store as the workflow.
+Separate store handles are refused even when they contain matching bead IDs;
+those IDs do not prove that both handles refer to the same prerequisite.
+The launch preserves existing source locks and duplicate-root rules. Reusing an
+existing root does not append dependencies to that root or create a self-edge.
+The copied edges are a creation-time snapshot. Readiness does not establish
+source integration or acceptance of the resulting code.
+
 **Attach on a split city.** A city that serves the graph coordination class
 from its own `[storage]` binding refuses most of `gc formula cook --attach`
 rather than serving it. A graft is graph class whatever the formula's

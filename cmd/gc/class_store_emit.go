@@ -718,6 +718,40 @@ func (s *emittingClassStore) CompareAndSetMetadataKey(id, key, expected, next st
 	return swapped, err
 }
 
+func (s *emittingClassStore) SnapshotMetadata(ids []string) ([]beads.MetadataSnapshot, error) {
+	batch, ok := s.Store.(beads.GuardedMetadataBatchStore)
+	if !ok {
+		return nil, beads.ErrConditionalWriteUnsupported
+	}
+	return batch.SnapshotMetadata(ids)
+}
+
+func (s *emittingClassStore) ApplyGuardedMetadataBatch(request beads.GuardedMetadataBatchRequest) ([]beads.GuardedMetadataRowResult, error) {
+	batch, ok := s.Store.(beads.GuardedMetadataBatchStore)
+	if !ok {
+		return nil, beads.ErrConditionalWriteUnsupported
+	}
+	closing := make(map[string]bool)
+	for _, row := range request.Rows {
+		if row.CloseReason != nil {
+			closing[row.ID] = !s.closedBefore(row.ID)
+		}
+	}
+	rows, err := batch.ApplyGuardedMetadataBatch(request)
+	if err == nil {
+		for _, row := range rows {
+			if row.Changed {
+				if closing[row.ID] {
+					s.emitClosed(row.ID)
+				} else {
+					s.emitUpdated(row.ID)
+				}
+			}
+		}
+	}
+	return rows, err
+}
+
 func (s *emittingClassStore) Claim(id, assignee string) (beads.Bead, bool, error) {
 	claimer, ok := s.Store.(interface {
 		Claim(string, string) (beads.Bead, bool, error)

@@ -1402,7 +1402,6 @@ func InstantiateCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe
 	rootKey := ""
 	if graphWorkflow {
 		stampGraphV2RootMetadata(recipe, formulaName, opts.Vars, scopeKind, scopeRef)
-		sourceBeadID = ""
 		rootKey = strings.TrimSpace(recipe.Steps[0].Metadata[beadmeta.Graphv2RootKeyMetadataKey])
 	}
 
@@ -1430,6 +1429,10 @@ func InstantiateCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe
 // atomic across processes.
 func materializeCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe, formulaName string, opts molecule.Options, sourceBeadID, scopeKind, scopeRef string, graphWorkflow bool, a config.Agent, deps SlingDeps, forceGraphV2Replace ...bool) (*molecule.Result, error) {
 	graphStore := deps.graphStore()
+	readinessSourceID := sourceBeadID
+	if graphWorkflow {
+		sourceBeadID = ""
+	}
 	if err := graphroute.ApplyGraphRouting(recipe, &a, agentutil.RoutedToIdentity(&a), opts.Vars, sourceBeadID, scopeKind, scopeRef, deps.StoreRef, graphStore, deps.CityName, deps.Cfg, deps.graphrouteDeps()); err != nil {
 		SlingTracef("instantiate decorate-error formula=%s err=%v", formulaName, err)
 		return nil, err
@@ -1450,6 +1453,13 @@ func materializeCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe
 				return existing, nil
 			}
 		}
+	}
+	if graphWorkflow {
+		entryDeps, err := sourceworkflow.EntryDependencies(deps.Store, graphStore, recipe, readinessSourceID)
+		if err != nil {
+			return nil, err
+		}
+		opts.ExternalDeps = append(opts.ExternalDeps, entryDeps...)
 	}
 	instantiateStart := time.Now()
 	var replacedSnapshots []sourceworkflow.WorkflowBeadSnapshot

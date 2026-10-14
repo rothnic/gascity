@@ -220,6 +220,7 @@ type bindingTarget struct {
 	// when set, must be verified by the session key before it applies.
 	WorkDir      string
 	WorktreeSpec *worktree.Spec
+	WorktreeRef  *worktreeReference
 	// Patch is computePoolTriggerBindingPatch against the pass's row: what
 	// the start effect's PreWake folds (v5 S1).
 	Patch session.MetadataPatch

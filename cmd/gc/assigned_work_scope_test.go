@@ -941,7 +941,7 @@ func TestResolveTaskWorkDirIncludesAssignedWisp(t *testing.T) {
 		t.Fatalf("mark wisp in progress: %v", err)
 	}
 
-	if got := resolveTaskWorkDir("", store, "worker-session"); got != workDir {
+	if got, err := resolveTaskWorkDir("", store, "", "worker-session"); err != nil || got != workDir {
 		t.Fatalf("resolveTaskWorkDir = %q, want assigned wisp work_dir %q", got, workDir)
 	}
 }
@@ -989,7 +989,7 @@ func TestResolveTaskWorkDirPrefersPreparedDrainSourceAnchor(t *testing.T) {
 		t.Fatalf("mark implementation step in progress: %v", err)
 	}
 
-	if got := resolveTaskWorkDir("", store, "worker-session"); got != sourceWorkDir {
+	if got, err := resolveTaskWorkDir("", store, "", "worker-session"); err != nil || got != sourceWorkDir {
 		t.Fatalf("resolveTaskWorkDir = %q, want prepared source work dir %q", got, sourceWorkDir)
 	}
 }
@@ -1020,7 +1020,7 @@ func TestResolveTaskWorkDirPrefersCreatorWorkDirOverStampedCanonical(t *testing.
 		t.Fatalf("mark assigned task in progress: %v", err)
 	}
 
-	if got := resolveTaskWorkDir("", store, "worker-session"); got != "" {
+	if got, err := resolveTaskWorkDir("", store, "", "worker-session"); err != nil || got != "" {
 		t.Fatalf("resolveTaskWorkDir = %q, want empty: a bare gc.work_dir stamp (no legacy work_dir) must not resolve (stamped dir was %q)", got, observedDir)
 	}
 
@@ -1031,7 +1031,7 @@ func TestResolveTaskWorkDirPrefersCreatorWorkDirOverStampedCanonical(t *testing.
 		t.Fatalf("add creator work_dir: %v", err)
 	}
 
-	if got := resolveTaskWorkDir("", store, "worker-session"); got != creatorDir {
+	if got, err := resolveTaskWorkDir("", store, "", "worker-session"); err != nil || got != creatorDir {
 		t.Fatalf("resolveTaskWorkDir = %q, want creator work_dir %q (not stamped %q)", got, creatorDir, observedDir)
 	}
 }

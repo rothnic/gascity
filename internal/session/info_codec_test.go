@@ -90,6 +90,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 
 		TriggerBeadID:       b.Metadata[beadmeta.TriggerBeadIDMetadataKey],
 		TriggerBeadStoreRef: b.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey],
+		WorktreeReference:   b.Metadata[beadmeta.WorktreeRefMetadataKey],
 		BrainParentSID:      b.Metadata[beadmeta.BrainParentSIDMetadataKey],
 		Pack:                b.Metadata[beadmeta.PackMetadataKey],
 		PackWorkspace:       b.Metadata[beadmeta.PackWorkspaceMetadataKey],

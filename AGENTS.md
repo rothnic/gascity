@@ -26,7 +26,9 @@ next to that code; read the matching file before changing it.
 |---|---|
 | `internal/api/`, `internal/events/`, `internal/extmsg/`, CLI code that constructs events or calls the API client, the OpenAPI spec, or the dashboard | `internal/api/AGENTS.md` |
 | `internal/config/` (agent or rig config fields) | `internal/config/AGENTS.md` |
+| Source-workflow prerequisite readiness in sling or formula cook | `internal/sourceworkflow/AGENTS.md` |
 | `internal/session/` | `internal/session/AGENTS.md` |
+| `internal/sessionlog/` | `internal/sessionlog/AGENTS.md` |
 | `internal/runtime/acp/` | `internal/runtime/acp/AGENTS.md` |
 | Session creation or lifecycle from `cmd/gc` or `internal/api` | `internal/worker/AGENTS.md` |
 | `internal/cliauth/`, `gc login`, `gc whoami` | `internal/cliauth/AGENTS.md` |
@@ -244,7 +246,25 @@ becoming more useful as models improve — it becomes LESS useful instead.
   To check something out, use your own worktree or a disposable
   `git worktree add`. Native managed `gc worktree ensure`/`verify` must
   retain the recorded input commit in HEAD's ancestry; refusal preserves
-  existing work. Workflows own input selection and behavioral acceptance.
+  existing work. Omitted mode remains attached; explicit detached mode must
+  have an empty branch and the same durable owner, input and attempt fences.
+  Rollback must preserve an advanced detached HEAD even when clean, because
+  removing its checkout leaves no branch protecting its commits. Detached
+  rollback also requires a matching published provisioning attempt; ambiguous
+  prepublication checkouts remain preserved. Explicit within-repo-root placement
+  admits only the selected primary or bare control registration and excludes
+  Git administration and other worktrees. A declared gc.worktree_ref must bind
+  the exact invoking step and stable owner in one registered store; incomplete
+  or changed bindings refuse launch before directory or conversation fallback.
+  Native reference checks retain the selected binding and preserve authoritative
+  read handles through read-only wrappers without exposing the backing writer.
+  Synthetic single-item input convoys record `gc.source_bead_id` at creation;
+  mutable tracking edges are not revision-fenced source identity.
+  Workflows own input selection and behavioral acceptance.
+  Worktree mutations wait up to `Spec.LockTimeout` for their path lock (zero
+  means 30 seconds), or until caller cancellation. Verify and dry-run remain
+  lock-free. Once admitted, the transaction finishes synchronously under the
+  lock; a refusal must never leave a background mutation running.
 - **Non-interactive shell:** `cp`, `mv`, and `rm` may be aliased to `-i` and
   hang an agent; use `cp -f`, `mv -f`, `rm -f`, `rm -rf`, `cp -rf`. Use
   `-o BatchMode=yes` for `ssh`/`scp`, `-y` for `apt-get`, and

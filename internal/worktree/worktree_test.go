@@ -151,6 +151,298 @@ func TestVerifyDetachedHead(t *testing.T) {
 	}
 }
 
+func TestEnsureDetachedDryRunAndRefusals(t *testing.T) {
+	repo, base := initTestRepo(t)
+	root := t.TempDir()
+	spec := managedSpec(repo, root, filepath.Join(root, "detached"), "", base)
+	spec.Mode, spec.DryRun = ModeDetached, true
+	resolved := runGit(t, repo, "rev-parse", "HEAD")
+	before := strings.Join(snapshotTree(t, root), "\n")
+	refs := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)")
+	registrations := runGit(t, repo, "worktree", "list", "--porcelain")
+	report, err := Ensure(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Created || report.BranchCreated || report.Head != "" || report.Mode != ModeDetached || report.Branch != "" ||
+		len(report.Planned) != 1 || report.Planned[0] != "git worktree add --detach "+spec.Path+" "+resolved ||
+		report.Provenance == nil || report.Provenance.SchemaVersion != 2 || report.Provenance.Mode != ModeDetached ||
+		report.Provenance.Placement != PlacementOutsideWorktrees || report.Provenance.BaseSHA != resolved ||
+		report.Provenance.CreatedAt != nil || report.Provenance.AttemptID != "" {
+		t.Fatalf("detached dry run = %+v, want pure exact-input plan", report)
+	}
+	for _, change := range []func(*Spec){
+		func(s *Spec) { s.Mode = "unknown" },
+		func(s *Spec) { s.Branch = "must-not-be-adopted" },
+		func(s *Spec) { s.Placement = "unknown-placement" },
+		func(s *Spec) { s.Base = "missing-ref" },
+		func(s *Spec) { s.Base = resolved + "^{tree}" },
+		func(s *Spec) { s.BaseSHA = strings.Repeat("f", 40) },
+	} {
+		bad := spec
+		change(&bad)
+		for _, dry := range []bool{true, false} {
+			bad.DryRun = dry
+			if _, err := Ensure(bad); err == nil {
+				t.Fatalf("Ensure accepted invalid detached input: %+v", bad)
+			}
+		}
+	}
+	if got := strings.Join(snapshotTree(t, root), "\n"); got != before {
+		t.Fatalf("dry run/refusal changed root: before %q, after %q", before, got)
+	}
+	if got := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+		t.Fatalf("dry run/refusal changed refs: %q", got)
+	}
+	if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != registrations {
+		t.Fatalf("dry run/refusal changed registrations: %q", got)
+	}
+}
+
+func TestVerifyModeCompatibilityAndPreservedWork(t *testing.T) {
+	for _, creationMode := range []string{"", ModeAttached, ModeDetached} {
+		t.Run("created mode="+creationMode, func(t *testing.T) {
+			repo, base := initTestRepo(t)
+			root := t.TempDir()
+			spec := managedSpec(repo, root, filepath.Join(root, "owned"), "work/owned", base)
+			spec.Mode = creationMode
+			if creationMode == ModeDetached {
+				spec.Branch = ""
+			}
+			report, err := Ensure(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantVersion := 2
+			if creationMode == "" {
+				wantVersion = 1
+			}
+			if report.Provenance.SchemaVersion != wantVersion {
+				t.Fatalf("provenance version = %d, want %d", report.Provenance.SchemaVersion, wantVersion)
+			}
+			spec.BaseSHA = report.Provenance.BaseSHA
+			manifest, err := provenanceFilePath(spec.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if creationMode != ModeDetached {
+				for _, compatibleMode := range []string{"", ModeAttached} {
+					compatible := spec
+					compatible.Mode = compatibleMode
+					if reused, err := Ensure(compatible); err != nil || reused.Created || reused.Provenance.SchemaVersion != wantVersion {
+						t.Fatalf("attached/schema 1 compatibility = %+v, %v", reused, err)
+					}
+				}
+			}
+			marker := filepath.Join(spec.Path, "preserve.txt")
+			if err := os.WriteFile(marker, []byte("preserve WIP\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			refs := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)")
+			registered := runGit(t, repo, "worktree", "list", "--porcelain")
+			for _, change := range []func(*Spec){
+				func(s *Spec) {
+					if creationMode == ModeDetached {
+						s.Mode, s.Branch = ModeAttached, "work/other"
+					} else {
+						s.Mode, s.Branch = ModeDetached, ""
+					}
+				},
+				func(s *Spec) { s.Owner = "other" },
+				func(s *Spec) { s.StoreRef = "rig:other" },
+				func(s *Spec) { s.Generation = "stale" },
+				func(s *Spec) { s.BaseSHA = strings.Repeat("f", 40) },
+			} {
+				bad := spec
+				change(&bad)
+				if _, err := Verify(bad); err == nil {
+					t.Fatalf("Verify accepted mismatched identity: %+v", bad)
+				}
+				if _, err := Ensure(bad); err == nil {
+					t.Fatalf("Ensure adopted mismatched identity: %+v", bad)
+				}
+			}
+			if got, err := os.ReadFile(marker); err != nil || string(got) != "preserve WIP\n" {
+				t.Fatalf("refusal changed WIP: %v", err)
+			}
+			if got, err := os.ReadFile(manifest); err != nil || string(got) != string(before) {
+				t.Fatalf("compatibility/refusal rewrote provenance: %v", err)
+			}
+			if got := runGit(t, spec.Path, "rev-parse", "HEAD"); got != report.Head {
+				t.Fatalf("refusal changed HEAD: %s", got)
+			}
+			if got := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+				t.Fatalf("refusal changed refs: %s", got)
+			}
+			if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != registered {
+				t.Fatalf("refusal changed registration: %s", got)
+			}
+		})
+	}
+}
+
+func TestEnsureDetachedRetainsHookCommits(t *testing.T) {
+	for _, hookExit := range []string{"0", "1"} {
+		t.Run("post-checkout exit="+hookExit, func(t *testing.T) {
+			repo, base := initTestRepo(t)
+			root := t.TempDir()
+			spec := managedSpec(repo, root, filepath.Join(root, "detached"), "", base)
+			spec.Mode = ModeDetached
+			t.Setenv("GC_DETACHED_TEST_WORKTREE", spec.Path)
+			initial := runGit(t, repo, "rev-parse", "HEAD")
+			refs := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)")
+			hook := "#!/bin/sh\ngit -C \"$GC_DETACHED_TEST_WORKTREE\" commit --allow-empty -m 'hook work' || exit 99\nexit " + hookExit + "\n"
+			if err := os.WriteFile(filepath.Join(repo, ".git", "hooks", "post-checkout"), []byte(hook), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Ensure(spec); err == nil || !strings.Contains(err.Error(), "rollback incomplete") {
+				t.Fatalf("hook-advanced Ensure = %v, want retained work and incomplete rollback", err)
+			}
+			head := runGit(t, spec.Path, "rev-parse", "HEAD")
+			if head == initial || runGit(t, spec.Path, "status", "--porcelain") != "" {
+				t.Fatal("expected clean committed hook work")
+			}
+			matches, err := matchingRegisteredWorktrees(git.New(repo), spec.Path)
+			if err != nil || len(matches) != 1 || matches[0].Head != head || matches[0].Branch != "" {
+				t.Fatalf("retained registration = %+v, %v", matches, err)
+			}
+			if got := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+				t.Fatalf("detached failure changed branch refs: %s", got)
+			}
+			manifest, err := provenanceFilePath(spec.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(manifest); !os.IsNotExist(err) {
+				t.Fatalf("failed creation published provenance: %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRefusesInvalidModeProvenance(t *testing.T) {
+	for _, change := range []func(*Provenance){
+		func(p *Provenance) { p.SchemaVersion = 3 },
+		func(p *Provenance) { p.Mode = "" },
+		func(p *Provenance) { p.Mode = "unknown" },
+		func(p *Provenance) { p.Mode = ModeAttached },
+		func(p *Provenance) { p.Placement = "" },
+		func(p *Provenance) { p.Placement = "within-repo-root" },
+		func(p *Provenance) { p.SchemaVersion = 1 },
+	} {
+		repo, base := initTestRepo(t)
+		root := t.TempDir()
+		spec := managedSpec(repo, root, filepath.Join(root, "detached"), "", base)
+		spec.Mode = ModeDetached
+		report, err := Ensure(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bad := *report.Provenance
+		change(&bad)
+		if err := writeProvenance(spec.Path, bad); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := provenanceFilePath(spec.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Verify(spec); err == nil {
+			t.Fatalf("Verify accepted invalid stored mode identity: %+v", bad)
+		}
+		if _, err := Ensure(spec); err == nil {
+			t.Fatalf("Ensure adopted invalid stored mode identity: %+v", bad)
+		}
+		if got, err := os.ReadFile(manifest); err != nil || string(got) != string(before) {
+			t.Fatalf("refusal repaired invalid stored provenance: %v", err)
+		}
+		if got := runGit(t, spec.Path, "rev-parse", "HEAD"); got != report.Head {
+			t.Fatalf("refusal moved HEAD: %s", got)
+		}
+	}
+}
+
+func TestVerifySchema1ForbidsModeAliases(t *testing.T) {
+	for _, key := range []string{"", "Mode", "PLACEMENT"} {
+		values := []string{`""`, `null`}
+		if key == "" {
+			values = []string{"unchanged"}
+		}
+		for _, value := range values {
+			name := key + "=" + value
+			if key == "" {
+				name = "legacy record"
+			}
+			t.Run(name, func(t *testing.T) {
+				repo, base := initTestRepo(t)
+				root := t.TempDir()
+				spec := managedSpec(repo, root, filepath.Join(root, "attached"), "work/schema1", base)
+				report, err := Ensure(spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if report.Provenance == nil || report.Provenance.SchemaVersion != 1 {
+					t.Fatalf("legacy provenance = %+v, want schema 1", report.Provenance)
+				}
+				manifest, err := provenanceFilePath(spec.Path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.ReadFile(manifest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if key != "" {
+					var fields map[string]json.RawMessage
+					if err := json.Unmarshal(before, &fields); err != nil {
+						t.Fatal(err)
+					}
+					fields[key] = json.RawMessage(value)
+					before, err = json.MarshalIndent(fields, "", "  ")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(manifest, before, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				refs := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)")
+				registration := runGit(t, repo, "worktree", "list", "--porcelain")
+				_, readErr := readProvenance(spec.Path)
+				_, verifyErr := Verify(spec)
+				_, ensureErr := Ensure(spec)
+				if key == "" {
+					if readErr != nil || verifyErr != nil || ensureErr != nil {
+						t.Fatalf("unchanged legacy record refused: read=%v verify=%v ensure=%v", readErr, verifyErr, ensureErr)
+					}
+				} else if readErr == nil || verifyErr == nil || ensureErr == nil {
+					t.Errorf("schema 1 accepted forbidden %s=%s declaration: read=%v verify=%v ensure=%v", key, value, readErr, verifyErr, ensureErr)
+				}
+				if got, err := os.ReadFile(manifest); err != nil || string(got) != string(before) {
+					t.Fatalf("mode declaration check rewrote provenance: %v", err)
+				}
+				if got := runGit(t, spec.Path, "rev-parse", "HEAD"); got != report.Head {
+					t.Fatalf("mode declaration check moved HEAD: %s", got)
+				}
+				if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != registration {
+					t.Fatalf("mode declaration check changed registration: %q", got)
+				}
+				if got := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+					t.Fatalf("mode declaration check changed refs: %q", got)
+				}
+			})
+		}
+	}
+}
+
 func TestVerifyDifferentRepo(t *testing.T) {
 	repoA, _ := initTestRepo(t)
 	repoB, baseB := initTestRepo(t)
@@ -379,7 +671,7 @@ func TestRollbackRemovesCreatedState(t *testing.T) {
 	if err := g.WorktreeAddNewBranch(wt, "doomed", base); err != nil {
 		t.Fatalf("WorktreeAddNewBranch: %v", err)
 	}
-	if err := rollbackCreated(g, wt, "doomed", true); err != nil {
+	if err := rollbackCreated(g, Spec{RepoDir: repo, Path: wt, Branch: "doomed"}, true, base, nil); err != nil {
 		t.Fatalf("rollbackCreated: %v", err)
 	}
 	if _, statErr := os.Stat(wt); statErr == nil {
@@ -398,7 +690,7 @@ func TestRollbackKeepsPreexistingBranch(t *testing.T) {
 	if err := g.WorktreeAddExistingBranch(wt, "keep"); err != nil {
 		t.Fatalf("WorktreeAddExistingBranch: %v", err)
 	}
-	if err := rollbackCreated(g, wt, "keep", false); err != nil {
+	if err := rollbackCreated(g, Spec{RepoDir: repo, Path: wt, Branch: "keep"}, false, base, nil); err != nil {
 		t.Fatalf("rollbackCreated: %v", err)
 	}
 	if _, statErr := os.Stat(wt); statErr == nil {
@@ -421,7 +713,7 @@ func TestRollbackPreservesDirtyAttemptState(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if err := rollbackCreated(g, wt, "dirty", true); err == nil {
+	if err := rollbackCreated(g, Spec{RepoDir: repo, Path: wt, Branch: "dirty"}, true, base, nil); err == nil {
 		t.Fatal("rollbackCreated removed a dirty worktree")
 	}
 	if got, err := os.ReadFile(marker); err != nil || string(got) != "keep" {
@@ -504,87 +796,114 @@ func TestEnsureManagedWorktreePersistsAndVerifiesProvenance(t *testing.T) {
 }
 
 func TestVerifyManagedWorktreeAcceptsDescendantsOfRecordedBase(t *testing.T) {
-	repo, base := initTestRepo(t)
-	root := t.TempDir()
-	wt := filepath.Join(root, "gc-test")
-	spec := managedSpec(repo, root, wt, "work/gc-test", base)
-	created, err := Ensure(spec)
-	if err != nil {
-		t.Fatalf("Ensure: %v", err)
-	}
-	spec.BaseSHA = created.Provenance.BaseSHA
+	for _, mode := range []string{"", ModeAttached, ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			repo, base := initTestRepo(t)
+			root := t.TempDir()
+			wt := filepath.Join(root, "gc-test")
+			spec := managedSpec(repo, root, wt, "work/gc-test", base)
+			spec.Mode = mode
+			if mode == ModeDetached {
+				spec.Branch = ""
+			}
+			created, err := Ensure(spec)
+			if err != nil {
+				t.Fatalf("Ensure: %v", err)
+			}
+			spec.BaseSHA = created.Provenance.BaseSHA
+			manifest, err := provenanceFilePath(wt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if err := os.WriteFile(filepath.Join(wt, "implementation.txt"), []byte("completed work\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, wt, "add", "implementation.txt")
-	runGit(t, wt, "commit", "-m", "implement after recorded input")
-	head := runGit(t, wt, "rev-parse", "HEAD")
+			if err := os.WriteFile(filepath.Join(wt, "implementation.txt"), []byte("completed work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, wt, "add", "implementation.txt")
+			runGit(t, wt, "commit", "-m", "implement after recorded input")
+			head := runGit(t, wt, "rev-parse", "HEAD")
 
-	verified, err := Verify(spec)
-	if err != nil {
-		t.Fatalf("Verify descendant: %v", err)
-	}
-	if verified.Head != head || verified.Provenance.BaseSHA != spec.BaseSHA {
-		t.Fatalf("verified head/base = %s/%s, want %s/%s",
-			verified.Head, verified.Provenance.BaseSHA, head, spec.BaseSHA)
-	}
-	reused, err := Ensure(spec)
-	if err != nil || reused.Created || reused.Head != head {
-		t.Fatalf("Ensure descendant = %+v, %v; want unchanged worktree at %s", reused, err, head)
+			verified, err := Verify(spec)
+			if err != nil {
+				t.Fatalf("Verify descendant: %v", err)
+			}
+			if verified.Head != head || verified.Provenance.BaseSHA != spec.BaseSHA {
+				t.Fatalf("verified head/base = %s/%s, want %s/%s",
+					verified.Head, verified.Provenance.BaseSHA, head, spec.BaseSHA)
+			}
+			reused, err := Ensure(spec)
+			if err != nil || reused.Created || reused.Head != head {
+				t.Fatalf("Ensure descendant = %+v, %v; want unchanged worktree at %s", reused, err, head)
+			}
+			if got, err := os.ReadFile(manifest); err != nil || string(got) != string(before) {
+				t.Fatalf("reuse rewrote initial owner/base/attempt provenance: %v", err)
+			}
+		})
 	}
 }
 
 // A reset must not let unchanged ownership metadata attest a lost input commit.
 func TestVerifyManagedWorktreeRejectsHeadMissingRecordedBase(t *testing.T) {
-	repo, base := initTestRepo(t)
-	beforeInput := runGit(t, repo, "rev-parse", "HEAD")
-	if err := os.WriteFile(filepath.Join(repo, "input.txt"), []byte("required parent output\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, repo, "add", "input.txt")
-	runGit(t, repo, "commit", "-m", "required parent output")
-	root := t.TempDir()
-	wt := filepath.Join(root, "gc-test")
-	spec := managedSpec(repo, root, wt, "work/gc-test", base)
-	created, err := Ensure(spec)
-	if err != nil {
-		t.Fatalf("Ensure: %v", err)
-	}
-	spec.BaseSHA = created.Provenance.BaseSHA
-	runGit(t, wt, "reset", "--hard", beforeInput)
-	marker := filepath.Join(wt, "uncommitted.txt")
-	if err := os.WriteFile(marker, []byte("preserve work\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	provenancePath, err := provenanceFilePath(wt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	beforeProvenance, err := os.ReadFile(provenancePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	for _, mode := range []string{"", ModeDetached} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			repo, base := initTestRepo(t)
+			beforeInput := runGit(t, repo, "rev-parse", "HEAD")
+			if err := os.WriteFile(filepath.Join(repo, "input.txt"), []byte("required parent output\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, repo, "add", "input.txt")
+			runGit(t, repo, "commit", "-m", "required parent output")
+			root := t.TempDir()
+			wt := filepath.Join(root, "gc-test")
+			spec := managedSpec(repo, root, wt, "work/gc-test", base)
+			spec.Mode = mode
+			if mode == ModeDetached {
+				spec.Branch = ""
+			}
+			created, err := Ensure(spec)
+			if err != nil {
+				t.Fatalf("Ensure: %v", err)
+			}
+			spec.BaseSHA = created.Provenance.BaseSHA
+			runGit(t, wt, "reset", "--hard", beforeInput)
+			marker := filepath.Join(wt, "uncommitted.txt")
+			if err := os.WriteFile(marker, []byte("preserve work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			provenancePath, err := provenanceFilePath(wt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeProvenance, err := os.ReadFile(provenancePath)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if _, err := Verify(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
-		t.Errorf("Verify reset branch error = %v, want recorded base refusal", err)
-	}
-	if _, err := Ensure(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
-		t.Errorf("Ensure reset branch error = %v, want recorded base refusal", err)
-	}
-	dry := spec
-	dry.DryRun = true
-	if _, err := Ensure(dry); err == nil {
-		t.Error("dry-run accepted an existing worktree missing its recorded input")
-	}
-	if got := runGit(t, wt, "rev-parse", "HEAD"); got != beforeInput {
-		t.Errorf("refusal moved HEAD to %s, want %s", got, beforeInput)
-	}
-	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserve work\n" {
-		t.Errorf("refusal changed work: data=%q err=%v", got, err)
-	}
-	if got, err := os.ReadFile(provenancePath); err != nil || string(got) != string(beforeProvenance) {
-		t.Errorf("refusal changed durable provenance: err=%v", err)
+			if _, err := Verify(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
+				t.Errorf("Verify reset branch error = %v, want recorded base refusal", err)
+			}
+			if _, err := Ensure(spec); err == nil || !strings.Contains(err.Error(), "recorded base") {
+				t.Errorf("Ensure reset branch error = %v, want recorded base refusal", err)
+			}
+			dry := spec
+			dry.DryRun = true
+			if _, err := Ensure(dry); err == nil {
+				t.Error("dry-run accepted an existing worktree missing its recorded input")
+			}
+			if got := runGit(t, wt, "rev-parse", "HEAD"); got != beforeInput {
+				t.Errorf("refusal moved HEAD to %s, want %s", got, beforeInput)
+			}
+			if got, err := os.ReadFile(marker); err != nil || string(got) != "preserve work\n" {
+				t.Errorf("refusal changed work: data=%q err=%v", got, err)
+			}
+			if got, err := os.ReadFile(provenancePath); err != nil || string(got) != string(beforeProvenance) {
+				t.Errorf("refusal changed durable provenance: err=%v", err)
+			}
+		})
 	}
 }
 
@@ -1145,7 +1464,7 @@ func TestRollbackAfterFailedCreateKeepsBranchNotAtOurBase(t *testing.T) {
 	}
 	runGit(t, repo, "branch", "rival", other)
 
-	err := rollbackAfterFailedCreate(repoGit, filepath.Join(t.TempDir(), "absent"), "rival", true, base)
+	err := rollbackAfterFailedCreate(repoGit, Spec{RepoDir: repo, Path: filepath.Join(t.TempDir(), "absent"), Branch: "rival"}, true, base)
 	if err == nil || !strings.Contains(err.Error(), "refusing to delete branch") {
 		t.Fatalf("rollback err = %v, want a refusal to delete", err)
 	}
@@ -1169,7 +1488,7 @@ func TestRollbackAfterFailedCreateKeepsWorktreeWithPublishedProvenance(t *testin
 		t.Fatal("setup: Ensure published no provenance")
 	}
 
-	rollbackErr := rollbackAfterFailedCreate(git.New(repo), path, "rival-branch", false, base)
+	rollbackErr := rollbackAfterFailedCreate(git.New(repo), Spec{RepoDir: repo, Path: path, Branch: "rival-branch"}, false, base)
 	if rollbackErr == nil || !strings.Contains(rollbackErr.Error(), "published provenance") {
 		t.Fatalf("rollback err = %v, want a refusal citing published provenance", rollbackErr)
 	}
@@ -1195,11 +1514,150 @@ func TestRollbackAfterFailedCreateKeepsWorktreeWithUnreadableProvenance(t *testi
 		t.Fatalf("corrupting provenance: %v", err)
 	}
 
-	rollbackErr := rollbackAfterFailedCreate(git.New(repo), path, "rival-branch", false, base)
+	rollbackErr := rollbackAfterFailedCreate(git.New(repo), Spec{RepoDir: repo, Path: path, Branch: "rival-branch"}, false, base)
 	if rollbackErr == nil || !strings.Contains(rollbackErr.Error(), "ownership is inconclusive") {
 		t.Fatalf("rollback err = %v, want an inconclusive-ownership refusal", rollbackErr)
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Errorf("rival worktree removed on inconclusive ownership: %v", statErr)
+	}
+}
+
+// Explicit nested placement changes the permitted ancestor, while keeping
+// the workspace parent, provenance, and attempt removal fences.
+func TestManagedPlacementTopologies(t *testing.T) {
+	for _, topology := range []string{"ordinary", "bare-root", "bare-git-dir"} {
+		for _, parent := range []string{"direct", "nested", "external"} {
+			t.Run(topology+"/"+parent, func(t *testing.T) {
+				repo, base := initTestRepo(t)
+				if topology != "ordinary" {
+					control := filepath.Join(t.TempDir(), "control.git")
+					if topology == "bare-git-dir" {
+						control = filepath.Join(t.TempDir(), ".git")
+					}
+					runGit(t, repo, "clone", "--bare", repo, control)
+					repo = control
+				}
+				root := repo
+				if topology == "bare-git-dir" {
+					root = filepath.Dir(repo)
+				}
+				switch parent {
+				case "nested":
+					root = filepath.Join(root, "managed", "spaces in parent")
+				case "external":
+					root = t.TempDir()
+				}
+				spec := managedSpec(repo, root, filepath.Join(root, "owner"), "", base)
+				spec.Mode = ModeDetached
+				before := runGit(t, repo, "worktree", "list", "--porcelain")
+				refs := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)")
+				// Default placement continues to refuse an editable/control ancestor.
+				if topology != "bare-git-dir" && parent != "external" {
+					if _, err := Ensure(spec); err == nil {
+						t.Fatal("default placement accepted nested workspace")
+					}
+				}
+				spec.Placement = "within-repo-root"
+				spec.DryRun = true
+				planned, err := Ensure(spec)
+				if err != nil || planned.Provenance == nil || planned.Provenance.Placement != spec.Placement {
+					t.Fatalf("explicit placement plan = %+v, %v", planned, err)
+				}
+				if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != before {
+					t.Fatal("placement planning mutated registration")
+				}
+				if _, err := os.Lstat(spec.Path); !os.IsNotExist(err) {
+					t.Fatalf("placement planning wrote path: %v", err)
+				}
+				spec.DryRun = false
+				created, err := Ensure(spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				spec.BaseSHA, spec.AttemptID = created.Provenance.BaseSHA, created.Provenance.AttemptID
+				if verified, err := Verify(spec); err != nil || verified.Placement != spec.Placement {
+					t.Fatalf("placement verification = %+v, %v", verified, err)
+				}
+				if reused, err := Ensure(spec); err != nil || reused.Created || reused.Provenance.AttemptID != spec.AttemptID {
+					t.Fatalf("placement reuse = %+v, %v", reused, err)
+				}
+				wrong := spec
+				wrong.Placement = PlacementOutsideWorktrees
+				if _, err := Verify(wrong); err == nil {
+					t.Fatal("placement mismatch accepted")
+				}
+				if cleaned, err := Cleanup(spec); err != nil || !cleaned.Removed {
+					t.Fatalf("placement cleanup = %+v, %v", cleaned, err)
+				}
+				if got := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+					t.Fatal("detached placement changed refs")
+				}
+			})
+		}
+	}
+}
+
+func TestManagedPlacementRefusesUnsafeAncestors(t *testing.T) {
+	for _, kind := range []string{"git-admin", "linked-parent", "linked-repo", "foreign-parent", "traversal", "symlink", "prunable", "bare-admin", "separate-git-admin"} {
+		t.Run(kind, func(t *testing.T) {
+			repo, base := initTestRepo(t)
+			root := filepath.Join(repo, "managed")
+			switch kind {
+			case "git-admin":
+				root = filepath.Join(repo, ".git", "objects")
+			case "linked-parent", "linked-repo", "prunable":
+				linked := filepath.Join(t.TempDir(), "linked")
+				runGit(t, repo, "worktree", "add", "--detach", linked, base)
+				root = filepath.Join(linked, "managed")
+				if kind == "linked-repo" {
+					repo = linked
+				}
+				if kind == "prunable" {
+					if err := os.RemoveAll(linked); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "foreign-parent":
+				root = filepath.Join(repo, "foreign")
+				runGit(t, repo, "init", root)
+				root = filepath.Join(root, "managed")
+			case "traversal":
+				root = repo + "/missing/../managed"
+			case "symlink":
+				alias := filepath.Join(t.TempDir(), "alias")
+				if err := os.Symlink(repo, alias); err != nil {
+					t.Fatal(err)
+				}
+				root = filepath.Join(alias, "managed")
+			case "bare-admin":
+				bare := filepath.Join(t.TempDir(), "control.git")
+				runGit(t, repo, "clone", "--bare", repo, bare)
+				repo, root = bare, filepath.Join(bare, "worktrees")
+			case "separate-git-admin":
+				admin := filepath.Join(t.TempDir(), "admin")
+				runGit(t, repo, "init", "--separate-git-dir", admin)
+				root = filepath.Join(admin, "workspaces")
+			}
+			spec := managedSpec(repo, root, root+"/owner", "", base)
+			spec.Mode, spec.Placement = ModeDetached, "within-repo-root"
+			before := runGit(t, repo, "worktree", "list", "--porcelain")
+			refs := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)")
+			for _, dry := range []bool{true, false} {
+				spec.DryRun = dry
+				if _, err := Ensure(spec); err == nil {
+					t.Fatalf("unsafe ancestor accepted, dry=%v", dry)
+				}
+			}
+			if got := runGit(t, repo, "worktree", "list", "--porcelain"); got != before {
+				t.Fatal("refusal mutated registration")
+			}
+			if got := runGit(t, repo, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+				t.Fatal("refusal mutated refs")
+			}
+			if _, err := os.Lstat(spec.Path); !os.IsNotExist(err) {
+				t.Fatalf("refusal wrote candidate: %v", err)
+			}
+		})
 	}
 }

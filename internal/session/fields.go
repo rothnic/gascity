@@ -381,6 +381,12 @@ var registry = slices.Concat([]Field{
 	{Key: "common_name", Class: ClassLaunchConfig, NoWriter: "retired: no production writer; name lookups still query it"},
 	{Key: "work_dir", Class: ClassLaunchConfig, Writers: sites(legacyCreate, v2("cmd/gc/allocator_create.go", "createEffects.verifiedMetadata"))},
 	{Key: beadmeta.WorkDirMetadataKey, Class: ClassLaunchConfig, Writers: sites(legacy("cmd/gc/build_desired_state.go", "computePoolTriggerBindingPatch"), v2("cmd/gc/allocator_create.go", "createEffects.verifiedMetadata"))},
+	{
+		Key: beadmeta.WorktreeRefMetadataKey, Class: ClassLaunchConfig,
+		Writers: sites(legacy("cmd/gc/build_desired_state.go", "computePoolTriggerBindingPatch"), legacy("cmd/gc/build_desired_state.go", "poolTriggerMetadata"), v2("cmd/gc/allocator_create.go", "createEffects.verifiedMetadata")),
+		Readers: sites(legacy("cmd/gc/session_lifecycle_parallel.go", "resolvePreparedTaskWorkDir"), v2("cmd/gc/session_lifecycle_parallel.go", "resolvePreparedTaskWorkDir")),
+		Clears:  sites(legacy("cmd/gc/build_desired_state.go", "computePoolTriggerBindingPatch")),
+	},
 	{Key: "continuation_epoch", Class: ClassLaunchConfig, Writers: sites(legacyPreWake)},
 	{Key: "transport", Class: ClassLaunchConfig, Writers: sites(op(srcManager, "Manager.persistTransport"))},
 	{Key: "manual_session", Class: ClassAssignmentIdentity, NoWriter: "retired: no production writer; legacy rows keep it and isManualSessionBead still reads it"},

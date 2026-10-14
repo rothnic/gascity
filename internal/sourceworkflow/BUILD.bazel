@@ -10,7 +10,10 @@ go_library(
         "//internal/beads",
         "//internal/beads/closeorder",
         "//internal/citylayout",
+        "//internal/convoy",
         "//internal/coordclass",
+        "//internal/formula",
+        "//internal/molecule",
         "//internal/pathutil",
     ],
 )
@@ -25,6 +28,7 @@ go_test(
     embed = [":sourceworkflow"],
     deps = [
         "//internal/beads",
+        "//internal/formula",
         "//internal/session",
         "//internal/testenv",
         "//internal/testutil",

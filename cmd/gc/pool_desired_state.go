@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +38,7 @@ type SessionRequest struct {
 	// When present, the pool path verifies it before publishing work_dir on a
 	// session bead; a mismatch fails the whole atomic metadata update.
 	WorktreeSpec *worktree.Spec
+	WorktreeRef  *worktreeReference
 	// WorktreeError carries incomplete/conflicting worktree evidence discovered
 	// while building demand. The realization path fails closed before creating
 	// or updating a session bead.
@@ -88,6 +92,17 @@ var legacyWorkDirNoticeSeen sync.Map // work bead ID -> struct{}
 // incomplete or conflicting evidence is an error, never permission to launch
 // a session into an unverified directory.
 func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, error) {
+	if _, present := bead.Metadata[beadmeta.WorktreeRefMetadataKey]; present {
+		return nil, fmt.Errorf("work bead %s declares a native worktree reference requiring selected-store resolution", bead.ID)
+	}
+	mode, modePresent := bead.Metadata[beadmeta.WorktreeModeMetadataKey]
+	placement, placementPresent := bead.Metadata[beadmeta.WorktreePlacementMetadataKey]
+	explicitMode := modePresent || placementPresent
+	if explicitMode && (!modePresent || !placementPresent ||
+		(mode != worktree.ModeAttached && mode != worktree.ModeDetached) || (placement != worktree.PlacementOutsideWorktrees && placement != worktree.PlacementWithinRepoRoot)) {
+		return nil, fmt.Errorf("work bead %s has incomplete or invalid %s=%q and %s=%q",
+			bead.ID, beadmeta.WorktreeModeMetadataKey, mode, beadmeta.WorktreePlacementMetadataKey, placement)
+	}
 	canonicalPath := strings.TrimSpace(bead.Metadata[beadmeta.WorkDirMetadataKey])
 	legacyPath := strings.TrimSpace(bead.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	if canonicalPath != "" && legacyPath != "" && canonicalPath != legacyPath {
@@ -101,7 +116,14 @@ func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, erro
 		pathKey = beadmeta.LegacyWorkDirMetadataKey
 	}
 	if path == "" {
+		if explicitMode {
+			return nil, fmt.Errorf("work bead %s declares a worktree mode but has no %s", bead.ID, beadmeta.WorkDirMetadataKey)
+		}
 		return nil, nil
+	}
+	branch := strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey])
+	if mode == worktree.ModeDetached && branch != "" {
+		return nil, fmt.Errorf("work bead %s declares detached mode with nonempty %s", bead.ID, beadmeta.WorkBranchMetadataKey)
 	}
 	values := []struct {
 		key   string
@@ -109,13 +131,15 @@ func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, erro
 	}{
 		{beadmeta.WorktreeRepoMetadataKey, bead.Metadata[beadmeta.WorktreeRepoMetadataKey]},
 		{beadmeta.WorktreeRootMetadataKey, bead.Metadata[beadmeta.WorktreeRootMetadataKey]},
-		{beadmeta.WorkBranchMetadataKey, bead.Metadata[beadmeta.WorkBranchMetadataKey]},
 		{beadmeta.WorktreeBaseRefMetadataKey, bead.Metadata[beadmeta.WorktreeBaseRefMetadataKey]},
 		{beadmeta.WorktreeBaseSHAMetadataKey, bead.Metadata[beadmeta.WorktreeBaseSHAMetadataKey]},
 		{beadmeta.WorktreeCreatorMetadataKey, bead.Metadata[beadmeta.WorktreeCreatorMetadataKey]},
 		{beadmeta.WorktreeOwnerMetadataKey, bead.Metadata[beadmeta.WorktreeOwnerMetadataKey]},
 		{beadmeta.WorktreeGenerationMetadataKey, bead.Metadata[beadmeta.WorktreeGenerationMetadataKey]},
 		{beadmeta.WorktreeLifecycleMetadataKey, bead.Metadata[beadmeta.WorktreeLifecycleMetadataKey]},
+	}
+	if mode != worktree.ModeDetached {
+		values = append(values, struct{ key, value string }{beadmeta.WorkBranchMetadataKey, branch})
 	}
 	missing := make([]string, 0, len(values))
 	present := make([]string, 0, len(values))
@@ -126,7 +150,7 @@ func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, erro
 			present = append(present, item.key)
 		}
 	}
-	if len(missing) == len(values) {
+	if !explicitMode && len(missing) == len(values) {
 		// A bead carrying work_dir without any ownership evidence is not
 		// incomplete evidence -- it never claimed to publish any. Recipe steps
 		// are still minted this way (stampDrainItemRecipe in
@@ -140,7 +164,7 @@ func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, erro
 		}
 		return nil, nil
 	}
-	if len(present) == 1 && present[0] == beadmeta.WorkBranchMetadataKey {
+	if !explicitMode && len(present) == 1 && present[0] == beadmeta.WorkBranchMetadataKey {
 		// gc.work_branch alone is not incomplete evidence either -- it is the
 		// shape a hook claim's ambient branch stamp produces on an otherwise
 		// unmanaged bead (hookClaimIdentityPatch stamps gc.work_branch onto
@@ -176,7 +200,9 @@ func worktreeSpecForBead(bead beads.Bead, storeRef string) (*worktree.Spec, erro
 		RepoDir:    strings.TrimSpace(bead.Metadata[beadmeta.WorktreeRepoMetadataKey]),
 		Root:       strings.TrimSpace(bead.Metadata[beadmeta.WorktreeRootMetadataKey]),
 		Path:       path,
-		Branch:     strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey]),
+		Branch:     branch,
+		Mode:       mode,
+		Placement:  placement,
 		Base:       strings.TrimSpace(bead.Metadata[beadmeta.WorktreeBaseRefMetadataKey]),
 		BaseSHA:    strings.TrimSpace(bead.Metadata[beadmeta.WorktreeBaseSHAMetadataKey]),
 		BeadID:     strings.TrimSpace(bead.ID),
@@ -609,6 +635,7 @@ func computePoolDesiredStatesAt(
 			workStoreRef := ""
 			workParentSID := ""
 			var worktreeSpec *worktree.Spec
+			var worktreeRef *worktreeReference
 			worktreeError := ""
 			if len(residualWorkBeadIDs) > j {
 				workBeadID = residualWorkBeadIDs[j]
@@ -629,6 +656,7 @@ func computePoolDesiredStatesAt(
 				}
 				if demand.WorktreeSpecs != nil {
 					worktreeSpec = demand.WorktreeSpecs[workBeadID]
+					worktreeRef = demand.WorktreeRefs[workBeadID]
 				}
 				if demand.WorktreeErrors != nil {
 					worktreeError = strings.TrimSpace(demand.WorktreeErrors[workBeadID])
@@ -644,6 +672,7 @@ func computePoolDesiredStatesAt(
 				WorkStoreRef:   workStoreRef,
 				BrainParentSID: workParentSID,
 				WorktreeSpec:   worktreeSpec,
+				WorktreeRef:    worktreeRef,
 				WorktreeError:  worktreeError,
 			}
 			allRequests = append(allRequests, req)
@@ -732,9 +761,11 @@ func requestWithScaleDemandProvenance(request SessionRequest, demand scaleCheckD
 	// previous bead's spec into a rebound request would hand the session a
 	// workspace verified for other work.
 	request.WorktreeSpec = nil
+	request.WorktreeRef = nil
 	request.WorktreeError = ""
 	if demand.WorktreeSpecs != nil {
 		request.WorktreeSpec = demand.WorktreeSpecs[workBeadID]
+		request.WorktreeRef = demand.WorktreeRefs[workBeadID]
 	}
 	if demand.WorktreeErrors != nil {
 		request.WorktreeError = strings.TrimSpace(demand.WorktreeErrors[workBeadID])
@@ -1614,4 +1645,210 @@ func isConfiguredNamedSessionIdentity(cfg *config.City, assignee string) bool {
 		return false
 	}
 	return !spec.Agent.Suspended
+}
+
+// worktreeReference binds an invoking step to one native workspace attempt.
+// Pack source selection and lifecycle records are outside this transport.
+type worktreeReference struct {
+	Version          int    `json:"version"`
+	BindingStepID    string `json:"binding_step_id"`
+	WorkflowRootID   string `json:"workflow_root_id"`
+	Generation       int64  `json:"generation"`
+	WorkspaceOwnerID string `json:"workspace_owner_id"`
+	WorkspaceBeadID  string `json:"workspace_bead_id"`
+	StoreRef         string `json:"store_ref"`
+	NativeAttemptID  string `json:"native_attempt_id"`
+}
+
+func worktreeReferenceForBead(bead beads.Bead, storeRef string) (*worktreeReference, error) {
+	raw, present := bead.Metadata[beadmeta.WorktreeRefMetadataKey]
+	if !present {
+		return nil, nil
+	}
+	var ref *worktreeReference
+	if err := json.Unmarshal([]byte(raw), &ref); err != nil {
+		return nil, fmt.Errorf("work bead %s: decoding native worktree reference: %w", bead.ID, err)
+	}
+	if ref == nil || ref.Version != 1 || ref.Generation < 1 {
+		return nil, fmt.Errorf("work bead %s: unsupported or incomplete native worktree reference", bead.ID)
+	}
+	for _, value := range []string{ref.BindingStepID, ref.WorkflowRootID, ref.WorkspaceOwnerID, ref.WorkspaceBeadID, ref.StoreRef, ref.NativeAttemptID} {
+		if value == "" || strings.TrimSpace(value) != value {
+			return nil, fmt.Errorf("work bead %s: incomplete native worktree reference identity", bead.ID)
+		}
+	}
+	if ref.BindingStepID != bead.ID || ref.WorkflowRootID != bead.Metadata[beadmeta.RootBeadIDMetadataKey] ||
+		ref.StoreRef != storeRef || ref.StoreRef != bead.Metadata[beadmeta.RootStoreRefMetadataKey] {
+		return nil, fmt.Errorf("work bead %s: native worktree reference step/root/store mismatch", bead.ID)
+	}
+	return ref, nil
+}
+
+func worktreeBindingForBead(store beads.Store, bead beads.Bead, storeRef string) (*worktree.Spec, *worktreeReference, error) {
+	ref, err := worktreeReferenceForBead(bead, storeRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ref == nil {
+		spec, err := worktreeSpecForBead(bead, storeRef)
+		return spec, nil, err
+	}
+	if store == nil {
+		return nil, nil, fmt.Errorf("work bead %s: selected work store is unavailable", bead.ID)
+	}
+	owner, err := beads.HandlesFor(store).Live.Get(ref.WorkspaceBeadID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("work bead %s: reading workspace owner in %s: %w", bead.ID, storeRef, err)
+	}
+	if owner.ID != ref.WorkspaceBeadID || owner.Metadata[beadmeta.RootBeadIDMetadataKey] != ref.WorkflowRootID ||
+		owner.Metadata[beadmeta.RootStoreRefMetadataKey] != ref.StoreRef ||
+		owner.Metadata[beadmeta.WorktreeOwnerMetadataKey] != ref.WorkspaceOwnerID ||
+		owner.Metadata[beadmeta.WorktreeGenerationMetadataKey] != strconv.FormatInt(ref.Generation, 10) {
+		return nil, nil, fmt.Errorf("work bead %s: native workspace owner/root/store/generation mismatch", bead.ID)
+	}
+	if _, present := owner.Metadata[beadmeta.WorktreeModeMetadataKey]; !present {
+		return nil, nil, fmt.Errorf("work bead %s: referenced workspace lacks explicit native mode", bead.ID)
+	}
+	if _, present := owner.Metadata[beadmeta.WorktreePlacementMetadataKey]; !present {
+		return nil, nil, fmt.Errorf("work bead %s: referenced workspace lacks explicit native placement", bead.ID)
+	}
+	spec, err := worktreeSpecForBead(owner, storeRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	if spec == nil {
+		return nil, nil, fmt.Errorf("work bead %s: referenced workspace has no native ownership projection", bead.ID)
+	}
+	spec.AttemptID = ref.NativeAttemptID
+	return spec, ref, nil
+}
+
+// verifyReferencedWorktree re-reads the step and owner in the selected store
+// before verifying Git, so cached demand cannot authorize a changed attempt.
+func verifyReferencedWorktree(store beads.Store, stepID, storeRef string, expected *worktreeReference, spec *worktree.Spec, verify func(worktree.Spec) (worktree.Report, error)) (worktree.Report, error) {
+	if store == nil || expected == nil || expected.BindingStepID != stepID || expected.StoreRef != storeRef {
+		return worktree.Report{}, errors.New("native worktree reference verification lacks exact step/store binding")
+	}
+	step, err := beads.HandlesFor(store).Live.Get(stepID)
+	if err != nil {
+		return worktree.Report{}, fmt.Errorf("reading native worktree reference step: %w", err)
+	}
+	fresh, ref, err := worktreeBindingForBead(store, step, storeRef)
+	if err != nil {
+		return worktree.Report{}, err
+	}
+	if fresh == nil || ref == nil || *ref != *expected || (spec != nil && *fresh != *spec) {
+		return worktree.Report{}, errors.New("native worktree reference changed since selection")
+	}
+	report, err := verify(*fresh)
+	if err != nil {
+		return report, err
+	}
+	if report.Provenance == nil || report.Provenance.AttemptID != ref.NativeAttemptID {
+		return report, errors.New("native worktree reference provisioning attempt mismatch")
+	}
+	return report, nil
+}
+
+// canonicalWorktreeStoreRef expands only the selected city's shorthand;
+// distinct named cities and class bindings keep their full identities.
+func canonicalWorktreeStoreRef(cfg *config.City, ref string) string {
+	if ref == "" || ref == "city" {
+		return "city:" + censusCityName(cfg)
+	}
+	if cfg == nil {
+		return ref
+	}
+	for _, rig := range cfg.Rigs {
+		if ref == rig.Name {
+			return "rig:" + ref
+		}
+	}
+	return ref
+}
+
+func selectedNativeWorkStore(cityPath string, cfg *config.City, leading beads.Store, rigs map[string]beads.Store, ref string) (beads.Store, error) {
+	legs, err := censusStoreCandidates(cityPath, cfg, leading, rigs, buildSuspendedRigPathsForCity(cfg, cityPath), censusRefScoped)
+	if err != nil {
+		return nil, err
+	}
+	var selected beads.Store
+	for _, leg := range legs {
+		if leg.ref == ref {
+			if selected != nil {
+				return nil, fmt.Errorf("native worktree store %q is ambiguous", ref)
+			}
+			selected = leg.store
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("native worktree store %q is not a serving registered leg", ref)
+	}
+	return selected, nil
+}
+
+func referenceWorkKey(ref *worktreeReference, legacyID string) string {
+	if ref != nil {
+		return ref.StoreRef + "/" + ref.BindingStepID
+	}
+	return legacyID
+}
+
+func referenceFingerprint(ref *worktreeReference, spec *worktree.Spec) string {
+	if ref != nil {
+		return fmt.Sprintf("%#v %#v", ref, spec)
+	}
+	if spec != nil {
+		return specFingerprint(*spec)
+	}
+	return ""
+}
+
+// bindAssignedWorktreeReferences carries the observed leg identity into
+// assigned requests without reading stores or Git in the pure planner.
+func bindAssignedWorktreeReferences(cfg *config.City, states []PoolDesiredState, work []beads.Bead, refs []string) {
+	byID := make(map[string][]int)
+	for i, bead := range work {
+		if _, declared := bead.Metadata[beadmeta.WorktreeRefMetadataKey]; declared {
+			byID[bead.ID] = append(byID[bead.ID], i)
+		}
+	}
+	for i := range states {
+		for j := range states[i].Requests {
+			req := &states[i].Requests[j]
+			for _, k := range byID[req.WorkBeadID] {
+				bead := work[k]
+				if _, declared := bead.Metadata[beadmeta.WorktreeRefMetadataKey]; !declared {
+					continue
+				}
+				if k >= len(refs) {
+					req.WorktreeError = "native worktree reference has no observed work-store identity"
+					continue
+				}
+				storeRef := canonicalWorktreeStoreRef(cfg, refs[k])
+				ref, err := worktreeReferenceForBead(bead, storeRef)
+				if err != nil {
+					req.WorktreeError = err.Error()
+					continue
+				}
+				if req.WorktreeRef != nil && *req.WorktreeRef != *ref {
+					req.WorktreeError = "native worktree reference has conflicting assigned-store evidence"
+					continue
+				}
+				req.WorktreeRef, req.WorkStoreRef = ref, storeRef
+			}
+		}
+	}
+}
+
+func nativeReferenceWorkDir(store beads.Store, bead beads.Bead, storeRef string) (string, bool, error) {
+	if _, present := bead.Metadata[beadmeta.WorktreeRefMetadataKey]; !present {
+		return "", false, nil
+	}
+	spec, ref, err := worktreeBindingForBead(store, bead, storeRef)
+	if err != nil {
+		return "", true, err
+	}
+	report, err := verifyReferencedWorktree(store, bead.ID, storeRef, ref, spec, worktree.Verify)
+	return report.Path, true, err
 }

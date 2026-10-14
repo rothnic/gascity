@@ -121,9 +121,23 @@ func foldPreWake(_ context.Context, r effectReads, v txView) (preWakeFold, error
 	}
 	if e := v.Alloc.Snapshot.Entries[v.It.Key]; e != nil && e.Binding != nil {
 		f.bind = maps.Clone(e.Binding.Patch)
-		if spec := e.Binding.WorktreeSpec; spec != nil {
-			report, err := verifyWorktree(*spec)
-			f.work = &workVerdict{BeadID: spec.BeadID, Fingerprint: specFingerprint(*spec), Refused: err != nil}
+		if spec, ref := e.Binding.WorktreeSpec, e.Binding.WorktreeRef; spec != nil || ref != nil {
+			var report worktree.Report
+			var err error
+			legacyID := ""
+			if spec != nil {
+				legacyID = spec.BeadID
+			}
+			if ref != nil {
+				store, readErr := r.legs.nativeStore(ref.StoreRef)
+				err = readErr
+				if err == nil {
+					report, err = verifyReferencedWorktree(store, e.Binding.WorkBeadID, ref.StoreRef, ref, spec, verifyWorktree)
+				}
+			} else {
+				report, err = verifyWorktree(*spec)
+			}
+			f.work = &workVerdict{BeadID: referenceWorkKey(ref, legacyID), Fingerprint: referenceFingerprint(ref, spec), Refused: err != nil}
 			if err != nil {
 				return f, err
 			}
@@ -135,6 +149,14 @@ func foldPreWake(_ context.Context, r effectReads, v txView) (preWakeFold, error
 				f.bind[beadmeta.WorkDirMetadataKey], f.bind[beadmeta.LegacyWorkDirMetadataKey] = report.Path, report.Path
 			}
 		}
+	}
+	bound := foldInfo(v.Row, f.bind)
+	if _, err := resolvePreparedTaskWorkDir(startCandidate{info: bound, tp: tp}, v.World.CityPath, v.World.Env.Cfg, r.city, taskWorkDirs(v.World, r), dispatchOptionSources{nativeWorkStore: r.legs.nativeStore}); err != nil {
+		if f.work == nil {
+			f.work = &workVerdict{BeadID: canonicalWorktreeStoreRef(v.World.Env.Cfg, bound.TriggerBeadStoreRef) + "/" + bound.TriggerBeadID, Fingerprint: bound.WorktreeReference, Refused: true}
+		}
+		f.work.Refused = true
+		return f, err
 	}
 	base := foldInfo(v.Row, v.It.folded()) // a dead committed row's heal and accrual (A6 item 4)
 	_, _, patch, class := preWakePatch(base, v.Now, f.token)
@@ -183,6 +205,8 @@ func preWakeStep(v txView, f preWakeFold, probeErr error) txStep {
 		return txStep{Refuse: causeLivenessUnknown, Err: probeErr}
 	case !session.IsSessionNameSyntaxValid(strings.TrimSpace(v.Row.SessionNameMetadata)):
 		return healInstead(v, txStep{Refuse: causeSessionName})
+	case healDrifted(v): // the carried timer heal no longer holds on the fresh row: no heal, no start
+		return txStep{Refuse: causeHeld}
 	case preWakeRefused(v) || session.IsKillPendingInfo(v.Row, v.Now): // the hold the intent's own patch writes too
 		return healInstead(v, txStep{Refuse: causeHeld})
 	case v.RT.Class != rtAbsent:

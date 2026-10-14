@@ -434,7 +434,8 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 		return beads.Bead{}, fmt.Errorf("input convoy target id is empty")
 	}
 	metadata := map[string]string{
-		syntheticMetadataKey: "true",
+		syntheticMetadataKey:             "true",
+		beadmeta.SourceBeadIDMetadataKey: target.ID,
 	}
 	created, err := store.Create(beads.Bead{
 		Title:    "input convoy for " + target.ID,
