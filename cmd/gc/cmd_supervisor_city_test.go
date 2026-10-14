@@ -2102,7 +2102,6 @@ func TestSupervisorCreatesControllerSocketForManagedCity(t *testing.T) {
 	t.Setenv("GC_HOME", gcHome)
 
 	cityPath := shortSocketTempDir(t, "gc-supervisor-city-")
-	cleanupManagedDoltTestCity(t, cityPath)
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2126,6 +2125,7 @@ shutdown_timeout = "100ms"
 	script := writeSpyScript(t, logFile)
 	t.Setenv("GC_BEADS", "exec:"+script)
 	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+	cleanupManagedDoltTestCity(t, cityPath)
 
 	reg := supervisor.NewRegistry(supervisor.RegistryPath())
 	if err := reg.Register(cityPath, "test-city"); err != nil {
@@ -2136,7 +2136,7 @@ shutdown_timeout = "100ms"
 	var stdout, stderr bytes.Buffer
 	reconcileCities(context.Background(), reg, cr, supervisor.PublicationConfig{}, &stdout, &stderr)
 
-	sockPath := filepath.Join(canonicalTestPath(cityPath), ".gc", "controller.sock")
+	sockPath := controllerSocketPath(canonicalTestPath(cityPath))
 	if _, err := os.Stat(sockPath); err != nil {
 		t.Fatalf("controller.sock not created at %s after reconcileCities: %v", sockPath, err)
 	}

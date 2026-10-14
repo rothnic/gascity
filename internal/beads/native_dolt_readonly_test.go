@@ -73,6 +73,7 @@ var nativeStoreMethodKinds = map[string]nativeStoreMethodKind{
 	// Create at all.
 	"ApplyGraphPlan":              nativeStoreMutation,
 	"ApplyGraphPlanWithStorage":   nativeStoreMutation,
+	"ApplyGuardedMetadataBatch":   nativeStoreMutation,
 	"CreateWithForeignID":         nativeStoreMutation,
 	"CloseIfMatch":                nativeStoreMutation,
 	"CloseWithMetadataIfMatch":    nativeStoreMutation,
@@ -86,6 +87,7 @@ var nativeStoreMethodKinds = map[string]nativeStoreMethodKind{
 	"Count":                       nativeStoreRead,
 	"DepMetadata":                 nativeStoreRead,
 	"SawRows":                     nativeStoreRead,
+	"SnapshotMetadata":            nativeStoreRead,
 	"IDPrefix":                    nativeStoreLifecycle,
 	"AtomicTx":                    nativeStoreLifecycle,
 	"SupportsEphemeralGraphApply": nativeStoreLifecycle,

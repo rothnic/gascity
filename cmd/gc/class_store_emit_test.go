@@ -1745,8 +1745,8 @@ func TestEmittingClassStoreOverClaimsArePinnedPerEngine(t *testing.T) {
 			"SequenceFloor", "SetSequenceFloor", "StoreHealthPath",
 		},
 		reflect.TypeOf(&beads.SQLiteStore{}): {
-			"ConditionalWritesModeSource", "Count", "DepListBatch",
-			"NamespaceCensusHandle", "ReadOnly", "SawRows",
+			"ApplyGuardedMetadataBatch", "ConditionalWritesModeSource", "Count", "DepListBatch",
+			"NamespaceCensusHandle", "ReadOnly", "SawRows", "SnapshotMetadata",
 			"SupportsEphemeralGraphApply", "TransferIfCurrent", "WaitForParentProjection",
 		},
 	}
@@ -1772,5 +1772,24 @@ func TestEmittingClassStoreOverClaimsArePinnedPerEngine(t *testing.T) {
 		if !slices.Equal(got, sorted) {
 			t.Errorf("the emitter claims %v that %s lacks, pinned %v: check each new claim answers over %s as its absence would, then update the pin", got, engine, sorted, engine)
 		}
+	}
+}
+
+func TestEmittingClassStoreGuardedMetadataRefusesUnsupportedEngine(t *testing.T) {
+	cityPath := t.TempDir()
+	// Any fallback read or write through the required Store surface panics.
+	emitter := &emittingClassStore{Store: &plainCreateEngine{}, cityPath: cityPath}
+	if rows, err := emitter.SnapshotMetadata([]string{"work-1"}); !errors.Is(err, beads.ErrConditionalWriteUnsupported) || rows != nil {
+		t.Fatalf("unsupported snapshot = %v, %v; want nil and unsupported", rows, err)
+	}
+	reason := "completed"
+	request := beads.GuardedMetadataBatchRequest{CloseSession: "session-1", Rows: []beads.GuardedMetadataPatch{
+		{ID: "work-1", ExpectedRevision: "1", RequireChange: true, Set: map[string]string{"result": "accepted"}, CloseReason: &reason},
+	}}
+	if rows, err := emitter.ApplyGuardedMetadataBatch(request); !errors.Is(err, beads.ErrConditionalWriteUnsupported) || rows != nil {
+		t.Fatalf("unsupported batch = %v, %v; want nil and unsupported", rows, err)
+	}
+	if events := readCityJournal(t, cityPath); len(events) != 0 {
+		t.Fatalf("unsupported operations emitted %d events", len(events))
 	}
 }

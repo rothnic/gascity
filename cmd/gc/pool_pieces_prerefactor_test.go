@@ -494,7 +494,7 @@ func buildDemandTargetsPreRefactor(
 			}
 			if store != nil && isCold && !storeScopedControlDispatcher {
 				for _, source := range activeStores {
-					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref}
+					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, worktreeStoreRef: source.ref}
 					if namedSessionMode != "always" {
 						defaultScaleTargets = append(defaultScaleTargets, target)
 					}
@@ -523,7 +523,7 @@ func buildDemandTargetsPreRefactor(
 		}
 		if store != nil && isCold && !storeScopedControlDispatcher {
 			for _, source := range activeStores {
-				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref})
+				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, worktreeStoreRef: source.ref})
 			}
 			coldWakeTemplates[template] = true
 		}

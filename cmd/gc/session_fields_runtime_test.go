@@ -350,6 +350,12 @@ func TestSessionFieldsClearSitesClear(t *testing.T) {
 		meta []string // the row: each cleared key set, and what the site needs to act
 		run  func(*testing.T, []string) map[string]string
 	}{
+		"cmd/gc/build_desired_state.go:computePoolTriggerBindingPatch": {
+			[]string{"gc.worktree_ref", "retained-reference"},
+			patchSite(func(info session.Info) session.MetadataPatch {
+				return computePoolTriggerBindingPatch(info, SessionRequest{}, "")
+			}),
+		},
 		"cmd/gc/session_reconciler.go:finalizeDrainAckStoppedSession": {[]string{"restart_requested", "true"}, func(t *testing.T, meta []string) map[string]string {
 			env := newReconcilerTestEnv(t)
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}

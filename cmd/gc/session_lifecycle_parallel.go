@@ -1650,10 +1650,16 @@ func resolvePreparedTaskWorkDir(candidate startCandidate, cityPath string, cfg *
 		if sources.nativeWorkStore != nil {
 			selected, err = sources.nativeWorkStore(storeRef)
 		} else if storeRef != "city:"+censusCityName(cfg) {
-			selected = nil
+			if candidate.info.WorktreeReference != "" {
+				selected = nil
+			} else {
+				// Legacy triggers may share the passed store. An empty native
+				// scope makes any declared step or source reference refuse.
+				storeRef = ""
+			}
 		}
 		if err != nil || selected == nil {
-			if candidate.info.WorktreeReference != "" {
+			if sources.nativeWorkStore != nil || candidate.info.WorktreeReference != "" {
 				if err != nil {
 					return "", fmt.Errorf("native worktree reference selected store %q: %w", storeRef, err)
 				}

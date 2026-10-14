@@ -277,7 +277,7 @@ func TestEffectLintBansBlindWrites(t *testing.T) {
 // effectLintSessionReads are the session.Store methods that write nothing,
 // or (UpdateRowFenced) write only through a resolved conditional writer.
 var effectLintSessionReads = []string{
-	"Backed", "CircuitResetGeneration", "CircuitState", "CurrentClaimBeadID", "ExtmsgHandleSource", "Get",
+	"Backed", "CircuitResetGeneration", "CircuitState", "CurrentClaimBeadID", "ExtmsgHandleSource", "Get", "GetExactFresh",
 	"GetLocalString", "GetPersistedResponse", "GetState", "GetWait", "HasOpenSessionNamed", "List", "ListAddresses",
 	"ListAll", "ListAllForReconcile", "ListAllForReconcileWithFingerprint", "ListAllWithResponses",
 	"ListByMetadataInfos", "ListLabeledSessionInfosUnfiltered", "ListStartupHealthEpisodes", "ListWaits",

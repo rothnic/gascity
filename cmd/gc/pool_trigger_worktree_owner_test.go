@@ -495,6 +495,20 @@ func TestSharedWorktreeReferenceBinding(t *testing.T) {
 				}
 			})
 		}
+		t.Run(id+"/assigned-new-reference", func(t *testing.T) {
+			observed, err := store.Get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed.Metadata = maps.Clone(observed.Metadata)
+			delete(observed.Metadata, beadmeta.WorktreeRefMetadataKey)
+			observed.Metadata[beadmeta.LegacyWorkDirMetadataKey] = t.TempDir()
+			resolver := newAssignedTaskWorkDirResolver("", []beads.Bead{observed}, []string{spec.StoreRef}, func(string) (beads.Store, error) { return store, nil })
+			got, err := resolver(startCandidate{info: sessionpkg.Info{ID: "session"}}, &config.City{Workspace: config.Workspace{Name: "fixture"}})
+			if err != nil || got != spec.Path {
+				t.Fatalf("new managed reference did not replace the legacy snapshot: dir=%q err=%v", got, err)
+			}
+		})
 		for _, changedID := range []string{id, owner.ID} {
 			t.Run(id+"/cached-"+changedID, func(t *testing.T) {
 				cache := beads.NewCachingStore(store, nil)
@@ -574,6 +588,127 @@ func TestPreparedNativeReferenceRefusesLegacyDirectory(t *testing.T) {
 			prepared, returned, err := buildPreparedStartWithWorkDirResolver(candidate, "", &config.City{Workspace: config.Workspace{Name: "fixture"}}, store, func(startCandidate, *config.City) (string, error) { return dir, nil }, dispatchOptionSources{})
 			if err == nil || !strings.Contains(err.Error(), "reference") || prepared != nil || returned.SessionKey != "preserved" {
 				t.Fatalf("invalid native reference reached directory fallback: prepared=%v key=%q err=%v", prepared, returned.SessionKey, err)
+			}
+		})
+	}
+}
+
+func TestPreparedLegacyTriggerRefusesUnboundNativeReference(t *testing.T) {
+	for _, location := range []string{"session", "trigger", "source"} {
+		t.Run(location, func(t *testing.T) {
+			store := beads.NewMemStore()
+			store.HonorExplicitIDs = true
+			if _, err := store.Create(beads.Bead{ID: "session", Type: sessionpkg.BeadType}); err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			step := beads.Bead{ID: "step", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: "workflow-root"}}
+			source := beads.Bead{ID: "source", Metadata: map[string]string{
+				beadmeta.RootBeadIDMetadataKey: "workflow-root", beadmeta.LegacyWorkDirMetadataKey: dir,
+			}}
+			ref := worktreeReference{
+				Version: 1, BindingStepID: "step", WorkflowRootID: "workflow-root", Generation: 1,
+				WorkspaceOwnerID: "owner", WorkspaceBeadID: "workspace", StoreRef: "rig:missing", NativeAttemptID: "attempt",
+			}
+			if location == "source" {
+				ref.BindingStepID = source.ID
+			}
+			raw, err := json.Marshal(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := startCandidate{
+				info: sessionpkg.Info{ID: "session", TriggerBeadID: step.ID, TriggerBeadStoreRef: ref.StoreRef, WorkDir: dir, SessionKey: "preserved"},
+				tp:   TemplateParams{TemplateName: "worker", SessionName: "worker", Command: "agent"},
+			}
+			switch location {
+			case "session":
+				candidate.info.WorktreeReference = string(raw)
+			case "trigger":
+				step.Metadata[beadmeta.WorktreeRefMetadataKey] = string(raw)
+				step.Metadata[beadmeta.RootStoreRefMetadataKey] = ref.StoreRef
+				if _, err := worktreeReferenceForBead(step, ref.StoreRef); err != nil {
+					t.Fatalf("the declared trigger reference must be well formed: %v", err)
+				}
+			case "source":
+				source.Metadata[beadmeta.WorktreeRefMetadataKey] = string(raw)
+				source.Metadata[beadmeta.RootStoreRefMetadataKey] = ref.StoreRef
+				if _, err := worktreeReferenceForBead(source, ref.StoreRef); err != nil {
+					t.Fatalf("the declared source reference must be well formed: %v", err)
+				}
+			}
+			for _, bead := range []beads.Bead{
+				step, source, {ID: "workflow-root", Metadata: map[string]string{beadmeta.DrainMemberIDMetadataKey: source.ID}},
+			} {
+				if _, err := store.Create(bead); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prepared, returned, err := buildPreparedStartWithWorkDirResolver(candidate, "", &config.City{Workspace: config.Workspace{Name: "fixture"}}, store,
+				func(startCandidate, *config.City) (string, error) { return dir, nil }, dispatchOptionSources{})
+			want := "step/root/store mismatch"
+			if location == "session" {
+				want = "selected store is unavailable"
+			}
+			if err == nil || !strings.Contains(err.Error(), want) || prepared != nil || returned.SessionKey != "preserved" {
+				t.Fatalf("unbound %s reference reached legacy launch: prepared=%v key=%q err=%v", location, prepared, returned.SessionKey, err)
+			}
+			persisted, err := store.Get("session")
+			if err != nil || persisted.Metadata["instance_token"] != "" {
+				t.Fatalf("refused native evidence changed the session: row=%+v err=%v", persisted, err)
+			}
+		})
+	}
+}
+
+func TestAssignedWorkDirPreservesLegacyAndChecksNativeStore(t *testing.T) {
+	for _, shape := range []string{"unknown-legacy", "known-legacy", "unknown-native", "store-unavailable", "store-nil", "fresh-read-failed", "new-invalid-reference"} {
+		t.Run(shape, func(t *testing.T) {
+			dir := t.TempDir()
+			observed := beads.Bead{ID: "step", Status: "in_progress", Assignee: "session", Metadata: map[string]string{beadmeta.LegacyWorkDirMetadataKey: dir}}
+			store := beads.NewMemStore()
+			store.HonorExplicitIDs = true
+			var refs []string
+			if shape != "unknown-legacy" && shape != "unknown-native" {
+				refs = []string{"city:fixture"}
+			}
+			if shape == "unknown-native" {
+				observed.Metadata[beadmeta.WorktreeRefMetadataKey] = "null"
+			}
+			if shape == "new-invalid-reference" {
+				fresh := observed
+				fresh.Metadata = maps.Clone(observed.Metadata)
+				fresh.Metadata[beadmeta.WorktreeRefMetadataKey] = "null"
+				if _, err := store.Create(fresh); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if shape == "known-legacy" {
+				if _, err := store.Create(observed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			called := false
+			resolver := newAssignedTaskWorkDirResolver("", []beads.Bead{observed}, refs, func(string) (beads.Store, error) {
+				called = true
+				if shape == "store-unavailable" {
+					return nil, beads.ErrNotFound
+				}
+				if shape == "store-nil" {
+					return nil, nil
+				}
+				return store, nil
+			})
+			got, err := resolver(startCandidate{info: sessionpkg.Info{ID: "session"}}, &config.City{Workspace: config.Workspace{Name: "fixture"}})
+			if shape == "unknown-legacy" || shape == "known-legacy" {
+				if err != nil || got != dir || called != (shape == "known-legacy") {
+					t.Fatalf("legacy snapshot changed its store selection: dir=%q called=%v err=%v", got, called, err)
+				}
+			} else if err == nil || got != "" {
+				t.Fatalf("%s fell back to a cached directory: dir=%q err=%v", shape, got, err)
+			}
+			if shape == "unknown-native" && called {
+				t.Fatal("declared native evidence inferred an unrecorded store")
 			}
 		})
 	}

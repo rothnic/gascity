@@ -119,6 +119,11 @@ var cacheOmittedCapabilities = map[string]func(beads.Store) bool{
 	"AdvanceSequenceFloor": nil,
 	"StoreHealthPath":      nil,
 	"ReadOnly":             nil,
+	// Guarded metadata opens the authoritative engine through the one-shot
+	// CLI, where reads retain native revisions and writes remain one atomic
+	// transaction. No controller cache caller uses this engine-only door.
+	"SnapshotMetadata":          nil,
+	"ApplyGuardedMetadataBatch": nil,
 	// Engine-only (see above): the batch dep-edge read exists for
 	// `gc storage recover-stranded`, which opens the engine itself. A live
 	// cache answers per-anchor down-dep reads from memory, and the scope-skip

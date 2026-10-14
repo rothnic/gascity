@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 211,
+  "next_id": 212,
   "permanent_ids": [
     {
       "name": "help",
@@ -283,6 +283,23 @@
       "classification": "beads-city-use-managed",
       "owner": "immediate",
       "id": 13
+    },
+    {
+      "path": "gc beads guarded-metadata-batch",
+      "aliases": [],
+      "conditional_modes": [
+        "beads-machine-output"
+      ],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "beads-guarded-metadata-batch",
+      "owner": "immediate",
+      "id": 211
     },
     {
       "path": "gc beads health",

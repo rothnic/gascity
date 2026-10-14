@@ -7232,14 +7232,17 @@ func newAssignedTaskWorkDirResolver(cityPath string, assigned []beads.Bead, refs
 				continue
 			}
 			_, declared := item.bead.Metadata[beadmeta.WorktreeRefMetadataKey]
-			if resolveStore != nil {
+			if declared && strings.TrimSpace(item.storeRef) == "" {
+				return "", errors.New("native worktree reference has no observed work-store identity")
+			}
+			if resolveStore != nil && strings.TrimSpace(item.storeRef) != "" {
 				ref := canonicalWorktreeStoreRef(cfg, item.storeRef)
 				store, err := resolveStore(ref)
 				if err != nil {
-					if declared {
-						return "", err
-					}
-					continue
+					return "", fmt.Errorf("reading assigned work store %q: %w", ref, err)
+				}
+				if store == nil {
+					return "", errors.New("assigned work store is unavailable")
 				}
 				if declared {
 					expected, err := worktreeReferenceForBead(item.bead, ref)
@@ -7251,7 +7254,7 @@ func newAssignedTaskWorkDirResolver(cityPath string, assigned []beads.Bead, refs
 				}
 				fresh, err := beads.HandlesFor(store).Live.Get(item.bead.ID)
 				if err != nil {
-					continue
+					return "", fmt.Errorf("reading assigned work bead %q in %s: %w", item.bead.ID, ref, err)
 				}
 				if _, present := fresh.Metadata[beadmeta.WorktreeRefMetadataKey]; present {
 					return resolveTaskBeadWorkDir(cityPath, store, ref, fresh)
