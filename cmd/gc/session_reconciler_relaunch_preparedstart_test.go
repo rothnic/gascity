@@ -127,6 +127,9 @@ func TestReconcileSessionBeads_LaunchDriftRelaunchAppliesRigResidentTriggerPins(
 		beadmeta.TriggerBeadIDMetadataKey:       triggerID,
 		beadmeta.TriggerBeadStoreRefMetadataKey: "rig:frontend",
 	})
+	// The trigger reader and the workspace check use the same serving rig.
+	env.cfg.Rigs = []config.Rig{{Name: "frontend", Path: t.TempDir()}}
+	env.rigStores = map[string]beads.Store{"frontend": rigStore}
 	env.startOptions = append(env.startOptions, withTriggerBeadResolver(rigStore.Get))
 
 	env.reconcile([]beads.Bead{session})

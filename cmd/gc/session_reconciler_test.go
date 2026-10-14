@@ -282,6 +282,7 @@ func (p *lateSuccessStartProvider) Start(ctx context.Context, name string, cfg r
 // reconcilerTestEnv holds common test infrastructure.
 type reconcilerTestEnv struct {
 	store        beads.Store
+	rigStores    map[string]beads.Store
 	sp           *runtime.Fake
 	dt           *drainTracker
 	clk          *clock.Fake
@@ -477,7 +478,7 @@ func (e *reconcilerTestEnv) reconcileWithPoolDesiredAndDrainOps(sessions []beads
 	cfgNames := configuredSessionNames(e.cfg, "", e.store)
 	return reconcileSessionBeadsAtPath(
 		context.Background(), e.city, sessions, e.desiredState, cfgNames, e.cfg, e.sp,
-		e.store, dops, nil, nil, nil, e.dt, poolDesired, false, nil, "",
+		e.store, dops, nil, e.rigStores, nil, e.dt, poolDesired, false, nil, "",
 		nil, e.clk, e.rec, 0, 0, &e.stdout, &e.stderr,
 		e.startOptions...,
 	)
