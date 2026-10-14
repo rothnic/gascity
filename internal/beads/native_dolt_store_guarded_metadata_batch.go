@@ -51,6 +51,10 @@ func readNativeMetadataSnapshot(ctx context.Context, reader issueops.Reader, id 
 	if row == nil {
 		return MetadataSnapshot{}, fmt.Errorf("bead %q: %w", id, ErrNotFound)
 	}
+	return metadataSnapshotFromDetails(id, row)
+}
+
+func metadataSnapshotFromDetails(id string, row *issueops.IssueDetails) (MetadataSnapshot, error) {
 	if row.ID != id {
 		return MetadataSnapshot{}, fmt.Errorf("metadata snapshot for %q returned a different ID %q", id, row.ID)
 	}
@@ -73,10 +77,52 @@ func (s *NativeDoltStore) ApplyGuardedMetadataBatch(request GuardedMetadataBatch
 	if err := s.readOnlyGuard(); err != nil {
 		return nil, err
 	}
+	plan, err := prepareGuardedMetadataBatch(request, s.actor)
+	if err != nil {
+		return nil, err
+	}
+	storage, release, err := s.acquireStorage()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	reader, err := storage.IssueReader()
+	if err != nil {
+		return nil, err
+	}
+	applier, err := storage.BatchApplier()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := nativeDoltOperationContext(context.TODO())
+	defer cancel()
+	return applyGuardedMetadataBatchPlan(request, plan,
+		func(id string) (MetadataSnapshot, error) { return readNativeMetadataSnapshot(ctx, reader, id) },
+		func(batch issueops.ApplyBatchRequest) (issueops.ApplyBatchResult, error) {
+			var result issueops.ApplyBatchResult
+			err := retryOnNativeDoltSerializationConflict(func() error {
+				ctx, cancel := nativeDoltOperationContext(context.TODO())
+				defer cancel()
+				var applyErr error
+				result, applyErr = applier.ApplyBatch(ctx, batch)
+				return applyErr
+			})
+			return result, err
+		})
+}
+
+type guardedMetadataBatchPlan struct {
+	batch      issueops.ApplyBatchRequest
+	guards     []bool
+	closeItems map[int]int
+}
+
+// Both native transports use the same validation, preflight and result contract.
+func prepareGuardedMetadataBatch(request GuardedMetadataBatchRequest, actor string) (*guardedMetadataBatchPlan, error) {
 	if err := request.Validate(); err != nil {
 		return nil, err
 	}
-	batch := issueops.ApplyBatchRequest{Actor: s.actor, Provenance: "gc: guarded metadata batch", Items: make([]issueops.ApplyItem, len(request.Rows))}
+	batch := issueops.ApplyBatchRequest{Actor: actor, Provenance: "gc: guarded metadata batch", Items: make([]issueops.ApplyItem, len(request.Rows))}
 	seen := make(map[string]bool, len(request.Rows))
 	guards := make([]bool, len(request.Rows))
 	closeItems := make(map[int]int)
@@ -135,28 +181,21 @@ func (s *NativeDoltStore) ApplyGuardedMetadataBatch(request GuardedMetadataBatch
 	if !hasGuard {
 		return nil, fmt.Errorf("guarded metadata batch requires a changing guard: %w", issueops.ErrValidation)
 	}
-	storage, release, err := s.acquireStorage()
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	reader, err := storage.IssueReader()
-	if err != nil {
-		return nil, err
-	}
-	applier, err := storage.BatchApplier()
-	if err != nil {
-		return nil, err
-	}
+	return &guardedMetadataBatchPlan{batch: batch, guards: guards, closeItems: closeItems}, nil
+}
+
+func applyGuardedMetadataBatchPlan(request GuardedMetadataBatchRequest, plan *guardedMetadataBatchPlan,
+	read func(string) (MetadataSnapshot, error),
+	apply func(issueops.ApplyBatchRequest) (issueops.ApplyBatchResult, error),
+) ([]GuardedMetadataRowResult, error) {
+	batch, guards, closeItems := plan.batch, plan.guards, plan.closeItems
 	// Guard effectiveness is checked on the exact read revision. The batch
 	// rechecks that original revision inside its transaction, so a competing
 	// mutation cannot turn this check into permission for a stale write.
-	err = func() error {
-		ctx, cancel := nativeDoltOperationContext(context.TODO())
-		defer cancel()
+	err := func() error {
 		for i, item := range batch.Items[:len(request.Rows)] {
 			update := item.Update
-			current, err := readNativeMetadataSnapshot(ctx, reader, update.Target.ID)
+			current, err := read(update.Target.ID)
 			if err != nil {
 				return err
 			}
@@ -188,14 +227,7 @@ func (s *NativeDoltStore) ApplyGuardedMetadataBatch(request GuardedMetadataBatch
 	if err != nil {
 		return nil, err
 	}
-	var result issueops.ApplyBatchResult
-	err = retryOnNativeDoltSerializationConflict(func() error {
-		ctx, cancel := nativeDoltOperationContext(context.TODO())
-		defer cancel()
-		var applyErr error
-		result, applyErr = applier.ApplyBatch(ctx, batch)
-		return applyErr
-	})
+	result, err := apply(batch)
 	if err != nil {
 		return nil, fmt.Errorf("applying guarded metadata batch: %w", err)
 	}

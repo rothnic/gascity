@@ -740,6 +740,32 @@ func (s *ProxiedStore) SetMetadataBatch(id string, kvs map[string]string) error 
 	return s.withMutation("set-metadata-batch "+id, func(leaf Store) error { return leaf.SetMetadataBatch(id, kvs) })
 }
 
+// SnapshotMetadata follows the authoritative write leaf's guarded capability.
+// The native read leaf must never gain write authority through this door.
+func (s *ProxiedStore) SnapshotMetadata(ids []string) ([]MetadataSnapshot, error) {
+	leaf, ok := s.writeLeaf().(GuardedMetadataBatchStore)
+	if !ok {
+		return nil, ErrConditionalWriteUnsupported
+	}
+	return leaf.SnapshotMetadata(ids)
+}
+
+// ApplyGuardedMetadataBatch writes through the authoritative leaf under its
+// normal generation check.
+func (s *ProxiedStore) ApplyGuardedMetadataBatch(request GuardedMetadataBatchRequest) ([]GuardedMetadataRowResult, error) {
+	var rows []GuardedMetadataRowResult
+	err := s.withMutation("guarded-metadata-batch", func(store Store) error {
+		leaf, ok := store.(GuardedMetadataBatchStore)
+		if !ok {
+			return ErrConditionalWriteUnsupported
+		}
+		var err error
+		rows, err = leaf.ApplyGuardedMetadataBatch(request)
+		return err
+	})
+	return rows, err
+}
+
 // SetLocalString writes clone-local data through the ONE shared sidecar (H2).
 //
 // It is NOT bracketed by the generation check: the sidecar is a JSON file under
