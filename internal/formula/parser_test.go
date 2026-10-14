@@ -1261,6 +1261,46 @@ func TestParseFile_AndResolve(t *testing.T) {
 	if resolved.Steps[1].ID != "deploy" {
 		t.Errorf("Steps[1].ID = %q, want 'deploy' (child)", resolved.Steps[1].ID)
 	}
+	if got, want := resolved.ContentHash, ContentHash([]byte(child)); got != want {
+		t.Errorf("ContentHash = %q, want child source hash %q", got, want)
+	}
+	if resolved.Source != formula.Source {
+		t.Errorf("Source = %q, want child source %q", resolved.Source, formula.Source)
+	}
+}
+
+func TestResolve_InMemoryChildDoesNotInheritSourceIdentity(t *testing.T) {
+	dir := t.TempDir()
+	parentPath := filepath.Join(dir, "mol-hash-parent.toml")
+	parent := `formula = "mol-hash-parent"
+[[steps]]
+id = "work"
+title = "Do work"
+`
+	if err := os.WriteFile(parentPath, []byte(parent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := NewParser(dir)
+	loadedParent, err := p.LoadByName("mol-hash-parent")
+	if err != nil {
+		t.Fatalf("LoadByName: %v", err)
+	}
+	if loadedParent.ContentHash == "" || loadedParent.Source == "" {
+		t.Fatal("file-loaded parent must have its own source identity")
+	}
+	child, err := p.ParseTOML([]byte(`formula = "mol-hash-child"
+extends = ["mol-hash-parent"]
+`))
+	if err != nil {
+		t.Fatalf("ParseTOML: %v", err)
+	}
+	resolved, err := p.Resolve(child)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.ContentHash != "" || resolved.Source != "" {
+		t.Errorf("in-memory child acquired source identity: hash=%q source=%q", resolved.ContentHash, resolved.Source)
+	}
 }
 
 func TestResolve_InheritsGraphContractFromParent(t *testing.T) {

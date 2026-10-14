@@ -2476,37 +2476,53 @@ description = "Review the {{feature}} implementation."
 }
 
 func TestCompile_PropagatesContentHash(t *testing.T) {
-	dir := t.TempDir()
-	content := `
+	for _, tc := range []struct {
+		name    string
+		extends string
+	}{
+		{name: "no inheritance"},
+		{name: "parent", extends: `extends = ["mol-hash-base"]`},
+		{name: "multilevel", extends: `extends = ["mol-hash-parent"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			base := `formula = "mol-hash-base"
+[[steps]]
+id = "base"
+title = "Base work"
+`
+			parent := `formula = "mol-hash-parent"
+extends = ["mol-hash-base"]
+`
+			for name, content := range map[string]string{"mol-hash-base": base, "mol-hash-parent": parent} {
+				if err := os.WriteFile(filepath.Join(dir, name+".toml"), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			content := `
 formula = "mol-hash-prop"
 description = "Hash propagation test"
-
+` + tc.extends + `
 [[steps]]
 id = "work"
 title = "Do work"
 type = "task"
 `
-	path := filepath.Join(dir, "mol-hash-prop.toml")
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	recipe, err := Compile(context.Background(), "mol-hash-prop", []string{dir}, nil)
-	if err != nil {
-		t.Fatalf("Compile: %v", err)
-	}
-
-	if recipe.ContentHash == "" {
-		t.Fatal("ContentHash should propagate from Formula to Recipe")
-	}
-	if recipe.FormulaSource == "" {
-		t.Fatal("FormulaSource should propagate from Formula to Recipe")
-	}
-
-	// Verify hash matches direct computation
-	want := ContentHash([]byte(content))
-	if recipe.ContentHash != want {
-		t.Errorf("ContentHash = %q, want %q", recipe.ContentHash, want)
+			path := filepath.Join(dir, "mol-hash-prop.toml")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			recipe, err := Compile(context.Background(), "mol-hash-prop", []string{dir}, nil)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			if got, want := recipe.ContentHash, ContentHash([]byte(content)); got != want {
+				t.Errorf("ContentHash = %q, want child source hash %q", got, want)
+			}
+			if recipe.FormulaSource != path {
+				t.Errorf("FormulaSource = %q, want child source %q", recipe.FormulaSource, path)
+			}
+		})
 	}
 }
 
