@@ -33,7 +33,7 @@ var configFS embed.FS
 var supported = []string{"claude", "codex", "gemini", "antigravity", "kiro", "opencode", "mimocode", "groq", "cerebras", "copilot", "cursor", "pi", "omp", "kimi"}
 
 const (
-	managedPiHookVersion       = 9
+	managedPiHookVersion       = 10
 	managedOpenCodeHookVersion = 8
 	managedMimoCodeHookVersion = 4
 	managedOmpHookVersion      = 2
@@ -299,6 +299,9 @@ func piHookNeedsUpgrade(existing []byte) bool {
 		return false
 	}
 	if piHookVersion(content) < managedPiHookVersion ||
+		!strings.Contains(content, `process.env.GC_BIN === undefined ? "gc" : process.env.GC_BIN`) ||
+		!strings.Contains(content, `execFileSync(GC_BIN, args, {`) ||
+		!strings.Contains(content, `PATH: [process.env.PATH, PATH_SUFFIX].filter(Boolean).join(path.delimiter)`) ||
 		!strings.Contains(content, "gc prime --hook") ||
 		!strings.Contains(content, "gc hook --inject") ||
 		!strings.Contains(content, "gc handoff --auto") ||

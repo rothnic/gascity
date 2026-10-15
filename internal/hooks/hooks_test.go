@@ -2108,7 +2108,10 @@ func TestInstallPiHookUsesCurrentExtensionAPI(t *testing.T) {
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
 		`pi.on("before_agent_start"`,
-		"const GC_PI_HOOK_VERSION = 9",
+		"const GC_PI_HOOK_VERSION = 10",
+		`process.env.GC_BIN === undefined ? "gc" : process.env.GC_BIN`,
+		`execFileSync(GC_BIN, args, {`,
+		`PATH: [process.env.PATH, PATH_SUFFIX].filter(Boolean).join(path.delimiter)`,
 		"gc hook --inject",
 		`run(["prime", "--hook"], ctx.cwd, hookEnv(ctx, "SessionStart"))`,
 		`run(["prime", "--hook"], ctx.cwd, hookEnv(ctx, "PreCompact"))`,
@@ -2169,12 +2172,38 @@ module.exports = {
 	}
 }
 
+func TestInstallPiHookUpgradesManagedV9(t *testing.T) {
+	fs := fsys.NewFake()
+	const dst = "/work/.pi/extensions/gc-hooks.js"
+	current, err := core.PackFS.ReadFile("overlay/per-provider/pi/.pi/extensions/gc-hooks.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 10"), []byte("GC_PI_HOOK_VERSION = 9"), 1)
+	fs.Files[dst] = legacy
+	if err := Install(fs, "/city", "/work", []string{"pi"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !bytes.Equal(fs.Files[dst], current) || !bytes.Equal(fs.Files[dst+".bak"], legacy) {
+		t.Fatal("managed v9 hook was not upgraded with its original bytes backed up")
+	}
+	if err := Install(fs, "/city", "/work", []string{"pi"}); err != nil {
+		t.Fatalf("second Install: %v", err)
+	}
+	if _, ok := fs.Files[dst+".bak.1"]; ok {
+		t.Fatal("installing the current hook again created another backup")
+	}
+}
+
 func TestPiHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 	current := []byte(`// Gas City hooks for Pi Coding Agent.
 // gc prime --hook
 // gc hook --inject
 // gc handoff --auto
-const GC_PI_HOOK_VERSION = 9;
+const GC_PI_HOOK_VERSION = 10;
+const GC_BIN = process.env.GC_BIN === undefined ? "gc" : process.env.GC_BIN;
+execFileSync(GC_BIN, args, {});
+PATH: [process.env.PATH, PATH_SUFFIX].filter(Boolean).join(path.delimiter);
 pendingPrimeContext = run(["prime", "--hook"], ctx.cwd, hookEnv(ctx, "SessionStart"));
 run(["hook", "--inject"], ctx.cwd);
 run(["handoff", "--auto", "context cycle"], ctx.cwd);
@@ -2186,13 +2215,15 @@ GC_HOOK_EVENT_NAME;
 stdio: ["ignore", "pipe", "inherit"];
 function providerSessionEnv(ctx) {}
 `)
-	stale := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 9"), []byte("GC_PI_HOOK_VERSION = 8"), 1)
-	future := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 9"), []byte("GC_PI_HOOK_VERSION = 10"), 1)
+	stale := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 10"), []byte("GC_PI_HOOK_VERSION = 9"), 1)
+	future := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 10"), []byte("GC_PI_HOOK_VERSION = 11"), 1)
 	missingStderrForward := bytes.Replace(current, []byte(`stdio: ["ignore", "pipe", "inherit"];
 `), nil, 1)
 	missingManagedHookMarkers := bytes.Replace(current, []byte(`GC_MANAGED_SESSION_HOOK;
 `), nil, 1)
 	missingPendingPrimeContext := bytes.Replace(current, []byte("pendingPrimeContext = "), nil, 1)
+	missingExecutablePin := bytes.Replace(current, []byte(`process.env.GC_BIN === undefined ? "gc" : process.env.GC_BIN`), []byte(`process.env.GC_BIN || "gc"`), 1)
+	globalPathFirst := bytes.Replace(current, []byte(`[process.env.PATH, PATH_SUFFIX]`), []byte(`[PATH_SUFFIX, process.env.PATH]`), 1)
 
 	if !piHookNeedsUpgrade(stale) {
 		t.Fatal("stale Pi hook version did not request upgrade")
@@ -2211,6 +2242,12 @@ function providerSessionEnv(ctx) {}
 	}
 	if !piHookNeedsUpgrade(missingPendingPrimeContext) {
 		t.Fatal("Pi hook that discards the SessionStart prime output did not request upgrade")
+	}
+	if !piHookNeedsUpgrade(missingExecutablePin) {
+		t.Fatal("Pi hook without the fail-closed executable pin did not request upgrade")
+	}
+	if !piHookNeedsUpgrade(globalPathFirst) {
+		t.Fatal("Pi hook that prepends global defaults did not request upgrade")
 	}
 }
 

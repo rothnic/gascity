@@ -1,4 +1,4 @@
-// Behavioral tests for the embedded OpenCode and MiMo Code plugins.
+// Behavioral tests for the embedded OpenCode, MiMo Code, and Pi plugins.
 //
 // Run directly with `node --test internal/hooks/opencode_plugin.test.mjs`;
 // TestProviderPluginNodeSuite (plugin_node_test.go) runs the same file under
@@ -11,10 +11,11 @@
 // reads its hook input to EOF and then emits `Current time: ...` even when
 // the queue is empty.
 
-import { after, before, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -688,3 +689,124 @@ for (const plugin of plugins) {
     });
   });
 }
+
+describe("Pi hook executable selection", { timeout: SUITE_TIMEOUT_MS }, () => {
+  const require = createRequire(import.meta.url);
+  const childProcess = require("node:child_process");
+  const envKeys = ["GC_BIN", "HOME", "PATH", "GC_PI_TRANSCRIPT_DIR", "GC_PI_TEST_LOG"];
+  let savedEnv;
+  let dir;
+  let log;
+  let hooks;
+  let errors;
+  let oldError;
+
+  function executable(folder, name, label, mode = 0o755) {
+    fs.mkdirSync(folder, { recursive: true });
+    const file = path.join(folder, name);
+    fs.writeFileSync(file, `#!${process.execPath}\n` +
+      `const fs = require("node:fs");\n` +
+      `fs.appendFileSync(process.env.GC_PI_TEST_LOG, JSON.stringify({\n` +
+      `  label: ${JSON.stringify(label)}, args: process.argv.slice(2), cwd: process.cwd(),\n` +
+      `  session: process.env.GC_PROVIDER_SESSION_ID, required: process.env.GC_PROVIDER_SESSION_ID_REQUIRED,\n` +
+      `  managed: process.env.GC_MANAGED_SESSION_HOOK, event: process.env.GC_HOOK_EVENT_NAME,\n` +
+      `  stdin: fs.readFileSync(0, "utf8")\n` +
+      `}) + "\\n");\n` +
+      `const output = {prime: "ROLE", hook: "WORK", nudge: "NUDGE", mail: "MAIL"};\n` +
+      `process.stdout.write(output[process.argv[2]] || "");\n`, { mode });
+    return file;
+  }
+
+  function load() {
+    const staged = path.join(dir, "gc-hooks.cjs");
+    fs.writeFileSync(staged, fs.readFileSync(path.join(overlayDir, "pi", ".pi", "extensions", "gc-hooks.js")));
+    const originalExec = childProcess.execFileSync;
+    // A regression must fail without ever invoking a developer's real gc.
+    // The actual child still executes: this guard only rejects host paths.
+    childProcess.execFileSync = (file, args, options) => {
+      if (file === "gc") {
+        const found = options.env.PATH.split(path.delimiter).map((p) => path.join(p, "gc")).find((p) => {
+          try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; }
+        });
+        assert.ok(!found || found.startsWith(dir + path.sep), `hook would execute host gc: ${found}`);
+      }
+      return originalExec(file, args, options);
+    };
+    try {
+      require(staged)({ on: (event, fn) => hooks.set(event, fn) });
+    } finally {
+      childProcess.execFileSync = originalExec;
+    }
+  }
+
+  const ctx = () => ({ cwd: dir, sessionManager: { getSessionId: () => "pi-owned-session" } });
+  const calls = () => readLines(log).map((line) => JSON.parse(line));
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    dir = fs.mkdtempSync(path.join(tmp, "pi-route-"));
+    log = path.join(dir, "calls.jsonl");
+    hooks = new Map();
+    errors = [];
+    oldError = console.error;
+    console.error = (...args) => errors.push(args.join(" "));
+    process.env.HOME = path.join(dir, "home");
+    process.env.GC_PI_TEST_LOG = log;
+    delete process.env.GC_PI_TRANSCRIPT_DIR;
+    executable(path.join(process.env.HOME, "go", "bin"), "gc", "global-canary");
+    const caller = path.join(dir, "caller-bin");
+    executable(caller, "gc", "caller");
+    process.env.PATH = caller;
+  });
+
+  afterEach(() => {
+    console.error = oldError;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  it("uses the exact pin with spaces for every hook and preserves session context", () => {
+    process.env.GC_BIN = executable(path.join(dir, "selected tools"), "gc pinned", "selected");
+    load();
+    hooks.get("session_start")({}, ctx());
+    hooks.get("session_compact")({}, ctx());
+    const prompt = hooks.get("before_agent_start")({ systemPrompt: "SYSTEM" }, ctx());
+    assert.equal(prompt.systemPrompt, "SYSTEM\n\nROLE\n\nWORK\n\nNUDGE\n\nMAIL");
+    const rows = calls();
+    assert.deepEqual(rows.map((row) => row.args), [
+      ["prime", "--hook"], ["prime", "--hook"], ["handoff", "--auto", "context cycle"],
+      ["hook", "--inject"], ["nudge", "drain", "--inject"], ["mail", "check", "--inject"],
+    ]);
+    assert.ok(rows.every((row) => row.label === "selected" && row.cwd === dir && row.stdin === ""));
+    assert.deepEqual(rows.slice(0, 2).map((row) => [row.session, row.required, row.managed, row.event]), [
+      ["pi-owned-session", "pi", "1", "SessionStart"], ["pi-owned-session", "pi", "1", "PreCompact"],
+    ]);
+    assert.equal(errors.length, 0);
+    assert.equal(hooks.get("before_agent_start")({ systemPrompt: "SYSTEM" }, ctx()).systemPrompt,
+      "SYSTEM\n\nWORK\n\nNUDGE\n\nMAIL", "startup context drains only once");
+  });
+
+  it("keeps caller PATH ahead of global defaults only when GC_BIN is unset", () => {
+    delete process.env.GC_BIN;
+    load();
+    hooks.get("session_start")({}, ctx());
+    assert.deepEqual(calls().map((row) => row.label), ["caller"]);
+    assert.equal(errors.length, 0);
+  });
+
+  for (const invalid of ["empty", "missing", "not-executable"]) {
+    it(`refuses the ${invalid} pin without falling back to caller or global gc`, () => {
+      process.env.GC_BIN = invalid === "empty" ? "" : invalid === "missing" ? path.join(dir, "missing gc") :
+        executable(path.join(dir, "selected tools"), "gc disabled", "invalid", 0o644);
+      load();
+      hooks.get("session_start")({}, ctx());
+      assert.deepEqual(calls(), []);
+      assert.equal(hooks.get("before_agent_start")({ systemPrompt: "SYSTEM" }, ctx()), undefined);
+      assert.deepEqual(calls(), []);
+      assert.equal(errors.length, 4, "each failed command keeps the existing nonfatal diagnostic");
+      assert.ok(errors.every((error) => error.includes("gc-hooks run:") && error.includes("failed:")));
+    });
+  }
+});

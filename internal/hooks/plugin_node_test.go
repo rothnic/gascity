@@ -9,7 +9,7 @@ import (
 )
 
 // TestProviderPluginNodeSuite executes opencode_plugin.test.mjs under node so
-// the embedded OpenCode and MiMo Code plugins are exercised as the provider
+// the embedded OpenCode, MiMo Code, and Pi plugins are exercised as the provider
 // loads them, not just string-matched. The suite drives a fake gc through
 // GC_BIN and pins the system-prompt shape the transform produces: the cached
 // prime stays attached to system[0] ahead of the provider's own text, and the

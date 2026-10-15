@@ -132,6 +132,9 @@ six primitives, plus the progressive capability levels — is
 
 Violating any fails the build. Details live in the linked files.
 
+- **Pinned Pi hooks.** Managed Pi hooks honor an explicit `GC_BIN` without
+  falling back on error; when unset, caller `PATH` entries precede appended
+  tool defaults.
 - **Object model at the center.** The CLI (`cmd/gc/`) and the HTTP+SSE API
   (`internal/api/`) are projections over the domain packages; neither
   re-implements domain logic (`internal/api/AGENTS.md`).
