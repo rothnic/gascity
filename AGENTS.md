@@ -225,6 +225,9 @@ becoming more useful as models improve — it becomes LESS useful instead.
 - Error messages include context: `fmt.Errorf("adding rig %q: %w", name, err)`
 - Don't swallow errors: no silently filled-in defaults, masked decode
   failures, or ignored timeouts.
+- BdStore staged close emits full preserved updates. Its projection barriers
+  require the transaction's requested fields and final status; independent
+  changes to other preserved fields do not block close.
 - Native guarded metadata requests check controller and coordination ownership
   before close-policy or backend effects. Both the original row and projected
   metadata must remain eligible; removing an ownership mark cannot authorize a write.

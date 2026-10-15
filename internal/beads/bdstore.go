@@ -2277,6 +2277,8 @@ type bdStoreTxTouched struct {
 	description bool
 	parentID    bool
 	assignee    bool
+	metadata    map[string]string
+	labels      map[string]bool
 }
 
 func newBdStoreTx(store *BdStore) *bdStoreTx {
@@ -2352,7 +2354,7 @@ func (tx *bdStoreTx) apply() error {
 					if err := tx.store.Update(id, opts); err != nil {
 						return err
 					}
-					if err := tx.store.waitForUpdateProjection(id, opts); err != nil {
+					if err := tx.store.waitForUpdateProjection(id, item.projectionUpdateOpts(false)); err != nil {
 						return err
 					}
 				}
@@ -2368,7 +2370,7 @@ func (tx *bdStoreTx) apply() error {
 				if err := tx.store.Update(id, opts); err != nil {
 					return err
 				}
-				if err := tx.store.waitForUpdateProjection(id, opts); err != nil {
+				if err := tx.store.waitForUpdateProjection(id, item.projectionUpdateOpts(true)); err != nil {
 					return err
 				}
 			}
@@ -2499,6 +2501,42 @@ func (item *bdStoreTxItem) preservedUpdateOpts(includeStatus bool) UpdateOpts {
 	return opts
 }
 
+// projectionUpdateOpts selects the transaction's requested fields from the full
+// preserved write. Unrelated fields may change again before its projection is
+// read, such as a controller observing a stopped runtime. Post-close status is
+// still checked because Close itself stages that status.
+func (item *bdStoreTxItem) projectionUpdateOpts(includeStatus bool) UpdateOpts {
+	opts := item.preservedUpdateOpts(includeStatus)
+	if !item.touched.title {
+		opts.Title = nil
+	}
+	if !item.touched.beadType {
+		opts.Type = nil
+	}
+	if !item.touched.priority {
+		opts.Priority = nil
+	}
+	if !item.touched.description {
+		opts.Description = nil
+	}
+	if !item.touched.parentID {
+		opts.ParentID = nil
+	}
+	if !item.touched.assignee {
+		opts.Assignee = nil
+	}
+	opts.Metadata = maps.Clone(item.touched.metadata)
+	opts.Labels, opts.RemoveLabels = nil, nil
+	for label, present := range item.touched.labels {
+		if present {
+			opts.Labels = append(opts.Labels, label)
+		} else {
+			opts.RemoveLabels = append(opts.RemoveLabels, label)
+		}
+	}
+	return opts
+}
+
 func snapshotBdStoreTxBead(bead Bead) Bead {
 	bead.Metadata = maps.Clone(bead.Metadata)
 	bead.Labels = append([]string(nil), bead.Labels...)
@@ -2513,6 +2551,23 @@ func (t *bdStoreTxTouched) note(opts UpdateOpts) {
 	t.description = t.description || opts.Description != nil
 	t.parentID = t.parentID || opts.ParentID != nil
 	t.assignee = t.assignee || opts.Assignee != nil
+	if len(opts.Metadata) > 0 {
+		if t.metadata == nil {
+			t.metadata = make(map[string]string)
+		}
+		maps.Copy(t.metadata, opts.Metadata)
+	}
+	if len(opts.Labels) > 0 || len(opts.RemoveLabels) > 0 {
+		if t.labels == nil {
+			t.labels = make(map[string]bool)
+		}
+		for _, label := range opts.Labels {
+			t.labels[label] = true
+		}
+		for _, label := range opts.RemoveLabels {
+			t.labels[label] = false
+		}
+	}
 }
 
 func hasUpdateOpts(opts UpdateOpts) bool {

@@ -1324,6 +1324,149 @@ func TestBdStoreTxCombinesWritesForSameBead(t *testing.T) {
 	}
 }
 
+func TestBdStoreTxCloseIgnoresUnrelatedProjectionChanges(t *testing.T) {
+	closed := false
+	updateCalls, closeCalls := 0, 0
+	metadata := map[string]string{"state": "awake", "existing": "kept"}
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "show":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(fmt.Sprintf(`[{"id":"bd-42","title":"before","status":%q,"issue_type":"task","description":"retained","metadata":%s,"labels":["existing"]}]`, status, mustJSON(t, metadata))), nil
+		case "update":
+			updateCalls++
+			want := "update --json bd-42 --title before"
+			if closed {
+				want += " --status closed"
+			}
+			want += " --type task --description retained --set-metadata close_reason=completed --set-metadata existing=kept --set-metadata state=awake --add-label existing"
+			if got := strings.Join(args, " "); got != want {
+				t.Fatalf("update = %q, want full preserved write %q", got, want)
+			}
+			metadata["close_reason"] = "completed"
+			// The controller observes the stopped runtime after each successful
+			// full-row write, before its first projection read.
+			metadata["state"] = "asleep"
+			return []byte(`{}`), nil
+		case "close":
+			if metadata["close_reason"] != "completed" {
+				t.Fatal("close ran before its requested reason was projected")
+			}
+			if got := strings.Join(args, " "); got != "close --force --json --reason completed bd-42" {
+				t.Fatalf("close = %q", got)
+			}
+			closeCalls++
+			closed = true
+			return []byte(`{}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected bd command: %q", args)
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Tx("close with controller update", func(tx beads.Tx) error {
+		if err := tx.SetMetadataBatch("bd-42", map[string]string{"close_reason": "completed"}); err != nil {
+			return err
+		}
+		return tx.Close("bd-42")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if updateCalls != 2 || closeCalls != 1 || !closed || metadata["state"] != "asleep" {
+		t.Fatalf("updates=%d closes=%d closed=%v state=%q", updateCalls, closeCalls, closed, metadata["state"])
+	}
+}
+
+func TestBdStoreTxCloseRequiresTouchedProjection(t *testing.T) {
+	empty := ""
+	for _, tc := range []struct {
+		name string
+		opts beads.UpdateOpts
+	}{
+		{"metadata", beads.UpdateOpts{Metadata: map[string]string{"close_reason": "completed"}}},
+		{"cleared description", beads.UpdateOpts{Description: &empty}},
+		{"added label", beads.UpdateOpts{Labels: []string{"requested"}}},
+		{"removed label", beads.UpdateOpts{RemoveLabels: []string{"existing"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closeCalls := 0
+			runner := func(_, _ string, args ...string) ([]byte, error) {
+				switch args[0] {
+				case "show":
+					return []byte(`[{"id":"bd-42","title":"before","status":"open","issue_type":"task","description":"retained","metadata":{"close_reason":"old"},"labels":["existing"]}]`), nil
+				case "update":
+					// A successful command whose requested value never appears
+					// must not authorize the irreversible close.
+					return []byte(`{}`), nil
+				case "close":
+					closeCalls++
+					return nil, errors.New("close must not run")
+				default:
+					return nil, fmt.Errorf("unexpected bd command: %q", args)
+				}
+			}
+			s := beads.NewBdStore("/city", runner)
+			err := s.Tx("missing projection", func(tx beads.Tx) error {
+				if err := tx.Update("bd-42", tc.opts); err != nil {
+					return err
+				}
+				return tx.Close("bd-42")
+			})
+			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "waiting for tx update projection") {
+				t.Fatalf("Tx error = %v, want projection deadline", err)
+			}
+			if closeCalls != 0 {
+				t.Fatalf("close calls = %d, want zero", closeCalls)
+			}
+		})
+	}
+}
+
+func TestBdStoreTxCloseRequiresFinalStatusProjection(t *testing.T) {
+	status := "open"
+	metadata := map[string]string{}
+	updateCalls, closeCalls := 0, 0
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "show":
+			return []byte(fmt.Sprintf(`[{"id":"bd-42","title":"before","status":%q,"issue_type":"task","metadata":%s}]`, status, mustJSON(t, metadata))), nil
+		case "update":
+			updateCalls++
+			metadata["close_reason"] = "completed"
+			if updateCalls == 2 {
+				if !strings.Contains(strings.Join(args, " "), "--status closed") {
+					t.Fatal("post-close update omitted the final status")
+				}
+				// Close's honesty read has seen closed, but the later full
+				// update reports success without preserving that status.
+				status = "open"
+			}
+			return []byte(`{}`), nil
+		case "close":
+			closeCalls++
+			status = "closed"
+			return []byte(`{}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected bd command: %q", args)
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Tx("lost final close projection", func(tx beads.Tx) error {
+		if err := tx.SetMetadataBatch("bd-42", map[string]string{"close_reason": "completed"}); err != nil {
+			return err
+		}
+		return tx.Close("bd-42")
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "waiting for tx update projection") {
+		t.Fatalf("Tx error = %v, want final-status projection deadline", err)
+	}
+	if closeCalls != 1 || updateCalls != 2 {
+		t.Fatalf("updates=%d closes=%d, want both writes and one close", updateCalls, closeCalls)
+	}
+}
+
 func TestBdStoreTxCloseOnlyUsesCloseCommand(t *testing.T) {
 	var commands []string
 	var closed bool
