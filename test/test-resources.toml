@@ -490,7 +490,7 @@ owner = "TestProviderPluginNodeSuite"
 resources = ["subprocess"]
 owner_bead = "ga-cp3hwi"
 invariant = "the embedded provider-plugin behavior proof is a checked Medium subprocess owner"
-resource_owner = "the one node subprocess is confined to TestProviderPluginNodeSuite, which exists to run the embedded OpenCode and MiMo Code plugins under node against a GC_BIN fake gc: the plugins are JavaScript the provider loads, so only a real node run can prove the system-prompt shape and the once-per-turn drain they produce"
+resource_owner = "the one node subprocess is confined to TestProviderPluginNodeSuite, which exists to run the embedded OpenCode, MiMo Code, and Pi plugins under node against a GC_BIN fake gc: the plugins are JavaScript the provider loads, so only a real node run can prove the system-prompt shape and the once-per-turn drain they produce"
 migration_target = "P0.4b"
 expires = "2026-10-31"
 
