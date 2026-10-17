@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 
 	"github.com/gastownhall/gascity/internal/rollout/gate"
 )
@@ -54,6 +55,75 @@ var (
 	_ conditionalWritesModeCarrier     = (*CachingStore)(nil)
 	_ conditionalWriteCapabilityProber = (*CachingStore)(nil)
 )
+
+// GuardedMetadataBatchHandle preserves the cache's conditional-write eviction
+// and notifications without advertising a capability absent from its backing.
+func (c *CachingStore) GuardedMetadataBatchHandle() (GuardedMetadataBatchStore, bool) {
+	if _, ok := c.conditionalBacking().(GuardedMetadataBatchStore); !ok {
+		return nil, false
+	}
+	batch, ok := c.backing.(GuardedMetadataBatchStore)
+	if !ok {
+		return nil, false
+	}
+	return &cachingGuardedMetadataBatch{cache: c, backing: batch}, true
+}
+
+type cachingGuardedMetadataBatch struct {
+	cache   *CachingStore
+	backing GuardedMetadataBatchStore
+}
+
+func (h *cachingGuardedMetadataBatch) SnapshotMetadata(ids []string) ([]MetadataSnapshot, error) {
+	return h.backing.SnapshotMetadata(ids)
+}
+
+func (h *cachingGuardedMetadataBatch) ApplyGuardedMetadataBatch(request GuardedMetadataBatchRequest) ([]GuardedMetadataRowResult, error) {
+	closing := map[string]uint64{}
+	for _, row := range request.Rows {
+		if row.CloseReason != nil {
+			closing[row.ID] = h.cache.beginCloseIntent(row.ID)
+		}
+	}
+	results, err := h.backing.ApplyGuardedMetadataBatch(request)
+	if err != nil {
+		for _, row := range request.Rows {
+			if generation, ok := closing[row.ID]; ok {
+				h.cache.endCloseIntent(row.ID, generation)
+			}
+			h.cache.applyConditionalWriteFailure(row.ID, err)
+		}
+		return nil, err
+	}
+	for _, row := range results {
+		if !row.Changed {
+			if generation, ok := closing[row.ID]; ok {
+				h.cache.endCloseIntent(row.ID, generation)
+			}
+			continue
+		}
+		var ev conditionalEviction
+		eventType := "bead.updated"
+		announce := true
+		if generation, ok := closing[row.ID]; ok {
+			ev, announce = h.cache.evictForConditionalClose(row.ID, generation)
+			eventType = "bead.closed"
+		} else {
+			ev = h.cache.evictForConditionalWrite(row.ID)
+		}
+		fresh, refreshErr := h.cache.refetchAfterConditionalWrite(row.ID, ev, func(b Bead) bool {
+			return strconv.FormatInt(b.Revision, 10) == row.Revision
+		})
+		if refreshErr != nil {
+			h.cache.recordProblem("refresh bead after guarded metadata batch", fmt.Errorf("%s: %w", row.ID, refreshErr))
+			continue
+		}
+		if announce {
+			h.cache.notifyChange(ChangeLocal, eventType, fresh)
+		}
+	}
+	return results, nil
+}
 
 // cachingAtomicConditionalCloser preserves cache eviction and notification
 // while exposing the capability only for a backing that actually supports it.

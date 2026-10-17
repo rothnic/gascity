@@ -99,3 +99,12 @@ readback. Keep unknown/tokenless admission unstamped without changing the
 existing claim policy; control and closed work remain unstamped. The owning
 regressions are `TestHookClaim*Attempt*` and the session-store-fault claim control
 in `cmd/gc`.
+
+An unassigned workflow root's `gc.session_name` and eligible `gc.work_dir` are
+one stable fallback correlation to its first admitted claim. Set them in one
+original-revision atomic write before a verified session hook reports work;
+parallel steps and reconcile must preserve the winner. An explicitly assigned
+root's uniquely resolved session retains precedence. A failed result delivery
+may release a newly minted step claim, but must never reset the shared root's
+fallback. Step session/attempt stamps still describe that step's actual claim
+history. See `SESSION-WORK-007`.

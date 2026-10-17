@@ -2,11 +2,134 @@ package main
 
 import (
 	"io"
+	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
+
+// rootStampRaceStore lets both producers read the unstamped root before either
+// writes. The selected winner finishes before the losing producer continues.
+type rootStampRaceStore struct {
+	*beads.MemStore
+	mu       sync.Mutex
+	reads    int
+	readBoth chan struct{}
+	finish   chan struct{}
+	winner   string
+	stop     chan struct{}
+}
+
+func (s *rootStampRaceStore) Get(id string) (beads.Bead, error) {
+	row, err := s.MemStore.Get(id)
+	if id != "run-root" || err != nil {
+		return row, err
+	}
+	s.mu.Lock()
+	s.reads++
+	n := s.reads
+	if n == 2 {
+		close(s.readBoth)
+	}
+	s.mu.Unlock()
+	if n <= 2 {
+		select {
+		case <-s.readBoth:
+		case <-s.stop:
+		}
+	}
+	return row, nil
+}
+
+func (s *rootStampRaceStore) SetMetadataBatch(id string, patch map[string]string) error {
+	if id == "run-root" && patch[beadmeta.SessionNameMetadataKey] != s.winner {
+		select {
+		case <-s.finish:
+		case <-s.stop:
+		}
+	}
+	return s.MemStore.SetMetadataBatch(id, patch)
+}
+
+func (s *rootStampRaceStore) UpdateIfMatch(id string, revision int64, opts beads.UpdateOpts) error {
+	if id == "run-root" && opts.Metadata[beadmeta.SessionNameMetadataKey] != s.winner {
+		select {
+		case <-s.finish:
+		case <-s.stop:
+		}
+	}
+	return s.MemStore.UpdateIfMatch(id, revision, opts)
+}
+
+func TestStampRunRootFromStepParallelFallbackIsStable(t *testing.T) {
+	for _, first := range []string{"worker-a", "worker-b"} {
+		t.Run(first, func(t *testing.T) {
+			root := beads.Bead{ID: "run-root", Status: "in_progress", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}}
+			store := &rootStampRaceStore{
+				MemStore: beads.NewMemStoreFrom(0, []beads.Bead{root}, nil),
+				readBoth: make(chan struct{}), finish: make(chan struct{}), winner: first, stop: make(chan struct{}),
+			}
+			t.Cleanup(func() { close(store.stop) })
+			finished := make(chan string, 2)
+			for _, name := range []string{"worker-a", "worker-b"} {
+				go func() {
+					step := beads.Bead{
+						ID: "step-" + name, Status: "in_progress", Assignee: name,
+						Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID},
+					}
+					stampRunRootFromStep(gaConfig(), store, step, name, "/worktrees/"+name, true, nil, map[string]struct{}{}, io.Discard)
+					finished <- name
+				}()
+			}
+			select {
+			case got := <-finished:
+				if got != first {
+					t.Fatalf("first completed stamp = %q, want %q", got, first)
+				}
+			case <-time.After(hangBudget):
+				t.Fatal("first root stamp did not finish")
+			}
+			frozen, err := store.MemStore.Get(root.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(store.finish)
+			select {
+			case <-finished:
+			case <-time.After(hangBudget):
+				t.Fatal("losing root stamp did not finish")
+			}
+			current, err := store.MemStore.Get(root.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(current, frozen) {
+				t.Fatalf("losing parallel step changed the frozen root:\nbefore=%+v\nafter=%+v", frozen, current)
+			}
+			// A later controller pass must not turn the losing step into the
+			// root's fallback owner after either claimant starts reading it.
+			other := "worker-a"
+			if other == first {
+				other = "worker-b"
+			}
+			step := beads.Bead{
+				ID: "step-" + other, Status: "in_progress", Assignee: other,
+				Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID},
+			}
+			stampRunRootFromStep(gaConfig(), store, step, other, "/worktrees/"+other, true, nil, map[string]struct{}{}, io.Discard)
+			current, err = store.MemStore.Get(root.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(current, frozen) {
+				t.Fatalf("delayed reconcile changed the frozen root: before=%+v after=%+v", frozen, current)
+			}
+		})
+	}
+}
 
 // countingStore wraps a Store and counts SetMetadataBatch calls so a test can
 // assert the stamp is idempotent (no writes once the bead already carries the
@@ -19,6 +142,24 @@ type countingStore struct {
 func (c *countingStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	c.writes++
 	return c.Store.SetMetadataBatch(id, kvs)
+}
+
+type countingConditionalWriter struct {
+	beads.ConditionalWriter
+	store *countingStore
+}
+
+func (w *countingConditionalWriter) UpdateIfMatch(id string, revision int64, opts beads.UpdateOpts) error {
+	w.store.writes++
+	return w.ConditionalWriter.UpdateIfMatch(id, revision, opts)
+}
+
+func (c *countingStore) ConditionalWriterHandle() (beads.ConditionalWriter, bool) {
+	writer, ok := beads.ConditionalWriterForTarget(c.Store)
+	if !ok {
+		return nil, false
+	}
+	return &countingConditionalWriter{ConditionalWriter: writer, store: c}, true
 }
 
 func stampTestSession(name, workDir string) beads.Bead {

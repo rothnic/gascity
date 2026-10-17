@@ -273,6 +273,21 @@ For PRs that touch `internal/runtime/fingerprint.go`:
 | `v1` | 2026-04-27 | Initial introduction of the `vN:` prefix. Pre-existing unversioned hashes are silently rebaselined to `v1` on the first reconciler tick after upgrade. |
 | `v5` | 2026-07-01 | Operational/host-tooling scripts (`city-*.sh`, `update-*.sh`) excluded from the `.gc/scripts` probed CopyFiles content hash, so editing one no longer flips every agent's fingerprint into a fleet-wide drift. Existing hashes rebaseline silently on upgrade. (#3840) |
 
+## Workflow correlation
+
+Session-owned hook claims settle their workflow root's correlation before
+returning work. An unassigned root keeps the first admitted claim's fallback
+session name and eligible work directory; both are committed in one native
+revision-guarded write. Later parallel steps and reconciliation preserve that
+tuple. This changes the root from a moving active-step hint to a stable run
+correlation; it does not prove execution or completion. An assigned root's own
+uniquely resolved session still takes precedence, and each step retains its
+own durable session and attempt history. Existing work-directory ownership
+checks still apply. An undelivered claim can be released without clearing the
+root fallback. Reconciliation remains a best-effort backfill; a verified hook
+claim refuses an unsettled or uncertain root write rather than acknowledging
+work. Raw `gc bd --claim` retains its ownership-only behavior.
+
 ## Known Limitations
 
 - Provider capabilities differ: interactive attach, idle waiting, and pending

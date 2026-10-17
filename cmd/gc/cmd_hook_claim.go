@@ -256,6 +256,10 @@ type hookClaimOps struct {
 	// ReadWorkMeta is the post-stamp authoritative readback used only to
 	// establish the durable lifecycle-start emission point.
 	ReadWorkMeta func(context.Context, string, []string, string, string) (beads.Bead, error)
+	// PrepareRunRoot settles a verified session's root correlation before any
+	// lifecycle event or delivered result. Production composition supplies the
+	// selected work-store and relocated-class route; it must fail closed.
+	PrepareRunRoot func(context.Context, string, []string, beads.Bead) error
 	// ConfirmBlocked re-derives whether a bead is really blocked, from its live
 	// dependencies rather than bd's denormalized is_blocked projection (which
 	// production reads do not carry). Diagnostics-only: the demand/claim
@@ -1283,6 +1287,26 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	durable, stamped := stampHookClaimIdentity(bead, opts, ops, dir, stderr)
+	if ops.PrepareRunRoot != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		err := ops.PrepareRunRoot(ctx, dir, opts.Env, bead)
+		if err == nil {
+			err = ctx.Err()
+		}
+		cancel()
+		if err != nil {
+			cause := fmt.Sprintf("settling root correlation for %s: %v", bead.ID, err)
+			if minted {
+				return unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, cause, bead, opts, ops, dir, stderr)
+			}
+			fmt.Fprintf(stderr, "gc hook --claim: %s\n", cause) //nolint:errcheck
+			return 1
+		}
+	}
+	if minted && ops.claimLandingWindowSpent() {
+		cause := fmt.Sprintf("claim of %s outlived its claim window while settling root correlation", bead.ID)
+		return unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, bead, opts, ops, dir, stderr)
+	}
 	if stamped && hookClaimLifecycleCandidate(durable, opts) {
 		ops.EmitExecutionStepStarted(durable, dir, opts.Env, opts.Assignee)
 	}

@@ -7,11 +7,81 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 
 	beadslib "github.com/steveyegge/beads"
 	"github.com/steveyegge/beads/issueops"
 )
+
+func TestCachingStoreNativeGuardedMetadataBatchTuple(t *testing.T) {
+	scope := initServerScopeForMergeProof(t)
+	a := openNativeDoltStoreHandleForMergeProof(t, scope)
+	b := openNativeDoltStoreHandleForMergeProof(t, scope)
+	root, err := a.Create(Bead{Title: "shared workflow root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	cache := NewCachingStoreForTest(a, func(kind, id string, _ json.RawMessage) { events = append(events, kind+":"+id) })
+	if err := cache.Prime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	batch, ok := GuardedMetadataBatchFor(cache)
+	if !ok {
+		t.Fatal("native batch capability hidden by cache")
+	}
+	before, err := batch.SnapshotMetadata([]string{root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner := map[string]string{"gc.session_name": "first-worker", "gc.work_dir": "/first-worker"}
+	request := GuardedMetadataBatchRequest{Rows: []GuardedMetadataPatch{{ID: root.ID, ExpectedRevision: before[0].Revision, RequireChange: true, Set: winner}}}
+	if _, err := b.ApplyGuardedMetadataBatch(request); err != nil {
+		t.Fatal(err)
+	}
+	request.Rows[0].Set = map[string]string{"gc.session_name": "loser", "gc.work_dir": "/loser"}
+	if _, err := batch.ApplyGuardedMetadataBatch(request); !errors.Is(err, issueops.ErrVersionMismatch) {
+		t.Fatalf("stale native root tuple = %v, want version mismatch", err)
+	}
+	current, err := cache.Get(root.ID)
+	if err != nil || current.Metadata["gc.session_name"] != winner["gc.session_name"] || current.Metadata["gc.work_dir"] != winner["gc.work_dir"] || len(events) != 0 {
+		t.Fatalf("cache lost native winner or emitted refused write: root=%+v events=%v err=%v", current, events, err)
+	}
+	fresh, err := batch.SnapshotMetadata([]string{root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Rows[0].ExpectedRevision = fresh[0].Revision
+	request.Rows[0].Set = map[string]string{"test.payload": "next"}
+	committed, err := batch.ApplyGuardedMetadataBatch(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = cache.Get(root.ID)
+	if err != nil || len(committed) != 1 || strconv.FormatInt(current.Revision, 10) != committed[0].Revision || current.Metadata["test.payload"] != "next" || current.Metadata["gc.session_name"] != "first-worker" || !reflect.DeepEqual(events, []string{"bead.updated:" + root.ID}) {
+		t.Fatalf("cache did not install/emit exact guarded write: root=%+v committed=%+v events=%v err=%v", current, committed, events, err)
+	}
+	// The handle exposes the existing batch contract, including native close.
+	// Retain normal close notification ownership rather than inventing a second
+	// event or leaving its close intent live.
+	fresh, err = batch.SnapshotMetadata([]string{root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := "guarded cache proof complete"
+	request.Rows[0].ExpectedRevision = fresh[0].Revision
+	request.Rows[0].Set = map[string]string{"test.payload": "closed"}
+	request.Rows[0].CloseReason = &reason
+	request.CloseSession = "gc-cache-proof-session"
+	if _, err := batch.ApplyGuardedMetadataBatch(request); err != nil {
+		t.Fatal(err)
+	}
+	current, err = cache.Get(root.ID)
+	if err != nil || current.Status != "closed" || current.CloseReason != reason || !reflect.DeepEqual(events, []string{"bead.updated:" + root.ID, "bead.closed:" + root.ID}) {
+		t.Fatalf("cache native terminal forwarding: root=%+v events=%v err=%v", current, events, err)
+	}
+}
 
 // TestNativeGuardedMetadataBatchStaleWriterAgainstRealDolt owns the real
 // transaction boundary: a replacement's committed guard and payload exclude a

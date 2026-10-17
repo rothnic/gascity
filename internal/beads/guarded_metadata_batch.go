@@ -83,3 +83,20 @@ type GuardedMetadataBatchStore interface {
 	SnapshotMetadata(ids []string) ([]MetadataSnapshot, error)
 	ApplyGuardedMetadataBatch(GuardedMetadataBatchRequest) ([]GuardedMetadataRowResult, error)
 }
+
+// GuardedMetadataBatchFor follows the same declared wrapper targets as the
+// metadata-CAS capability. A cache returns its forwarding handle so conditional
+// writes retain cache eviction and event emission. No rollout policy or
+// unconditional fallback is applied by this capability lookup.
+func GuardedMetadataBatchFor(store Store) (GuardedMetadataBatchStore, bool) {
+	store = followConditionalWritesResolveTarget(store)
+	if batch, ok := store.(GuardedMetadataBatchStore); ok {
+		return batch, true
+	}
+	if provider, ok := store.(interface {
+		GuardedMetadataBatchHandle() (GuardedMetadataBatchStore, bool)
+	}); ok {
+		return provider.GuardedMetadataBatchHandle()
+	}
+	return nil, false
+}
