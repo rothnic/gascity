@@ -92,8 +92,8 @@ func TestStampRunSessionIdentityDoesNotManufactureWorktreeEvidence(t *testing.T)
 
 func TestStampRunSessionIdentityPropagatesToRunRoot(t *testing.T) {
 	// #2843: a worked in-progress STEP back-fills its workflow ROOT (which the
-	// dashboard's root-only snapshot reads). The root is a control-lane bead,
-	// never in_progress+assigned, so it is reached only via gc.root_bead_id.
+	// dashboard's root-only snapshot reads). An unassigned root is reached
+	// through its step's gc.root_bead_id.
 	const sn = "gascity-packs-polecat-gc-1"
 	const wd = "/home/ds/gascity-packs-worktrees/gascity-packs-polecat-1"
 	root := beads.Bead{ID: "gpk-root", Type: "molecule", Status: "in_progress", Metadata: map[string]string{"gc.kind": "workflow"}}
@@ -122,6 +122,117 @@ func TestStampRunSessionIdentityPropagatesToRunRoot(t *testing.T) {
 	stampRunSessionIdentity(gaConfig(), []beads.Bead{stamped}, []beads.Store{store}, sessions, io.Discard)
 	if store.writes != 0 {
 		t.Errorf("second pass wrote %d times, want 0 (step+root already stamped)", store.writes)
+	}
+}
+
+func TestStampRunSessionIdentityRootSessionPrecedence(t *testing.T) {
+	const (
+		rootName = "root-session"
+		stepName = "step-session"
+		stepDir  = "/worktrees/step"
+	)
+	rootSession := stampTestSession(rootName, "")
+	rootSession.Metadata["alias"] = "root-owner"
+	replacement := stampTestSession("replacement-session", "")
+	replacement.Metadata["alias"] = "replacement-owner"
+	duplicate := stampTestSession("duplicate-session", "")
+	duplicate.Metadata["alias"] = "root-owner"
+	closed := stampTestSession(rootName, "")
+	closed.Status = "closed"
+	unnamed := beads.Bead{ID: "unnamed-session", Type: "session", Status: "open"}
+
+	for _, tc := range []struct {
+		name, assignee, status, kind, wantName string
+		rootSessions                           []beads.Bead
+		includeRoot, otherStore                bool
+	}{
+		{"assigned workflow", "root-owner", "in_progress", "workflow", rootName, []beads.Bead{rootSession}, true, false},
+		{"assigned by session ID", rootSession.ID, "in_progress", "workflow", rootName, []beads.Bead{rootSession}, true, false},
+		{"unassigned workflow", "", "in_progress", "workflow", stepName, nil, true, false},
+		{"unknown root session", "unknown", "in_progress", "workflow", stepName, nil, true, false},
+		{"ambiguous root session", "root-owner", "in_progress", "workflow", stepName, []beads.Bead{rootSession, duplicate}, true, false},
+		{"closed root session", closed.ID, "in_progress", "workflow", stepName, []beads.Bead{closed}, true, false},
+		{"unnamed root session", unnamed.ID, "in_progress", "workflow", stepName, []beads.Bead{unnamed}, true, false},
+		{"unclaimed workflow", "root-owner", "open", "workflow", stepName, []beads.Bead{rootSession}, true, false},
+		{"ordinary root backfill", "root-owner", "in_progress", "", stepName, []beads.Bead{rootSession}, false, false},
+		{"same ID in another store", "", "in_progress", "workflow", stepName, []beads.Bead{rootSession}, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := beads.Bead{
+				ID: "run-root", Type: "task", Status: tc.status, Assignee: tc.assignee,
+				Metadata: map[string]string{"gc.kind": tc.kind},
+			}
+			step := beads.Bead{
+				ID: "run-step", Type: "task", Status: "in_progress", Assignee: stepName,
+				Metadata: map[string]string{"gc.root_bead_id": root.ID},
+			}
+			store := &countingStore{Store: beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)}
+			rootStore := store
+			if tc.otherStore {
+				// An assigned root with this ID in another store cannot own the
+				// root reached through the step's own store.
+				foreignRoot := beads.Bead{
+					ID: root.ID, Type: "task", Status: "in_progress", Assignee: "root-owner",
+					Metadata: map[string]string{"gc.kind": "workflow"},
+				}
+				rootStore = &countingStore{Store: beads.NewMemStoreFrom(0, []beads.Bead{foreignRoot}, nil)}
+			}
+			sessionRows := append([]beads.Bead{stampTestSession(stepName, stepDir), replacement}, tc.rootSessions...)
+			sessions := newSessionBeadSnapshot(sessionRows)
+
+			checkPasses := func(wantName string) {
+				t.Helper()
+				for pass, rootFirst := range []bool{true, false, true, false} {
+					// Collect once, as the reconciler does. Store reads clone the
+					// metadata so a write cannot silently refresh this snapshot.
+					gotStep, err := store.Get(step.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					work, stores := []beads.Bead{gotStep}, []beads.Store{store}
+					if tc.includeRoot {
+						gotRoot, err := rootStore.Get(root.ID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if rootFirst {
+							work, stores = []beads.Bead{gotRoot, gotStep}, []beads.Store{rootStore, store}
+						} else {
+							work, stores = []beads.Bead{gotStep, gotRoot}, []beads.Store{store, rootStore}
+						}
+					}
+					store.writes, rootStore.writes = 0, 0
+					stampRunSessionIdentity(gaConfig(), work, stores, sessions, io.Discard)
+					gotRoot, err := store.Get(root.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if gotRoot.Metadata["gc.session_name"] != wantName || gotRoot.Metadata["gc.work_dir"] != stepDir {
+						t.Errorf("pass %d root: session_name=%q work_dir=%q, want %q %q", pass,
+							gotRoot.Metadata["gc.session_name"], gotRoot.Metadata["gc.work_dir"], wantName, stepDir)
+					}
+					gotStep, err = store.Get(step.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if gotStep.Metadata["gc.session_name"] != stepName || gotStep.Metadata["gc.work_dir"] != stepDir {
+						t.Errorf("pass %d step: session_name=%q work_dir=%q, want %q %q", pass,
+							gotStep.Metadata["gc.session_name"], gotStep.Metadata["gc.work_dir"], stepName, stepDir)
+					}
+					if pass > 0 && (store.writes != 0 || rootStore.writes != 0) {
+						t.Errorf("steady pass %d wrote step store %d / root store %d times, want 0", pass, store.writes, rootStore.writes)
+					}
+				}
+			}
+			checkPasses(tc.wantName)
+			if tc.wantName == rootName {
+				assignee := "replacement-owner"
+				if err := store.Update(root.ID, beads.UpdateOpts{Assignee: &assignee}); err != nil {
+					t.Fatal(err)
+				}
+				checkPasses("replacement-session")
+			}
+		})
 	}
 }
 
@@ -321,7 +432,7 @@ func TestStampRunRootFromStepPreservesRootEvidenceAgainstPoolSlotCwd(t *testing.
 	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)
 	store := &countingStore{Store: mem}
 
-	stampRunRootFromStep(gaConfig(), store, step, sessionName, poolSlotSelf, true, map[string]struct{}{}, io.Discard)
+	stampRunRootFromStep(gaConfig(), store, step, sessionName, poolSlotSelf, true, nil, map[string]struct{}{}, io.Discard)
 
 	gotRoot, err := mem.Get("ga-root")
 	if err != nil {

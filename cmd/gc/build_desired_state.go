@@ -6029,12 +6029,10 @@ func stampRunSessionIdentity(cfg *config.City, workBeads []beads.Bead, workStore
 				fmt.Fprintf(stderr, "stampRunSessionIdentity: %s: %v\n", wb.ID, err) //nolint:errcheck
 			}
 		}
-		// Propagate to the run root. The molecule root (gc.kind=workflow) is a
-		// control-lane bead — never in_progress+assigned — so it is not in
-		// workBeads and route-time stamping skips it for pool agents. The
-		// dashboard's root-only snapshot reads the root's own metadata, so a
-		// worked step back-fills its root via gc.root_bead_id. (#2843)
-		stampRunRootFromStep(cfg, store, wb, sessionName, workDir, !sbInfo.PoolManaged, stampedRoots, stderr)
+		// Back-fill the root metadata used by the dashboard's root-only
+		// snapshot. A resolved active root assignment takes precedence for
+		// the session name; the step still supplies the work directory. (#2843)
+		stampRunRootFromStep(cfg, store, wb, sessionName, workDir, !sbInfo.PoolManaged, sessionByAssignee, stampedRoots, stderr)
 	}
 }
 
@@ -6052,11 +6050,13 @@ func workDirStampHasOwnershipEvidence(metadata map[string]string, workDir string
 }
 
 // stampRunRootFromStep copies a step's resolved session_name/work_dir onto its
-// workflow root (gc.root_bead_id), once per root per pass. Idempotent: it reads
-// the root and writes only the keys that differ. Best-effort — a root that is
+// workflow root (gc.root_bead_id), once per root per pass. An in-progress
+// workflow root's uniquely resolved session name takes precedence over the
+// step's name. Idempotent: it reads the root and writes only the keys that
+// differ. Best-effort — a root that is
 // in another store, already gone, or already stamped is silently skipped (a
 // cross-store root gets stamped on its own store's reconcile pass).
-func stampRunRootFromStep(cfg *config.City, store beads.Store, step beads.Bead, sessionName, workDir string, allowUnownedWorkDir bool, stampedRoots map[string]struct{}, stderr io.Writer) {
+func stampRunRootFromStep(cfg *config.City, store beads.Store, step beads.Bead, sessionName, workDir string, allowUnownedWorkDir bool, sessionByAssignee map[string]sessionAssigneeMatch, stampedRoots map[string]struct{}, stderr io.Writer) {
 	rootID := strings.TrimSpace(step.Metadata[beadmeta.RootBeadIDMetadataKey])
 	if rootID == "" || rootID == step.ID {
 		return
@@ -6071,6 +6071,13 @@ func stampRunRootFromStep(cfg *config.City, store beads.Store, step beads.Bead, 
 		return
 	}
 	stampedRoots[rootID] = struct{}{}
+	if root.Status == "in_progress" && strings.TrimSpace(root.Metadata[beadmeta.KindMetadataKey]) == beadmeta.KindWorkflow {
+		if match, ok := sessionByAssignee[strings.TrimSpace(root.Assignee)]; ok && !match.ambiguous {
+			if rootName := sessionBeadIdentifierInfo(match.info); rootName != "" {
+				sessionName = rootName
+			}
+		}
+	}
 	patch := map[string]string{}
 	if sessionName != "" && strings.TrimSpace(root.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 		patch[beadmeta.SessionNameMetadataKey] = sessionName
