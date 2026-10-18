@@ -234,8 +234,8 @@ func (f clobberedRunFixture) workDir(t *testing.T) string {
 }
 
 // writeLogStore logs every write, in order, into a log shared by several
-// stores. Embedding the Store interface hides the inner store's optional
-// capabilities, so every write passes through the methods below.
+// stores. Optional conditional writes use a logging handle so revision-fenced
+// root stamps retain the backing store's capability and stay in the write log.
 type writeLogStore struct {
 	beads.Store
 	log *writeLog
@@ -269,6 +269,24 @@ func (s writeLogStore) SetMetadata(id, key, value string) error {
 func (s writeLogStore) SetMetadataBatch(id string, kvs map[string]string) error {
 	s.log.add("SetMetadataBatch %s %s", id, sortedKVs(kvs))
 	return s.Store.SetMetadataBatch(id, kvs)
+}
+
+type writeLogConditionalWriter struct {
+	beads.ConditionalWriter
+	log *writeLog
+}
+
+func (w writeLogConditionalWriter) UpdateIfMatch(id string, revision int64, opts beads.UpdateOpts) error {
+	w.log.add("UpdateIfMatch %s %s", id, sortedKVs(opts.Metadata))
+	return w.ConditionalWriter.UpdateIfMatch(id, revision, opts)
+}
+
+func (s writeLogStore) ConditionalWriterHandle() (beads.ConditionalWriter, bool) {
+	writer, ok := beads.ConditionalWriterForTarget(s.Store)
+	if !ok {
+		return nil, false
+	}
+	return writeLogConditionalWriter{ConditionalWriter: writer, log: s.log}, true
 }
 
 func (s writeLogStore) Update(id string, opts beads.UpdateOpts) error {
@@ -382,7 +400,7 @@ func TestBackstopDemandRepairsWriteLogGoldenInLegacyOrder(t *testing.T) {
 		"SetMetadataBatch ga-run " + beadmeta.WorkDirMetadataKey + "=" + clobberStaleLegacy,
 		"SetMetadataBatch ga-run gc.session_name=" + clobberSessionName + " " + beadmeta.WorkDirMetadataKey + "=" + clobberLiveWorkDir,
 		"SetMetadataBatch ga-step gc.session_name=" + goldenStepSession + " " + beadmeta.WorkDirMetadataKey + "=" + goldenStepWorkDir,
-		"SetMetadataBatch ga-root gc.session_name=" + goldenStepSession + " " + beadmeta.WorkDirMetadataKey + "=" + goldenStepWorkDir,
+		"UpdateIfMatch ga-root gc.session_name=" + goldenStepSession + " " + beadmeta.WorkDirMetadataKey + "=" + goldenStepWorkDir,
 		"Update ga-asg assignee=" + goldenCanonicalPlanner + " " + beadmeta.RoutedToMetadataKey + "=" + goldenCanonicalPlanner,
 		"SetMetadataBatch ga-rclob " + beadmeta.WorkDirMetadataKey + "=" + clobberStaleLegacy,
 		"Update ga-rlegacy assignee=- " + beadmeta.RoutedToMetadataKey + "=" + goldenCanonicalPlanner,
