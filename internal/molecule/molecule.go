@@ -910,6 +910,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 	var createdIDs []string
 	embeddedDeps := make(map[string]bool)
 	pendingAssignees := make(map[string]string)
+	pendingLogicalRefs := make(map[string]string)
 	graphWorkflow := preservesGraphActionTypes(recipe)
 	fenceGraphWorkflow := graphWorkflow && !opts.DeferAssignees
 	externalDepsByStep, err := groupExternalDeps(opts.ExternalDeps)
@@ -1034,6 +1035,8 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 						b.Metadata = make(map[string]string, 1)
 					}
 					b.Metadata[beadmeta.LogicalBeadIDMetadataKey] = logicalBeadID
+				} else {
+					pendingLogicalRefs[step.ID] = logicalStepID
 				}
 			}
 
@@ -1080,6 +1083,16 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 		createdParentByStep[step.ID] = created.ParentID
 		createdIDs = append(createdIDs, created.ID)
 
+	}
+
+	// Resolve forward lineage references before any graph step is activated.
+	for stepID, logicalStepID := range pendingLogicalRefs {
+		if logicalBeadID := idMapping[logicalStepID]; logicalBeadID != "" {
+			if err := store.SetMetadataBatch(idMapping[stepID], map[string]string{beadmeta.LogicalBeadIDMetadataKey: logicalBeadID}); err != nil {
+				markFailed(store, createdIDs)
+				return nil, fmt.Errorf("linking logical bead for step %q: %w", stepID, err)
+			}
+		}
 	}
 
 	// Wire dependencies using the IDMapping.
@@ -1212,6 +1225,7 @@ func InstantiateFragment(ctx context.Context, store beads.Store, recipe *formula
 	createdParentByStep := make(map[string]string, len(recipe.Steps))
 	embeddedDeps := make(map[string]bool)
 	pendingAssignees := make(map[string]string)
+	pendingLogicalRefs := make(map[string]string)
 	existingLogicalBeadIDs, err := existingLogicalBeadIDIndex(store, opts.RootID)
 	if err != nil {
 		return nil, fmt.Errorf("indexing existing logical beads: %w", err)
@@ -1284,6 +1298,9 @@ func InstantiateFragment(ctx context.Context, store beads.Store, recipe *formula
 				b.Metadata[beadmeta.LogicalBeadIDMetadataKey] = logicalBeadID
 			} else if logicalBeadID := existingLogicalBeadIDs[logicalStepID]; logicalBeadID != "" {
 				b.Metadata[beadmeta.LogicalBeadIDMetadataKey] = logicalBeadID
+			} else {
+				pendingLogicalRefs[step.ID] = logicalStepID
+				hasFutureBlocker = true
 			}
 		}
 
@@ -1317,6 +1334,15 @@ func InstantiateFragment(ctx context.Context, store beads.Store, recipe *formula
 		idMapping[step.ID] = created.ID
 		createdParentByStep[step.ID] = created.ParentID
 		createdIDs = append(createdIDs, created.ID)
+	}
+
+	for stepID, logicalStepID := range pendingLogicalRefs {
+		if logicalBeadID := idMapping[logicalStepID]; logicalBeadID != "" {
+			if err := store.SetMetadataBatch(idMapping[stepID], map[string]string{beadmeta.LogicalBeadIDMetadataKey: logicalBeadID}); err != nil {
+				markFailed(store, createdIDs)
+				return nil, fmt.Errorf("linking fragment logical bead for step %q: %w", stepID, err)
+			}
+		}
 	}
 
 	for _, dep := range recipe.Deps {

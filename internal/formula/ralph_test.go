@@ -820,3 +820,47 @@ func TestApplyRalph_NamespacesNestedControlForAcrossBody(t *testing.T) {
 		t.Fatalf("nested attempt gc.control_for = %q, want %q (must equal inner control gc.step_ref)", got, wantCF)
 	}
 }
+
+func TestApplyRalph_NestedLoopKeepsNearestScope(t *testing.T) {
+	inner := &Step{
+		ID: "inner", Title: "Inner", Ralph: &RalphSpec{MaxAttempts: 2, Check: &RalphCheckSpec{Mode: "exec", Path: "inner.sh"}},
+		Children: []*Step{{ID: "work", Title: "Work"}},
+	}
+	expanded, err := ApplyRalph([]*Step{{
+		ID: "outer", Title: "Outer", Ralph: &RalphSpec{MaxAttempts: 2, Check: &RalphCheckSpec{Mode: "exec", Path: "outer.sh"}},
+		Children: []*Step{inner},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]*Step)
+	for _, step := range expanded {
+		byID[step.ID] = step
+	}
+	controlRef := "outer.iteration.1.inner"
+	bodyRef := controlRef + ".iteration.1"
+	for _, id := range []string{bodyRef, bodyRef + ".work"} {
+		step := byID[id]
+		if step == nil {
+			t.Fatalf("missing %s", id)
+		}
+		for key, want := range map[string]string{
+			beadmeta.RalphStepIDMetadataKey: "inner",
+			beadmeta.AttemptMetadataKey:     "1",
+			beadmeta.IterationMetadataKey:   "1",
+		} {
+			if got := step.Metadata[key]; got != want {
+				t.Errorf("%s %s = %q, want %q", id, key, got, want)
+			}
+		}
+	}
+	if got := byID[bodyRef].Metadata[beadmeta.ControlForMetadataKey]; got != controlRef {
+		t.Errorf("inner body control_for = %q, want %q", got, controlRef)
+	}
+	if got := byID[bodyRef+".work"].Metadata[beadmeta.ScopeRefMetadataKey]; got != bodyRef {
+		t.Errorf("inner member scope_ref = %q, want %q", got, bodyRef)
+	}
+	if got := byID[controlRef].Metadata[beadmeta.ScopeRefMetadataKey]; got != "outer.iteration.1" {
+		t.Errorf("inner control scope_ref = %q, want outer body", got)
+	}
+}

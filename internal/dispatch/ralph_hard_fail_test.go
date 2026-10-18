@@ -29,16 +29,16 @@ import (
 // scope body whose MEMBER carries the hard failure. Production shows two such
 // shapes, and both are exercised:
 //
-//   - linked: graph-apply instantiation links a compile-time retry attempt to
+//   - linked: instantiation links a compile-time retry attempt to
 //     its control (gc.logical_bead_id), so the retry control closes hard and
 //     aborts the iteration (gascity#7084 iteration 1);
-//   - unlinked: the attempt carries no link, aborts the iteration through its
+//   - legacy-unlinked: the attempt carries no link, aborts the iteration through its
 //     own scope-check, and its retry control closes skipped (every
 //     runtime-spawned iteration in gascity#7036, #7049 and #7084).
 //
-// The MemStore cooks through the sequential instantiation path, which yields
-// the unlinked shape (the attempt is created before its control);
-// linkCompileTimeRetryAttempts writes the link graph apply would have.
+// Current instantiation resolves forward control references. The fixture keeps
+// those links for the linked shape and clears only retry-attempt links to
+// exercise the legacy-unlinked shape.
 
 const ralphHardFailCheckScript = ".gc/scripts/review-check.sh"
 
@@ -105,11 +105,9 @@ path = "` + ralphHardFailCheckScript + `"
 timeout = "30s"
 `
 
-// linkCompileTimeRetryAttempts gives each compile-time retry attempt the link
-// to its retry control that graph-apply instantiation writes through a metadata
-// reference: gc.logical_bead_id names the control whose gc.step_ref the
-// attempt's gc.control_for carries.
-func linkCompileTimeRetryAttempts(t *testing.T, store beads.Store, rootID string) {
+// setCompileTimeRetryShape validates each retry attempt's owning control and
+// retains or clears its logical link for the requested fixture shape.
+func setCompileTimeRetryShape(t *testing.T, store beads.Store, rootID string, shape ralphFixtureShape) {
 	t.Helper()
 	members, err := beads.DirectMembers(store, rootID)
 	if err != nil {
@@ -121,21 +119,27 @@ func linkCompileTimeRetryAttempts(t *testing.T, store beads.Store, rootID string
 			controlByRef[b.Metadata[beadmeta.StepRefMetadataKey]] = b.ID
 		}
 	}
-	linked := 0
+	attempts := 0
 	for _, b := range members {
-		if b.Metadata[beadmeta.RetryAttemptMetadataKey] == "" || b.Metadata[beadmeta.LogicalBeadIDMetadataKey] != "" {
+		if b.Metadata[beadmeta.RetryAttemptMetadataKey] == "" {
 			continue
 		}
 		controlID, ok := controlByRef[b.Metadata[beadmeta.ControlForMetadataKey]]
 		if !ok {
-			continue
+			t.Fatalf("retry attempt %s has no owning retry control: %v", b.ID, b.Metadata)
 		}
-		if err := store.SetMetadata(b.ID, beadmeta.LogicalBeadIDMetadataKey, controlID); err != nil {
-			t.Fatalf("linking attempt %s to %s: %v", b.ID, controlID, err)
+		current := b.Metadata[beadmeta.LogicalBeadIDMetadataKey]
+		if current != controlID {
+			t.Fatalf("retry attempt %s links to %q, want %q", b.ID, current, controlID)
 		}
-		linked++
+		if shape == shapeUnlinked {
+			if err := store.SetMetadata(b.ID, beadmeta.LogicalBeadIDMetadataKey, ""); err != nil {
+				t.Fatalf("clearing attempt %s logical link: %v", b.ID, err)
+			}
+		}
+		attempts++
 	}
-	if linked == 0 {
+	if shape == shapeLinked && attempts == 0 {
 		t.Fatal("linked shape requested but the molecule has no compile-time retry attempt")
 	}
 }
@@ -230,9 +234,7 @@ func buildCompiledRalphFixture(t *testing.T, wrap func(beads.Store) beads.Store,
 		t.Fatalf("Cook: %v", err)
 	}
 	rootID := cooked.RootID
-	if shape == shapeLinked {
-		linkCompileTimeRetryAttempts(t, ledger, rootID)
-	}
+	setCompileTimeRetryShape(t, ledger, rootID, shape)
 	work := func(t *testing.T) bool {
 		open, err := ledger.ListOpen()
 		if err != nil {
@@ -552,4 +554,158 @@ func TestCrashInjectionCompiledRalphHardFail(t *testing.T) {
 			requireRalphHardFailed(t, ledger, "implement", 1, "external_live_head_changed")
 		},
 	})
+}
+
+// TestCompiledRalphRecoveredChildFinalizesWorkflow keeps the compiler's physical
+// ownership links while replaying a classless review failure and later recovery.
+func TestCompiledRalphRecoveredChildFinalizesWorkflow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		dottedLoop bool
+	}{
+		{name: "recorded_review_recovery"},
+		{name: "distinct_dotted_loop_ids", dottedLoop: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bodyNeeds := `["loop"]`
+			if tc.dottedLoop {
+				bodyNeeds = `["loop", "review.loop"]`
+			}
+			formulaText := fmt.Sprintf(`formula = "recovered-review-finalize"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "body"
+title = "Workflow body"
+needs = %s
+metadata = { "gc.kind" = "scope", "gc.scope_role" = "body", "gc.scope_name" = "worktree" }
+
+[[steps]]
+id = "loop"
+title = "Review and repair"
+metadata = { "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+
+[steps.ralph]
+max_attempts = 3
+
+[steps.ralph.check]
+mode = "exec"
+path = "`+ralphHardFailCheckScript+`"
+timeout = "30s"
+
+[[steps.children]]
+id = "review"
+title = "Review"
+
+[[steps.children]]
+id = "apply-fixes"
+title = "Apply fixes"
+needs = ["review"]
+`, bodyNeeds)
+			if tc.dottedLoop {
+				formulaText += `
+[[steps]]
+id = "review.loop"
+title = "Independent review"
+metadata = { "gc.scope_ref" = "body", "gc.scope_role" = "member", "gc.on_fail" = "abort_scope" }
+
+[steps.ralph]
+max_attempts = 3
+
+[steps.ralph.check]
+mode = "exec"
+path = "` + ralphHardFailCheckScript + `"
+timeout = "30s"
+
+[[steps.children]]
+id = "other-review"
+title = "Independent reviewer"
+`
+			}
+			city := newCompiledRalphCity(t, "recovered-review-finalize", formulaText, 2)
+			// This formula has no retry attempts. All body and
+			// logical identity below comes from Cook/Attach, never fixture repair.
+			fx := buildCompiledRalphFixture(t, identityStore, city, shapeUnlinked, func(step string, iteration int) map[string]string {
+				if step == "review" && iteration == 1 {
+					return map[string]string{
+						beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+						beadmeta.FailureReasonMetadataKey: "review_requested_changes",
+					}
+				}
+				return workerPass
+			})
+			serveCompiledRalph(t, fx)
+			members, err := beads.DirectMembers(fx.store, fx.rootID)
+			if err != nil {
+				t.Fatalf("read compiled members: %v", err)
+			}
+			// Use actual stored IDs: snapshotLedger canonicalizes ID references.
+			get := func(kind, step, iteration string) beads.Bead {
+				t.Helper()
+				var matches []beads.Bead
+				for _, bead := range members {
+					if step != "" && bead.Metadata[beadmeta.StepIDMetadataKey] != step {
+						continue
+					}
+					if iteration != "" && bead.Metadata[beadmeta.IterationMetadataKey] != iteration {
+						continue
+					}
+					if kind != "" && bead.Metadata[beadmeta.KindMetadataKey] != kind {
+						continue
+					}
+					if kind == "" && beadmeta.IsControlKind(bead.Metadata[beadmeta.KindMetadataKey]) {
+						continue
+					}
+					matches = append(matches, bead)
+				}
+				if len(matches) != 1 {
+					t.Fatalf("compiled kind=%q step=%q iteration=%q: got %d beads, want one", kind, step, iteration, len(matches))
+				}
+				return matches[0]
+			}
+			wantOutcome := func(bead beads.Bead, want string) {
+				t.Helper()
+				if bead.Status != "closed" || bead.Metadata[beadmeta.OutcomeMetadataKey] != want {
+					t.Errorf("%s (%s) status=%s outcome=%q, want closed/%s", bead.ID, bead.Metadata[beadmeta.StepRefMetadataKey], bead.Status, bead.Metadata[beadmeta.OutcomeMetadataKey], want)
+				}
+			}
+			loops := []string{"loop"}
+			if tc.dottedLoop {
+				loops = append(loops, "review.loop")
+			}
+			for _, loop := range loops {
+				control := get(beadmeta.KindRalph, loop, "")
+				first := get(beadmeta.KindScope, loop, "1")
+				second := get(beadmeta.KindScope, loop, "2")
+				for _, body := range []beads.Bead{first, second} {
+					if body.Metadata[beadmeta.RootBeadIDMetadataKey] != fx.rootID {
+						t.Fatalf("compiled body %s belongs to another root: %v", body.ID, body.Metadata)
+					}
+				}
+				if first.Metadata[beadmeta.LogicalBeadIDMetadataKey] != control.ID || second.Metadata[beadmeta.LogicalBeadIDMetadataKey] != control.ID {
+					t.Fatalf("compiled loop %q lost its owning control identity %q: first=%v second=%v", loop, control.ID, first.Metadata, second.Metadata)
+				}
+				if first.Metadata[beadmeta.ControlForMetadataKey] != loop || second.Metadata[beadmeta.ControlForMetadataKey] != control.ID {
+					t.Fatalf("compiled loop %q lineage first=%q second=%q, want %q and %q", loop, first.Metadata[beadmeta.ControlForMetadataKey], second.Metadata[beadmeta.ControlForMetadataKey], loop, control.ID)
+				}
+				wantOutcome(control, beadmeta.OutcomePass)
+				wantOutcome(second, beadmeta.OutcomePass)
+			}
+			failed := get("", "review", "1")
+			first := get(beadmeta.KindScope, "loop", "1")
+			if failed.Metadata[beadmeta.LogicalBeadIDMetadataKey] != "" || failed.Metadata[beadmeta.FailureClassMetadataKey] != "" {
+				t.Fatalf("plain failed review gained logical identity or a failure class: %v", failed.Metadata)
+			}
+			if failed.Metadata[beadmeta.RalphStepIDMetadataKey] != "loop" || failed.Metadata[beadmeta.AttemptMetadataKey] != "1" || !matchesScopeRef(first, failed.Metadata[beadmeta.ScopeRefMetadataKey]) {
+				t.Fatalf("compiled failed child lost its first-iteration owner: %v", failed.Metadata)
+			}
+			wantOutcome(failed, beadmeta.OutcomeFail)
+			wantOutcome(first, beadmeta.OutcomeFail)
+			wantOutcome(get("", "apply-fixes", "1"), beadmeta.OutcomeSkipped)
+			wantOutcome(get("workflow-finalize", "", ""), beadmeta.OutcomePass)
+			wantOutcome(mustGetBead(t, fx.store, fx.rootID), beadmeta.OutcomePass)
+		})
+	}
 }

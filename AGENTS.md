@@ -27,6 +27,7 @@ next to that code; read the matching file before changing it.
 | `internal/api/`, `internal/events/`, `internal/extmsg/`, CLI code that constructs events or calls the API client, the OpenAPI spec, or the dashboard | `internal/api/AGENTS.md` |
 | `internal/config/` (agent or rig config fields) | `internal/config/AGENTS.md` |
 | Source-workflow prerequisite readiness in sling or formula cook | `internal/sourceworkflow/AGENTS.md` |
+| Scope-body identity or nested Ralph lineage in `internal/dispatch/`, `internal/molecule/`, or `internal/formula/` | `internal/dispatch/AGENTS.md` |
 | `internal/session/` | `internal/session/AGENTS.md` |
 | `internal/sessionlog/` | `internal/sessionlog/AGENTS.md` |
 | `internal/runtime/acp/` | `internal/runtime/acp/AGENTS.md` |

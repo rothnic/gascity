@@ -2266,6 +2266,204 @@ func TestProcessScopeCheckRetryAttemptPassPropagatesMemberMetadata(t *testing.T)
 	}
 }
 
+func TestResolveScopeBodyUsesUnambiguousStepRef(t *testing.T) {
+	t.Parallel()
+
+	scope := func(id, ref, role, status string) beads.Bead {
+		return beads.Bead{
+			ID: id, Title: id, Status: status,
+			Metadata: map[string]string{
+				beadmeta.RootBeadIDMetadataKey: "workflow",
+				beadmeta.KindMetadataKey:       beadmeta.KindScope,
+				beadmeta.StepRefMetadataKey:    ref,
+				beadmeta.ScopeRoleMetadataKey:  role,
+			},
+		}
+	}
+	foreign := scope("foreign", "loop.iteration.1", "body", "open")
+	foreign.Metadata[beadmeta.RootBeadIDMetadataKey] = "other-workflow"
+	control := scope("control", "loop.iteration.1", "body", "open")
+	control.Metadata[beadmeta.KindMetadataKey] = beadmeta.KindScopeCheck
+	tests := []struct {
+		name          string
+		members       []beads.Bead
+		wantID        string
+		wantMalformed bool
+	}{
+		{
+			name: "exact before dotted suffix",
+			members: []beads.Bead{
+				scope("alias", "review.loop.iteration.1", "body", "open"),
+				scope("exact", "loop.iteration.1", "body", "open"),
+			},
+			wantID: "exact",
+		},
+		{
+			name: "closed exact before open suffix",
+			members: []beads.Bead{
+				scope("alias", "review.loop.iteration.1", "body", "open"),
+				scope("exact", "loop.iteration.1", "body", "closed"),
+			},
+			wantID: "exact",
+		},
+		{
+			name:    "unique namespaced body",
+			members: []beads.Bead{scope("body", "formula.loop.iteration.1", "body", "open")},
+			wantID:  "body",
+		},
+		{
+			name: "legacy body excludes other roles roots and kinds",
+			members: []beads.Bead{
+				scope("member", "loop.iteration.1", "member", "open"),
+				foreign, control,
+				scope("body", "formula.loop.iteration.1", "", "open"),
+			},
+			wantID: "body",
+		},
+		{
+			name: "ambiguous suffixes",
+			members: []beads.Bead{
+				scope("first", "first.loop.iteration.1", "body", "open"),
+				scope("second", "second.loop.iteration.1", "body", "closed"),
+			},
+			wantMalformed: true,
+		},
+		{
+			name: "duplicate exact refs",
+			members: []beads.Bead{
+				scope("first", "loop.iteration.1", "body", "closed"),
+				scope("second", "loop.iteration.1", "body", "open"),
+			},
+			wantMalformed: true,
+		},
+	}
+	for _, tc := range tests {
+		for _, cached := range []bool{false, true} {
+			for _, reversed := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/cached=%t/reversed=%t", tc.name, cached, reversed), func(t *testing.T) {
+					ordered := slices.Clone(tc.members)
+					if reversed {
+						slices.Reverse(ordered)
+					}
+					members := append([]beads.Bead{{
+						ID: "workflow", Status: "open",
+						Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
+					}}, ordered...)
+					store := beads.NewMemStoreFrom(0, members, nil)
+					opts := ProcessOptions{}
+					if cached {
+						opts.view = &rootView{rootID: "workflow", loaded: true, root: members}
+					}
+					got, err := resolveScopeBody(store, "workflow", "loop.iteration.1", "check", opts)
+					if tc.wantMalformed {
+						if !errors.Is(err, ErrControlGraphMalformed) {
+							t.Fatalf("resolveScopeBody = %q, %v, want malformed graph", got.ID, err)
+						}
+						return
+					}
+					if err != nil || got.ID != tc.wantID {
+						t.Fatalf("resolveScopeBody = %q, %v, want %q", got.ID, err, tc.wantID)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestResolveScopeBodySeparatesIdentityFromMembership(t *testing.T) {
+	t.Parallel()
+
+	scope := func(id, stepRef, enclosingRef, status string) beads.Bead {
+		metadata := map[string]string{
+			beadmeta.RootBeadIDMetadataKey: "workflow",
+			beadmeta.KindMetadataKey:       beadmeta.KindScope,
+			beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleBody,
+		}
+		if stepRef != "" {
+			metadata[beadmeta.StepRefMetadataKey] = stepRef
+		}
+		if enclosingRef != "" {
+			metadata[beadmeta.ScopeRefMetadataKey] = enclosingRef
+		}
+		return beads.Bead{ID: id, Status: status, Metadata: metadata}
+	}
+	for _, status := range []string{"open", "closed"} {
+		innerStatus := "closed"
+		if status == "closed" {
+			innerStatus = "open"
+		}
+		outer := scope("outer", "formula.body", "", status)
+		inner := scope("inner", "formula.loop.iteration.2", "body", innerStatus)
+		legacy := scope("legacy", "", "body", status)
+		for _, tc := range []struct {
+			name        string
+			members     []beads.Bead
+			scopeRef    string
+			wantID      string
+			wantMissing bool
+		}{
+			{name: "outer body", members: []beads.Bead{inner, outer}, scopeRef: "body", wantID: "outer"},
+			{name: "inner own ref", members: []beads.Bead{outer, inner}, scopeRef: "formula.loop.iteration.2", wantID: "inner"},
+			{name: "inner membership alone", members: []beads.Bead{inner}, scopeRef: "body", wantMissing: true},
+			{name: "legacy without step ref", members: []beads.Bead{inner, legacy}, scopeRef: "body", wantID: "legacy"},
+		} {
+			for _, cached := range []bool{false, true} {
+				for _, reversed := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/status=%s/cached=%t/reversed=%t", tc.name, status, cached, reversed), func(t *testing.T) {
+						members := slices.Clone(tc.members)
+						if reversed {
+							slices.Reverse(members)
+						}
+						var got beads.Bead
+						var err error
+						if cached {
+							got, err = resolveScopeBodyFromMembers(members, "workflow", tc.scopeRef)
+						} else {
+							got, err = resolveScopeBodyOnce(beads.NewMemStoreFrom(0, members, nil), "workflow", tc.scopeRef)
+						}
+						if tc.wantMissing {
+							if got.ID != "" || !errors.Is(err, errScopeBodyMissing) {
+								t.Fatalf("resolveScopeBody = %q, %v, want missing body", got.ID, err)
+							}
+							return
+						}
+						if err != nil || got.ID != tc.wantID {
+							t.Fatalf("resolveScopeBody = %q, %v, want %q", got.ID, err, tc.wantID)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestResolveScopeBodyRejectsEmptyRef(t *testing.T) {
+	t.Parallel()
+
+	members := []beads.Bead{{
+		ID: "body", Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RootBeadIDMetadataKey: "workflow",
+			beadmeta.KindMetadataKey:       beadmeta.KindScope,
+			beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleBody,
+		},
+	}}
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%t", cached), func(t *testing.T) {
+			var got beads.Bead
+			var err error
+			if cached {
+				got, err = resolveScopeBodyFromMembers(members, "workflow", "")
+			} else {
+				got, err = resolveScopeBodyOnce(beads.NewMemStoreFrom(0, members, nil), "workflow", "")
+			}
+			if got.ID != "" || !errors.Is(err, errScopeBodyMissing) {
+				t.Fatalf("empty scope ref resolved to %q, %v, want missing body", got.ID, err)
+			}
+		})
+	}
+}
+
 func TestProcessScopeCheckReturnsMalformedWhenScopeBodyMissing(t *testing.T) {
 	t.Parallel()
 
@@ -2905,11 +3103,11 @@ func TestProcessScopeCheckUsesSingleWorkflowSnapshotAndEmitsTrace(t *testing.T) 
 	if got := store.queries[0].Metadata["gc.kind"]; got != "scope" {
 		t.Fatalf("query[0] gc.kind = %q, want scope", got)
 	}
-	if got := store.queries[0].Metadata["gc.scope_role"]; got != "body" {
-		t.Fatalf("query[0] gc.scope_role = %q, want body", got)
+	if len(store.queries[0].Metadata) != 2 {
+		t.Fatalf("query[0] metadata = %v, want only workflow root and scope kind", store.queries[0].Metadata)
 	}
-	if store.queries[0].IncludeClosed {
-		t.Fatal("query[0] should be active-only body lookup")
+	if !store.queries[0].IncludeClosed {
+		t.Fatal("query[0] should include closed bodies before resolving aliases")
 	}
 	if got := store.queries[1].Metadata["gc.scope_ref"]; got != "body" {
 		t.Fatalf("query[1] gc.scope_ref = %q, want body", got)
@@ -3071,8 +3269,9 @@ func canResolveScopeBodyQuery(query beads.ListQuery, rootID string) bool {
 	if query.Metadata["gc.root_bead_id"] != rootID {
 		return false
 	}
-	if query.Metadata["gc.kind"] == "scope" && query.Metadata["gc.scope_role"] == "body" {
-		return true
+	if query.Metadata["gc.kind"] == "scope" {
+		role := query.Metadata["gc.scope_role"]
+		return role == "" || role == "body"
 	}
 	return len(query.Metadata) == 1
 }
@@ -3887,6 +4086,87 @@ func TestProcessWorkflowFinalizeIgnoresSupersededHardRetryDescendant(t *testing.
 	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "pass" {
 		t.Fatalf("workflow = status %q outcome %q, want closed/pass", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
 	}
+}
+
+// A native first-iteration scope links to its logical control, while its
+// plain children carry only their loop/scope identity and attempt counters.
+func TestProcessWorkflowFinalizeIgnoresRecoveredRalphIterationMember(t *testing.T) {
+	t.Parallel()
+	store, f := newFinalizeRecoveredIteration(t)
+	if isRetryAttemptSubject(f.failed) || !beadOutcomeFailed(f.failed) || !terminalAbortScopeFailure(f.failed) {
+		t.Fatal("plain failed child must retain its scope-evaluation failure authority")
+	}
+	result, err := ProcessControl(store, f.finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want workflow-pass after logical recovery", result)
+	}
+	root := mustGetBead(t, store, f.workflow.ID)
+	if root.Status != "closed" || root.Metadata["gc.outcome"] != "pass" {
+		t.Fatalf("workflow = %+v, want closed/pass", root)
+	}
+	for _, before := range []beads.Bead{f.failed, f.oldAttempt} {
+		after := mustGetBead(t, store, before.ID)
+		if after.Status != before.Status || after.Revision != before.Revision || len(after.Metadata) != len(before.Metadata) {
+			t.Fatalf("historical failure %s was rewritten: %+v", before.ID, after)
+		}
+		for key, value := range before.Metadata {
+			if after.Metadata[key] != value {
+				t.Fatalf("historical failure %s metadata %s = %q, want %q", before.ID, key, after.Metadata[key], value)
+			}
+		}
+	}
+}
+
+type finalizeRecoveredIteration struct {
+	workflow   beads.Bead
+	logical    beads.Bead
+	oldAttempt beads.Bead
+	newAttempt beads.Bead
+	failed     beads.Bead
+	finalizer  beads.Bead
+}
+
+func newFinalizeRecoveredIteration(t *testing.T) (*beads.MemStore, finalizeRecoveredIteration) {
+	t.Helper()
+	store := beads.NewMemStore()
+	var f finalizeRecoveredIteration
+	f.workflow = mustCreateWorkflowBead(t, store, beads.Bead{Title: "workflow", Metadata: map[string]string{
+		"gc.kind": "workflow", "gc.formula_contract": "graph.v2",
+	}})
+	f.logical = mustCreateWorkflowBead(t, store, beads.Bead{Title: "logical review", Status: "closed", Metadata: map[string]string{
+		"gc.root_bead_id": f.workflow.ID, "gc.kind": "ralph", "gc.outcome": "pass", "gc.on_fail": "abort_scope",
+		"gc.step_id": "plan-review", "gc.step_ref": "native-plan-repair.plan-review", "gc.scope_ref": "build-body", "gc.scope_role": "member",
+	}})
+	// These are the native first-iteration scope/leaf fields. The plain leaf
+	// deliberately has no kind or logical_bead_id; assigning one changes scope-check.
+	f.oldAttempt = mustCreateWorkflowBead(t, store, beads.Bead{Title: "first iteration", Status: "closed", Metadata: map[string]string{
+		"gc.root_bead_id": f.workflow.ID, "gc.kind": "scope", "gc.scope_role": "body", "gc.outcome": "fail",
+		"gc.step_id": "plan-review", "gc.step_ref": "plan-review.iteration.1", "gc.control_for": "plan-review",
+		"gc.ralph_step_id": "plan-review", "gc.attempt": "1", "gc.iteration": "1", "gc.logical_bead_id": f.logical.ID,
+	}})
+	f.failed = mustCreateWorkflowBead(t, store, beads.Bead{Title: "first verdict", Status: "closed", Metadata: map[string]string{
+		"gc.root_bead_id": f.workflow.ID, "gc.scope_ref": "plan-review.iteration.1", "gc.scope_role": "member",
+		"gc.on_fail": "abort_scope", "gc.outcome": "fail", "gc.attempt": "1", "gc.iteration": "1",
+		"gc.ralph_step_id": "plan-review", "gc.step_id": "plan-review-verdict", "gc.step_ref": "plan-review.iteration.1.plan-review-verdict",
+	}})
+	f.newAttempt = mustCreateWorkflowBead(t, store, beads.Bead{Title: "second iteration", Status: "closed", Metadata: map[string]string{
+		"gc.root_bead_id": f.workflow.ID, "gc.kind": "scope", "gc.scope_role": "body", "gc.outcome": "pass", "gc.on_fail": "abort_scope",
+		"gc.step_id": "plan-review", "gc.step_ref": "native-plan-repair.plan-review.iteration.2", "gc.control_for": f.logical.ID,
+		"gc.ralph_step_id": "plan-review", "gc.attempt": "2", "gc.iteration": "2", "gc.logical_bead_id": f.logical.ID, "gc.scope_ref": "build-body",
+	}})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{Title: "decompose and body", Status: "closed", Metadata: map[string]string{
+		"gc.root_bead_id": f.workflow.ID, "gc.outcome": "pass",
+	}})
+	f.finalizer = mustCreateWorkflowBead(t, store, beads.Bead{Title: "finalize", Metadata: map[string]string{
+		"gc.root_bead_id": f.workflow.ID, "gc.kind": "workflow-finalize",
+	}})
+	mustDepAdd(t, store, f.finalizer.ID, f.logical.ID, "blocks")
+	mustDepAdd(t, store, f.finalizer.ID, cleanup.ID, "blocks")
+	mustDepAdd(t, store, f.workflow.ID, f.finalizer.ID, "blocks")
+	return store, f
 }
 
 func TestProcessWorkflowFinalizeUsesCloseOperationForTerminalBeads(t *testing.T) {
@@ -12439,5 +12719,173 @@ func TestProcessWorkflowFinalizeStampsFailureOnSameStoreDomainParent(t *testing.
 	assertFailureStamp(t, parent, "postcondition_failed", "hard", cleanup.ID)
 	if got := parent.Metadata["gc.outcome"]; got != "" {
 		t.Errorf("parent gc.outcome = %q, want unset (the parent is not terminal)", got)
+	}
+}
+
+// Finalize must prove recovery through physical same-root ownership, without
+// changing the original failures or the scope-time failure predicates. Fault
+// rows deliberately break one link in the recorded R4-shaped history; they are
+// fail-closed controls, not claims that the compiler emits corrupt histories.
+func TestProcessWorkflowFinalizeRequiresRecoveredRalphOwnership(t *testing.T) {
+	t.Parallel()
+	set := func(t *testing.T, s *beads.MemStore, id, key, value string) {
+		t.Helper()
+		if err := s.SetMetadata(id, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name   string
+		change func(*testing.T, *beads.MemStore, finalizeRecoveredIteration)
+		fails  bool
+	}{
+		{name: "recorded linked recovery"},
+		{name: "generated Ralph scope-check is infrastructure", change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			mustCreateWorkflowBead(t, s, beads.Bead{Title: "Finalize scope for logical review", Status: "closed", Metadata: map[string]string{
+				"gc.root_bead_id": f.workflow.ID, "gc.kind": "scope-check", "gc.scope_role": "control", "gc.outcome": "pass",
+				"gc.scope_ref": f.logical.Metadata["gc.scope_ref"], "gc.control_for": f.logical.Metadata["gc.step_id"],
+				"gc.step_id": f.logical.Metadata["gc.step_id"], "gc.step_ref": "native-plan-repair.plan-review-scope-check", "gc.on_fail": "abort_scope",
+			}})
+		}},
+		{name: "malformed real body remains authoritative", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.newAttempt.ID, "gc.scope_role", "control")
+		}},
+		{name: "unlinked Cook initial body uses control_for", change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.logical_bead_id", "")
+		}},
+		{name: "namespaced initial control_for", change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.logical_bead_id", "")
+			set(t, s, f.oldAttempt.ID, "gc.control_for", f.logical.Metadata["gc.step_ref"])
+		}},
+		{name: "physical scope identity", change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.failed.ID, "gc.scope_ref", f.oldAttempt.ID)
+		}},
+		{name: "distinct dotted loop identity", change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			other := mustCreateWorkflowBead(t, s, beads.Bead{Title: "other dotted loop", Status: "closed", Metadata: map[string]string{
+				"gc.root_bead_id": f.workflow.ID, "gc.kind": "ralph", "gc.outcome": "pass",
+				"gc.step_id": "review.plan-review", "gc.step_ref": "native-plan-repair.review.plan-review",
+			}})
+			mustCreateWorkflowBead(t, s, beads.Bead{Title: "other body", Status: "closed", Metadata: map[string]string{
+				"gc.root_bead_id": f.workflow.ID, "gc.kind": "scope", "gc.scope_role": "body", "gc.outcome": "pass",
+				"gc.ralph_step_id": "review.plan-review", "gc.step_ref": "native-plan-repair.review.plan-review.iteration.1",
+				"gc.attempt": "1", "gc.control_for": other.ID, "gc.logical_bead_id": other.ID,
+			}})
+			set(t, s, f.oldAttempt.ID, "gc.logical_bead_id", "")
+			set(t, s, f.oldAttempt.ID, "gc.step_ref", "native-plan-repair.plan-review.iteration.1")
+		}},
+		{name: "ordinary nested scope", change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			body := mustCreateWorkflowBead(t, s, beads.Bead{Title: "ordinary scope", Status: "closed", Metadata: map[string]string{
+				"gc.root_bead_id": f.workflow.ID, "gc.kind": "scope", "gc.scope_role": "body", "gc.outcome": "fail",
+				"gc.step_ref": "plan-review.iteration.1.nested", "gc.scope_ref": f.oldAttempt.ID,
+			}})
+			set(t, s, f.failed.ID, "gc.scope_ref", body.ID)
+			set(t, s, f.failed.ID, "gc.step_ref", "plan-review.iteration.1.nested.plan-review-verdict")
+		}},
+		{name: "missing scope body", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.failed.ID, "gc.scope_ref", "missing")
+		}},
+		{name: "unlinked member", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.failed.ID, "gc.scope_ref", "")
+		}},
+		{name: "ambiguous scope body", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			duplicate := f.oldAttempt
+			duplicate.ID = ""
+			mustCreateWorkflowBead(t, s, duplicate)
+		}},
+		{name: "cyclic ordinary scope", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			body := mustCreateWorkflowBead(t, s, beads.Bead{Title: "cyclic scope", Status: "closed", Metadata: map[string]string{
+				"gc.root_bead_id": f.workflow.ID, "gc.kind": "scope", "gc.scope_role": "body", "gc.outcome": "fail",
+				"gc.step_ref": "cyclic", "gc.scope_ref": "cyclic",
+			}})
+			set(t, s, f.failed.ID, "gc.scope_ref", body.ID)
+		}},
+		{name: "cross-root scope body", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.root_bead_id", "foreign-root")
+		}},
+		{name: "missing controller", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.logical_bead_id", "missing")
+		}},
+		{name: "missing all body ownership", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.logical_bead_id", "")
+			set(t, s, f.oldAttempt.ID, "gc.control_for", "")
+		}},
+		{name: "ambiguous bare controller", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.logical_bead_id", "")
+			duplicate := f.logical
+			duplicate.ID = ""
+			mustCreateWorkflowBead(t, s, duplicate)
+		}},
+		{name: "cross-root controller", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.logical.ID, "gc.root_bead_id", "foreign-root")
+		}},
+		{name: "non-ralph controller", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.logical.ID, "gc.kind", "task")
+		}},
+		{name: "unknown member outcome", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.failed.ID, "gc.outcome", "unknown")
+		}},
+		{name: "unknown body outcome", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.outcome", "unknown")
+		}},
+		{name: "unknown controller outcome", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.logical.ID, "gc.outcome", "unknown")
+		}},
+		{name: "exhausted controller", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.logical.ID, "gc.outcome", "fail")
+		}},
+		{name: "current body failed", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.newAttempt.ID, "gc.outcome", "fail")
+		}},
+		{name: "current body outcome unknown", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.newAttempt.ID, "gc.outcome", "unknown")
+		}},
+		{name: "contradictory current lineage", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.newAttempt.ID, "gc.logical_bead_id", "unrelated")
+		}},
+		{name: "no later owned body", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.newAttempt.ID, "gc.logical_bead_id", "unrelated")
+			set(t, s, f.newAttempt.ID, "gc.control_for", "unrelated")
+		}},
+		{name: "ambiguous current body", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			duplicate := f.newAttempt
+			duplicate.ID = ""
+			mustCreateWorkflowBead(t, s, duplicate)
+		}},
+		{name: "unresolved iteration counter", fails: true, change: func(t *testing.T, s *beads.MemStore, f finalizeRecoveredIteration) {
+			set(t, s, f.oldAttempt.ID, "gc.attempt", "unknown")
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, f := newFinalizeRecoveredIteration(t)
+			if tt.change != nil {
+				tt.change(t, store, f)
+			}
+			history := []beads.Bead{
+				mustGetBead(t, store, f.failed.ID), mustGetBead(t, store, f.oldAttempt.ID),
+				mustGetBead(t, store, f.newAttempt.ID), mustGetBead(t, store, f.logical.ID),
+			}
+			result, err := ProcessControl(store, f.finalizer, ProcessOptions{})
+			want := "pass"
+			if tt.fails {
+				want = "fail"
+			}
+			root := mustGetBead(t, store, f.workflow.ID)
+			if err != nil || !result.Processed || result.Action != "workflow-"+want || root.Status != "closed" || root.Metadata["gc.outcome"] != want {
+				t.Fatalf("finalize = %+v, %v; root = %+v; want closed/%s", result, err, root, want)
+			}
+			for _, before := range history {
+				after := mustGetBead(t, store, before.ID)
+				if after.Status != before.Status || after.Revision != before.Revision || len(after.Metadata) != len(before.Metadata) {
+					t.Fatalf("finalize rewrote historical row %s", before.ID)
+				}
+				for key, value := range before.Metadata {
+					if after.Metadata[key] != value {
+						t.Fatalf("finalize rewrote %s metadata %s", before.ID, key)
+					}
+				}
+			}
+		})
 	}
 }

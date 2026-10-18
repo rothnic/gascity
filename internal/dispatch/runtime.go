@@ -1765,51 +1765,21 @@ func resolveScopeBody(store beads.Store, rootID, scopeRef, traceID string, opts 
 }
 
 func resolveScopeBodyFromMembers(all []beads.Bead, rootID, scopeRef string) (beads.Bead, error) {
-	if bead, ok := viewScopeBody(all, rootID, scopeRef); ok {
-		return bead, nil
-	}
-	return beads.Bead{}, fmt.Errorf("%w: scope %q not found under root %s", errScopeBodyMissing, scopeRef, rootID)
+	return findScopeBody(all, rootID, scopeRef)
 }
 
 func resolveScopeBodyOnce(store beads.Store, rootID, scopeRef string) (beads.Bead, error) {
-	if bead, ok, err := resolveScopeBodyByRole(store, rootID, scopeRef, false); err != nil {
-		return beads.Bead{}, err
-	} else if ok {
-		return bead, nil
-	}
-	if bead, ok, err := resolveScopeBodyByRole(store, rootID, scopeRef, true); err != nil {
-		return beads.Bead{}, err
-	} else if ok {
-		return bead, nil
-	}
-	all, err := beads.DirectMembers(store, rootID)
-	if err != nil {
-		return beads.Bead{}, err
-	}
-	if bead, ok := findScopeBody(all, rootID, scopeRef); ok {
-		return bead, nil
-	}
-	return beads.Bead{}, fmt.Errorf("%w: scope %q not found under root %s", errScopeBodyMissing, scopeRef, rootID)
-}
-
-func resolveScopeBodyByRole(store beads.Store, rootID, scopeRef string, includeClosed bool) (beads.Bead, bool, error) {
-	matches, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
+	all, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		Metadata: map[string]string{
 			beadmeta.RootBeadIDMetadataKey: rootID,
 			beadmeta.KindMetadataKey:       beadmeta.KindScope,
-			beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleBody,
 		},
-		IncludeClosed: includeClosed,
+		IncludeClosed: true,
 	})
 	if err != nil {
-		return beads.Bead{}, false, err
+		return beads.Bead{}, err
 	}
-	for _, bead := range matches {
-		if matchesScopeRef(bead, scopeRef) {
-			return bead, true, nil
-		}
-	}
-	return beads.Bead{}, false, nil
+	return findScopeBody(all, rootID, scopeRef)
 }
 
 func canSkipScopeMemberWithDeps(deps []beads.Dep, pending map[string]beads.Bead) bool {
@@ -1931,19 +1901,42 @@ func isLogicalDescendant(logical, candidate beads.Bead) bool {
 	return false
 }
 
-func findScopeBody(all []beads.Bead, rootID, scopeRef string) (beads.Bead, bool) {
+func findScopeBody(all []beads.Bead, rootID, scopeRef string) (beads.Bead, error) {
+	if scopeRef == "" {
+		return beads.Bead{}, fmt.Errorf("%w: empty scope ref under root %s", errScopeBodyMissing, rootID)
+	}
+	var exact, fallback beads.Bead
+	var exactCount, fallbackCount int
 	for _, bead := range all {
-		if bead.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID {
+		if bead.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
+			bead.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindScope {
 			continue
 		}
-		if bead.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindScope {
+		role := bead.Metadata[beadmeta.ScopeRoleMetadataKey]
+		if role != "" && role != beadmeta.ScopeRoleBody {
 			continue
 		}
-		if matchesScopeRef(bead, scopeRef) {
-			return bead, true
+		stepRef := bead.Metadata[beadmeta.StepRefMetadataKey]
+		if stepRef == scopeRef {
+			exact, exactCount = bead, exactCount+1
+		} else if strings.HasSuffix(stepRef, "."+scopeRef) ||
+			(stepRef == "" && bead.Metadata[beadmeta.ScopeRefMetadataKey] == scopeRef) {
+			fallback, fallbackCount = bead, fallbackCount+1
 		}
 	}
-	return beads.Bead{}, false
+	if exactCount > 1 {
+		return beads.Bead{}, fmt.Errorf("%w: scope %q has %d exact bodies under root %s", ErrControlGraphMalformed, scopeRef, exactCount, rootID)
+	}
+	if exactCount == 1 {
+		return exact, nil
+	}
+	if fallbackCount > 1 {
+		return beads.Bead{}, fmt.Errorf("%w: scope %q has %d matching bodies under root %s", ErrControlGraphMalformed, scopeRef, fallbackCount, rootID)
+	}
+	if fallbackCount == 1 {
+		return fallback, nil
+	}
+	return beads.Bead{}, fmt.Errorf("%w: scope %q not found under root %s", errScopeBodyMissing, scopeRef, rootID)
 }
 
 func setOutcomeAndClose(store beads.Store, beadID, outcome string) error {
@@ -2192,11 +2185,160 @@ func terminalAbortScopeFailureMember(store beads.Store, rootID, finalizerID stri
 		if candidate.ID == finalizerID {
 			continue
 		}
-		if terminalAbortScopeFailure(candidate) {
+		if terminalAbortScopeFailure(candidate) && !supersededRalphBodyMember(candidate, all) {
 			return candidate, true, nil
 		}
 	}
 	return beads.Bead{}, false, nil
+}
+
+// supersededRalphBodyMember exempts only a failed member whose physical scope
+// chain reaches a failed iteration of a same-root ralph that later recovered.
+// The first compiled body may have only gc.control_for; runtime bodies can also
+// carry gc.logical_bead_id. When both exist they must name the same control.
+// Missing, ambiguous, cyclic or foreign ownership and unknown outcomes leave
+// the member terminal. Ordinary scope bodies can be traversed; this does not
+// reconstruct ownership of nested ralphs from dotted refs.
+func supersededRalphBodyMember(bead beads.Bead, members []beads.Bead) bool {
+	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
+	loopID := strings.TrimSpace(bead.Metadata[beadmeta.RalphStepIDMetadataKey])
+	attempt := strings.TrimSpace(bead.Metadata[beadmeta.AttemptMetadataKey])
+	if rootID == "" || loopID == "" || attempt == "" ||
+		strings.TrimSpace(bead.Metadata[beadmeta.OutcomeMetadataKey]) != beadmeta.OutcomeFail {
+		return false
+	}
+	seen := map[string]bool{bead.ID: true}
+	for {
+		scopeRef := strings.TrimSpace(bead.Metadata[beadmeta.ScopeRefMetadataKey])
+		if scopeRef == "" {
+			return false
+		}
+		var body beads.Bead
+		best, bodyMatches := 0, 0
+		for _, candidate := range members {
+			ref := strings.TrimSpace(candidate.Metadata[beadmeta.StepRefMetadataKey])
+			rank := 0
+			switch {
+			case candidate.ID == scopeRef:
+				rank = 3
+			case ref == scopeRef:
+				rank = 2
+			case strings.HasSuffix(ref, "."+scopeRef):
+				if id := strings.TrimSpace(candidate.Metadata[beadmeta.RalphStepIDMetadataKey]); id == "" || id == loopID {
+					rank = 1
+				}
+			}
+			if rank > best {
+				body, best, bodyMatches = candidate, rank, 1
+			} else if rank != 0 && rank == best {
+				bodyMatches++
+			}
+		}
+		if bodyMatches != 1 || seen[body.ID] || body.Status != "closed" ||
+			body.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
+			body.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindScope ||
+			body.Metadata[beadmeta.ScopeRoleMetadataKey] != beadmeta.ScopeRoleBody ||
+			strings.TrimSpace(body.Metadata[beadmeta.OutcomeMetadataKey]) != beadmeta.OutcomeFail {
+			return false
+		}
+		seen[body.ID] = true
+		if strings.TrimSpace(body.Metadata[beadmeta.LogicalBeadIDMetadataKey]) == "" &&
+			strings.TrimSpace(body.Metadata[beadmeta.ControlForMetadataKey]) == "" {
+			bead = body
+			continue
+		}
+		if strings.TrimSpace(body.Metadata[beadmeta.RalphStepIDMetadataKey]) != loopID ||
+			strings.TrimSpace(body.Metadata[beadmeta.AttemptMetadataKey]) != attempt ||
+			strings.TrimSpace(body.Metadata[beadmeta.RetryAttemptMetadataKey]) != "" {
+			return false
+		}
+		owner, ok := finalizeRalphBodyOwner(body, members, rootID)
+		if !ok || owner.Status != "closed" ||
+			strings.TrimSpace(owner.Metadata[beadmeta.OutcomeMetadataKey]) != beadmeta.OutcomePass {
+			return false
+		}
+		oldNumber := beadmeta.RetryAttemptNumber(body.Metadata)
+		if oldNumber < 1 {
+			return false
+		}
+		precise, bare := controlIdentitySets(owner)
+		var latest beads.Bead
+		latestNumber, matches := 0, 0
+		for _, candidate := range members {
+			if latestAttemptCandidateIsControlInfrastructure(candidate.Metadata[beadmeta.KindMetadataKey]) {
+				continue
+			}
+			logicalID := strings.TrimSpace(candidate.Metadata[beadmeta.LogicalBeadIDMetadataKey])
+			controlFor := strings.TrimSpace(candidate.Metadata[beadmeta.ControlForMetadataKey])
+			if logicalID != owner.ID && !precise[controlFor] && (logicalID != "" || !bare[controlFor]) {
+				continue
+			}
+			if candidate.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
+				candidate.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindScope ||
+				candidate.Metadata[beadmeta.ScopeRoleMetadataKey] != beadmeta.ScopeRoleBody ||
+				strings.TrimSpace(candidate.Metadata[beadmeta.RalphStepIDMetadataKey]) != loopID ||
+				strings.TrimSpace(candidate.Metadata[beadmeta.RetryAttemptMetadataKey]) != "" ||
+				(logicalID != "" && logicalID != owner.ID) ||
+				(controlFor != "" && !precise[controlFor] && !bare[controlFor]) {
+				return false
+			}
+			if logicalID == "" && bare[controlFor] {
+				resolved, known := finalizeRalphBodyOwner(candidate, members, rootID)
+				if !known || resolved.ID != owner.ID {
+					return false
+				}
+			}
+			number := beadmeta.RetryAttemptNumber(candidate.Metadata)
+			if number < 1 {
+				return false
+			}
+			if number > latestNumber {
+				latest, latestNumber, matches = candidate, number, 1
+			} else if number == latestNumber {
+				matches++
+			}
+		}
+		return matches == 1 && latestNumber > oldNumber && latest.Status == "closed" &&
+			strings.TrimSpace(latest.Metadata[beadmeta.OutcomeMetadataKey]) == beadmeta.OutcomePass
+	}
+}
+
+// finalizeRalphBodyOwner uses the same durable identity forms as native attempt
+// selection. A physical logical pointer must agree with control_for. Without
+// that pointer, precise identities outrank a bare step ID; ties are unresolved.
+func finalizeRalphBodyOwner(body beads.Bead, members []beads.Bead, rootID string) (beads.Bead, bool) {
+	logicalID := strings.TrimSpace(body.Metadata[beadmeta.LogicalBeadIDMetadataKey])
+	controlFor := strings.TrimSpace(body.Metadata[beadmeta.ControlForMetadataKey])
+	loopID := strings.TrimSpace(body.Metadata[beadmeta.RalphStepIDMetadataKey])
+	if loopID == "" || (logicalID == "" && controlFor == "") {
+		return beads.Bead{}, false
+	}
+	var owner beads.Bead
+	best, matches := 0, 0
+	for _, candidate := range members {
+		if candidate.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
+			candidate.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindRalph ||
+			strings.TrimSpace(candidate.Metadata[beadmeta.StepIDMetadataKey]) != loopID ||
+			(logicalID != "" && candidate.ID != logicalID) {
+			continue
+		}
+		precise, bare := controlIdentitySets(candidate)
+		rank := 0
+		switch {
+		case logicalID != "" && (controlFor == "" || precise[controlFor] || bare[controlFor]):
+			rank = 3
+		case logicalID == "" && precise[controlFor]:
+			rank = 2
+		case logicalID == "" && bare[controlFor]:
+			rank = 1
+		}
+		if rank > best {
+			owner, best, matches = candidate, rank, 1
+		} else if rank != 0 && rank == best {
+			matches++
+		}
+	}
+	return owner, matches == 1
 }
 
 func terminalAbortScopeFailure(bead beads.Bead) bool {
@@ -2218,6 +2360,9 @@ func terminalAbortScopeFailure(bead beads.Bead) bool {
 	// bead ran; its own failure must not outvote a passing later iteration at
 	// finalize (#4008). The logical bead's own final disposition is the
 	// authoritative signal. A genuinely terminal, non-superseded hard failure
-	// still returns true.
+	// still returns true. A ralph body member carries no gc.logical_bead_id; it
+	// is superseded when its owning ralph control passed, which needs the
+	// workflow's other beads, so terminalAbortScopeFailureMember checks it
+	// (supersededRalphBodyMember).
 	return !isRetryAttemptSubject(bead)
 }

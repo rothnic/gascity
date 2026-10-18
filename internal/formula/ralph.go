@@ -265,6 +265,17 @@ func namespaceRalphBodySteps(steps []*Step, iterationID string, owner *Step, att
 				beadmeta.IterationMetadataKey:   strconv.Itoa(attempt),
 				beadmeta.StepRefMetadataKey:     clone.ID,
 			}
+			// Already-expanded inner loops retain their nearest scope and counters.
+			scopeRef := node.Metadata[beadmeta.ScopeRefMetadataKey]
+			if bodyIDs[scopeRef] {
+				childMeta[beadmeta.ScopeRefMetadataKey] = iterationID + "." + scopeRef
+			}
+			if node.Metadata[beadmeta.RalphStepIDMetadataKey] != "" &&
+				(bodyIDs[scopeRef] || bodyIDs[node.Metadata[beadmeta.ControlForMetadataKey]]) {
+				for _, key := range []string{beadmeta.RalphStepIDMetadataKey, beadmeta.AttemptMetadataKey, beadmeta.IterationMetadataKey} {
+					childMeta[key] = node.Metadata[key]
+				}
+			}
 			// A nested control's attempt/iteration root carries gc.control_for as
 			// the bare inner-control step id (stamped by expandRetry/expandRalph
 			// before this body was namespaced). Rewrite it to the namespaced

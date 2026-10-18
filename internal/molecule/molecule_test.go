@@ -1423,6 +1423,86 @@ func TestInstantiateUsesGraphApplyPriorityOverride(t *testing.T) {
 	}
 }
 
+func TestInstantiateForwardLogicalRefs(t *testing.T) {
+	for _, fragment := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fragment=%t", fragment), func(t *testing.T) {
+			store := &observingCreateStore{MemStore: beads.NewMemStore()}
+			steps := []formula.RecipeStep{
+				{ID: "wf.loop.iteration.1", Title: "Body", Type: "task", Assignee: "worker", Metadata: map[string]string{
+					"gc.kind": "scope", "gc.attempt": "1", "gc.ralph_step_id": "loop", "custom": "preserved",
+				}},
+				{ID: "wf.loop.iteration.1.work", Title: "Work", Type: "task", Metadata: map[string]string{
+					"gc.kind": "task", "gc.attempt": "1", "gc.ralph_step_id": "loop",
+				}},
+				{ID: "wf.loop", Title: "Loop", Type: "task", Metadata: map[string]string{"gc.kind": "ralph"}},
+			}
+			var plan *beads.GraphApplyPlan
+			var ids map[string]string
+			if fragment {
+				root, err := store.Create(beads.Bead{Title: "Workflow", Metadata: map[string]string{"gc.kind": "workflow"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				recipe := &formula.FragmentRecipe{Steps: steps}
+				opts := FragmentOptions{RootID: root.ID}
+				plan, err = buildFragmentApplyPlan(store, recipe, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := InstantiateFragment(context.Background(), store, recipe, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ids = result.IDMapping
+			} else {
+				recipe := &formula.Recipe{Name: "wf", Steps: append([]formula.RecipeStep{{
+					ID: "wf", Title: "Workflow", IsRoot: true, Metadata: map[string]string{"gc.kind": "workflow"},
+				}}, steps...)}
+				var err error
+				plan, _, _, err = buildRecipeApplyPlan(recipe, Options{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := Instantiate(context.Background(), store, recipe, Options{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ids = result.IDMapping
+			}
+			body, err := store.Get(ids["wf.loop.iteration.1"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := body.Metadata[beadmeta.LogicalBeadIDMetadataKey]; got != ids["wf.loop"] {
+				t.Errorf("body logical ID = %q, want later-created control %q", got, ids["wf.loop"])
+			}
+			if body.Metadata["custom"] != "preserved" || body.Assignee != "worker" {
+				t.Errorf("body metadata/assignment not preserved: %+v", body)
+			}
+			for _, created := range store.created {
+				if created.ID == body.ID && created.Assignee != "" {
+					t.Error("forward-linked body was assigned before lineage resolution")
+				}
+			}
+			member, err := store.Get(ids["wf.loop.iteration.1.work"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if member.Metadata[beadmeta.LogicalBeadIDMetadataKey] != "" {
+				t.Error("plain member acquired logical control identity")
+			}
+			for _, node := range plan.Nodes {
+				if node.Key == "wf.loop.iteration.1" && node.MetadataRefs[beadmeta.LogicalBeadIDMetadataKey] != "wf.loop" {
+					t.Errorf("GraphApply body logical ref = %q, want wf.loop", node.MetadataRefs[beadmeta.LogicalBeadIDMetadataKey])
+				}
+				if node.Key == "wf.loop.iteration.1.work" && node.MetadataRefs[beadmeta.LogicalBeadIDMetadataKey] != "" {
+					t.Error("GraphApply plain member acquired logical control identity")
+				}
+			}
+		})
+	}
+}
+
 func TestLogicalRecipeStepIDV2AttemptAndIteration(t *testing.T) {
 	// Regression: v2 attempt/iteration beads keep their original kind and use
 	// .attempt.N / .iteration.N suffixes. logicalRecipeStepID must strip these

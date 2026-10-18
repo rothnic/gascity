@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -129,26 +128,4 @@ func viewScopeMembers(members []beads.Bead, rootID, scopeRef string, includeClos
 		out = append(out, member)
 	}
 	return out
-}
-
-// viewScopeBody is resolveScopeBodyOnce answered from members: an open
-// role-tagged body first, then a closed one, then any scope bead matching the
-// ref.
-func viewScopeBody(members []beads.Bead, rootID, scopeRef string) (beads.Bead, bool) {
-	for _, open := range []bool{true, false} {
-		for _, member := range members {
-			if member.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
-				member.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindScope ||
-				member.Metadata[beadmeta.ScopeRoleMetadataKey] != beadmeta.ScopeRoleBody {
-				continue
-			}
-			if open && strings.TrimSpace(member.Status) == "closed" {
-				continue
-			}
-			if matchesScopeRef(member, scopeRef) {
-				return member, true
-			}
-		}
-	}
-	return findScopeBody(members, rootID, scopeRef)
 }
