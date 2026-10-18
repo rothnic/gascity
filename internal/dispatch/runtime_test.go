@@ -449,8 +449,8 @@ func TestProcessScopeCheckAbortsScopeOnFailure(t *testing.T) {
 // that TestProcessScopeCheckAbortsScopeOnFailure deliberately omits: a scope
 // member whose only blocker is the scope-check currently aborting the scope.
 // skipScopeMembers judges such a member skippable — runtime.go excludes the
-// in-flight control from the pending set, and canSkipScopeMemberWithDeps only
-// consults that set — so it is closed while its blocker is still open. That is
+// in-flight control from the pending set and orders only pending members —
+// so it is closed while its blocker is still open. That is
 // legal only on a forced close; it is ga-4ote2, and closing it with an unforced
 // update is what real bd refused.
 //
@@ -577,8 +577,8 @@ func TestProcessScopeCheckAbortSkipsMemberBlockedOnInFlightControl(t *testing.T)
 // behavior this fix genuinely widened, so that narrowing it later is a decision
 // rather than an accident.
 //
-// canSkipScopeMemberWithDeps only refuses blockers that are in the pending set,
-// so it is blind to an open blocker outside the aborting scope. Under the old
+// The skip planner only orders members in the pending set, so it does not
+// wait on an open blocker outside the aborting scope. Under the old
 // unforced write that blindness was covered by accident: bd's own guard refused
 // the close, and the abort failed loudly. Closing with --force removes that
 // backstop, and this member now closes over its out-of-scope blocker.
@@ -1507,6 +1507,82 @@ func (s *scopeSkipFailingBatchStore) DepListBatch([]string) (map[string][]beads.
 	return nil, errors.New("dolt: connection reset")
 }
 
+func TestSkipOpenScopeMembersNeverReadiesDependents(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []string{"retry", "ralph"} {
+		for _, dependencyType := range []string{"blocks", "waits-for", "conditional-blocks"} {
+			t.Run(kind+"/"+dependencyType, func(t *testing.T) {
+				store := newPinnedScopeSkipStore()
+				body := mustCreateScopeSkipBody(t, store)
+				control := mustCreateScopeMember(t, store, "gcg-267019", "abort control", "scope-check", "control")
+				logical := mustCreateScopeMember(t, store, "gcg-267022", "logical work", kind, "member")
+				dependent := mustCreateScopeMember(t, store, "gcg-267024", "dependent work", "", "member")
+				finalize := mustCreateScopeMember(t, store, "gcg-267033", "dependent scope-check", "scope-check", "control")
+				preserved := mustCreateScopeMember(t, store, "gcg-267090", "replayable scope-check", "scope-check", "control")
+				var nested []beads.Bead
+				for _, suffix := range []string{"a", "b"} {
+					nested = append(nested, mustCreateWorkflowBead(t, store, beads.Bead{
+						ID: logical.ID + ".attempt.1." + suffix, Title: "nested work", Type: "task",
+						Metadata: map[string]string{"gc.root_bead_id": "wf-1", "gc.logical_bead_id": logical.ID},
+					}))
+				}
+				mustDepAdd(t, store, logical.ID, control.ID, "blocks")
+				mustDepAdd(t, store, dependent.ID, logical.ID, dependencyType)
+				mustDepAdd(t, store, finalize.ID, dependent.ID, dependencyType)
+				mustDepAdd(t, store, preserved.ID, control.ID, "blocks")
+				mustDepAdd(t, store, nested[0].ID, control.ID, "blocks")
+				mustDepAdd(t, store, nested[1].ID, nested[0].ID, dependencyType)
+				mustDepAdd(t, store, dependent.ID, nested[1].ID, dependencyType)
+				// A non-blocking edge must neither order the abort nor form a cycle.
+				mustDepAdd(t, store, logical.ID, dependent.ID, "tracks")
+
+				members := []beads.Bead{body, control, logical, dependent, finalize, preserved}
+				snapshot := scopeSnapshot{rootID: "wf-1", scopeRef: "body", members: members, body: body}
+				forbidden := []string{logical.ID, dependent.ID, finalize.ID, nested[0].ID, nested[1].ID}
+				checkReady := func(closedID string) {
+					t.Helper()
+					for _, id := range forbidden {
+						if mustReadyContains(t, store, id) {
+							t.Fatalf("scope member %s became ready after closing %s", id, closedID)
+						}
+					}
+				}
+				checkReady("nothing")
+				injected := errors.New("interrupted scope skip")
+				store.afterClose = func(id string) error {
+					checkReady(id)
+					if len(store.closeAllIDs) == 1 {
+						return injected
+					}
+					return nil
+				}
+				if _, err := snapshot.skipOpenScopeMembers(store, control.ID); !errors.Is(err, injected) {
+					t.Fatalf("first skip error = %v, want injected partial-close failure", err)
+				}
+				// Replay reads current statuses, just as abort reconciliation does.
+				for i := range snapshot.members {
+					snapshot.members[i] = mustGetBead(t, store, snapshot.members[i].ID)
+				}
+				if _, err := snapshot.skipOpenScopeMembers(store, control.ID); err != nil {
+					t.Fatalf("replaying interrupted skip: %v", err)
+				}
+				for _, id := range forbidden {
+					got := mustGetBead(t, store, id)
+					if got.Status != "closed" || got.Metadata["gc.outcome"] != "skipped" {
+						t.Fatalf("member %s = %s/%s, want closed/skipped", id, got.Status, got.Metadata["gc.outcome"])
+					}
+				}
+				for _, id := range []string{body.ID, control.ID, preserved.ID} {
+					if got := mustGetBead(t, store, id); got.Status != "open" {
+						t.Fatalf("body/control/replay bead %s = %s, want open", id, got.Status)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestSkipOpenScopeMembersBatchesDependencyChecksAndCloses(t *testing.T) {
 	t.Parallel()
 
@@ -1658,20 +1734,11 @@ func mustCreateScopeSkipBody(t *testing.T, store beads.Store) beads.Bead {
 	})
 }
 
-// TestSkipOpenScopeMembersContinuesAfterPreserveOnlyRound pins the specimen
-// behind ga-kzrlh: run gcg-5436965277264861 (beads#6038) quarantined its
-// control bead at 2026-08-30T04:26:11Z with "unable to skip remaining scope
-// members", while the healthy dup twin closed every one of those members one
-// second later. No store call ever failed — the round that PRESERVED the
-// subject's own scope-check (deleting the linchpin blocker from pending)
-// counted as no progress, so a graph that needed one more round was declared
-// deadlocked.
-//
-// The shape is the common one, not an exotic one: finalize scope-checks are
-// minted after the members they block, so their ids sort AFTER their
-// dependents and the preserve lands too late in the pass to unblock anything
-// in the same round.
-func TestSkipOpenScopeMembersContinuesAfterPreserveOnlyRound(t *testing.T) {
+// TestSkipOpenScopeMembersPreservesRecoveryCheckWhileSkippingDependents pins
+// ga-kzrlh: the failed subject's own scope-check must remain replayable without
+// preventing the other members from being skipped. Its ID sorts after its
+// dependents, so preservation must not depend on iteration order.
+func TestSkipOpenScopeMembersPreservesRecoveryCheckWhileSkippingDependents(t *testing.T) {
 	t.Parallel()
 
 	store := newPinnedScopeSkipStore()
@@ -1715,12 +1782,12 @@ func TestSkipOpenScopeMembersContinuesAfterPreserveOnlyRound(t *testing.T) {
 	if skipped != 4 {
 		t.Fatalf("skipped = %d, want 4", skipped)
 	}
-	// Three rounds: preserve-only, then the two dependency waves it unblocked.
-	if store.depListBatchCalls != 3 {
-		t.Fatalf("DepListBatch calls = %d, want 3 (preserve-only round then two skip waves)", store.depListBatchCalls)
+	// Preserve the recovery check before planning two dependent-first waves.
+	if store.depListBatchCalls != 2 {
+		t.Fatalf("DepListBatch calls = %d, want 2 dependency waves", store.depListBatchCalls)
 	}
-	if got := [][]string{store.closeAllIDs[0], store.closeAllIDs[1]}; !slices.Equal(got[0], []string{apply.ID, applyTwin.ID}) || !slices.Equal(got[1], []string{applyFinalize.ID, applyTwinFinalize.ID}) {
-		t.Fatalf("CloseAll waves = %v, want [[%s %s] [%s %s]]", got, apply.ID, applyTwin.ID, applyFinalize.ID, applyTwinFinalize.ID)
+	if got := store.closeAllIDs; len(got) != 2 || !slices.Equal(got[0], []string{applyFinalize.ID, applyTwinFinalize.ID}) || !slices.Equal(got[1], []string{apply.ID, applyTwin.ID}) {
+		t.Fatalf("CloseAll waves = %v, want [[%s %s] [%s %s]]", got, applyFinalize.ID, applyTwinFinalize.ID, apply.ID, applyTwin.ID)
 	}
 	for _, beadID := range []string{apply.ID, applyTwin.ID, applyFinalize.ID, applyTwinFinalize.ID} {
 		member := mustGetBead(t, store, beadID)
@@ -1739,50 +1806,54 @@ func TestSkipOpenScopeMembersContinuesAfterPreserveOnlyRound(t *testing.T) {
 	}
 }
 
-// TestSkipOpenScopeMembersStillFailsOnGenuineBlocksCycle is the control for the
-// fix above: progress-aware rounds must not paper over a real deadlock. Two
-// pending members that block each other can never be skipped, so hard-fail and
+// TestSkipOpenScopeMembersStillFailsOnGenuineReadinessCycle is the control for the
+// fix above: dependent-first waves must not paper over a real deadlock. Two
+// pending members with cyclic readiness dependencies cannot be skipped, so hard-fail and
 // quarantine remain the correct disposition.
-func TestSkipOpenScopeMembersStillFailsOnGenuineBlocksCycle(t *testing.T) {
+func TestSkipOpenScopeMembersStillFailsOnGenuineReadinessCycle(t *testing.T) {
 	t.Parallel()
 
-	store := newPinnedScopeSkipStore()
-	body := mustCreateScopeSkipBody(t, store)
-	control := mustCreateScopeMember(t, store, "gcg-267019", "Finalize scope for scorecard", "scope-check", "control")
-	left := mustCreateScopeMember(t, store, "gcg-267041", "left", "", "member")
-	right := mustCreateScopeMember(t, store, "gcg-267042", "right", "", "member")
+	for _, dependencyType := range []string{"blocks", "waits-for", "conditional-blocks"} {
+		t.Run(dependencyType, func(t *testing.T) {
+			store := newPinnedScopeSkipStore()
+			body := mustCreateScopeSkipBody(t, store)
+			control := mustCreateScopeMember(t, store, "gcg-267019", "Finalize scope for scorecard", "scope-check", "control")
+			left := mustCreateScopeMember(t, store, "gcg-267041", "left", "", "member")
+			right := mustCreateScopeMember(t, store, "gcg-267042", "right", "", "member")
 
-	mustDepAdd(t, store, left.ID, right.ID, "blocks")
-	mustDepAdd(t, store, right.ID, left.ID, "blocks")
+			mustDepAdd(t, store, left.ID, right.ID, dependencyType)
+			mustDepAdd(t, store, right.ID, left.ID, dependencyType)
 
-	snapshot := scopeSnapshot{
-		rootID:      "wf-1",
-		scopeRef:    "body",
-		allComplete: true,
-		members:     []beads.Bead{body, control, left, right},
-		body:        body,
-	}
-	skipped, err := snapshot.skipOpenScopeMembers(store, control.ID)
-	if err == nil {
-		t.Fatalf("skipOpenScopeMembers = (%d, nil), want a deadlock error for a genuine blocks cycle", skipped)
-	}
-	if skipped != 0 {
-		t.Fatalf("skipped = %d, want 0", skipped)
-	}
-	for _, want := range []string{
-		"unable to skip remaining scope members",
-		left.ID + " (blocked by " + right.ID + ")",
-		right.ID + " (blocked by " + left.ID + ")",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q, want it to contain %q", err.Error(), want)
-		}
-	}
-	for _, beadID := range []string{left.ID, right.ID} {
-		member := mustGetBead(t, store, beadID)
-		if member.Status != "open" {
-			t.Fatalf("%s status = %q, want open — a genuine deadlock closes nothing", beadID, member.Status)
-		}
+			snapshot := scopeSnapshot{
+				rootID:      "wf-1",
+				scopeRef:    "body",
+				allComplete: true,
+				members:     []beads.Bead{body, control, left, right},
+				body:        body,
+			}
+			skipped, err := snapshot.skipOpenScopeMembers(store, control.ID)
+			if err == nil {
+				t.Fatalf("skipOpenScopeMembers = (%d, nil), want a deadlock error for a genuine readiness-blocking cycle", skipped)
+			}
+			if skipped != 0 {
+				t.Fatalf("skipped = %d, want 0", skipped)
+			}
+			for _, want := range []string{
+				"unable to skip remaining scope members",
+				left.ID + " (blocked by " + right.ID + ")",
+				right.ID + " (blocked by " + left.ID + ")",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q, want it to contain %q", err.Error(), want)
+				}
+			}
+			for _, beadID := range []string{left.ID, right.ID} {
+				member := mustGetBead(t, store, beadID)
+				if member.Status != "open" {
+					t.Fatalf("%s status = %q, want open — a genuine deadlock closes nothing", beadID, member.Status)
+				}
+			}
+		})
 	}
 }
 
@@ -1825,10 +1896,9 @@ func TestSkipOpenScopeMembersDeadlockErrorNamesCurrentStuckMembers(t *testing.T)
 	}
 }
 
-// TestSkipOpenScopeMembersConvergesOverManyRounds pins that progress-aware
-// rounds converge on a chain deep enough to need more than the two waves the
-// original harness exercised: one preserve-only round followed by four
-// single-member waves as each skip unblocks the next link.
+// TestSkipOpenScopeMembersConvergesOverManyRounds checks a longer chain is
+// skipped from its final dependent back to its first prerequisite while keeping
+// the failed subject's recovery check open.
 func TestSkipOpenScopeMembersConvergesOverManyRounds(t *testing.T) {
 	t.Parallel()
 
@@ -1841,7 +1911,7 @@ func TestSkipOpenScopeMembersConvergesOverManyRounds(t *testing.T) {
 		mustCreateScopeMember(t, store, "gcg-267043", "link 3", "", "member"),
 		mustCreateScopeMember(t, store, "gcg-267044", "link 4", "", "member"),
 	}
-	// Sorts after every link it blocks, so round one can only preserve.
+	// Sorts after every link it blocks; ID order must not affect preservation.
 	preserved := mustCreateScopeMember(t, store, "gcg-267090", "Finalize scope for scorecard twin", "scope-check", "control")
 
 	mustDepAdd(t, store, preserved.ID, control.ID, "blocks")
@@ -1865,8 +1935,13 @@ func TestSkipOpenScopeMembersConvergesOverManyRounds(t *testing.T) {
 	if skipped != len(chain) {
 		t.Fatalf("skipped = %d, want %d", skipped, len(chain))
 	}
-	if store.depListBatchCalls != len(chain)+1 {
-		t.Fatalf("DepListBatch calls = %d, want %d (preserve-only round then one wave per link)", store.depListBatchCalls, len(chain)+1)
+	if store.depListBatchCalls != len(chain) {
+		t.Fatalf("DepListBatch calls = %d, want %d (one wave per link)", store.depListBatchCalls, len(chain))
+	}
+	for i, wave := range store.closeAllIDs {
+		if want := []string{chain[len(chain)-1-i].ID}; !slices.Equal(wave, want) {
+			t.Fatalf("CloseAll wave %d = %v, want %v", i, wave, want)
+		}
 	}
 	for _, member := range chain {
 		got := mustGetBead(t, store, member.ID)
@@ -3158,6 +3233,7 @@ type scopeSkipBatchStore struct {
 	updateCalls       int
 	closeAllCalls     int
 	closeAllIDs       [][]string
+	afterClose        func(string) error
 }
 
 type scopeBodyVanishAfterFirstResolveStore struct {
@@ -3225,6 +3301,20 @@ func (s *scopeSkipBatchStore) Update(id string, opts beads.UpdateOpts) error {
 func (s *scopeSkipBatchStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
 	s.closeAllCalls++
 	s.closeAllIDs = append(s.closeAllIDs, slices.Clone(ids))
+	if s.afterClose != nil {
+		closed := 0
+		for _, id := range ids {
+			n, err := s.MemStore.CloseAll([]string{id}, metadata)
+			closed += n
+			if err != nil {
+				return closed, err
+			}
+			if err := s.afterClose(id); err != nil {
+				return closed, err
+			}
+		}
+		return closed, nil
+	}
 	return s.MemStore.CloseAll(ids, metadata)
 }
 

@@ -1,14 +1,18 @@
 package acp
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 // sigtermIgnoringACPCommand is a minimal ACP server that ignores SIGTERM, so
@@ -147,4 +151,35 @@ func TestStopBySocketEscalatesAfterOwnersConfiguredGrace(t *testing.T) {
 	}
 	assertElapsedWithinGrace(t, time.Since(start))
 	assertProcessReaped(t, sc)
+}
+
+func TestStopSocketDoesNotAcknowledgeTerminationFailure(t *testing.T) {
+	previous := stopManagedProcess
+	t.Cleanup(func() { stopManagedProcess = previous })
+	for _, refuse := range []bool{false, true} {
+		stopManagedProcess = func(*exec.Cmd, <-chan struct{}, time.Duration) error {
+			if refuse {
+				return errors.New("termination refused")
+			}
+			return nil
+		}
+		client, server := net.Pipe()
+		if err := client.SetDeadline(time.Now().Add(testutil.GoroutineRaceTimeout)); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() { defer close(done); handleControlConn(server, nil, nil, time.Second, nil) }()
+		if _, err := client.Write([]byte("stop\n")); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := bufio.NewReader(client).ReadString('\n')
+		_ = client.Close()
+		<-done
+		if refuse && (err == nil || reply == "ok\n") {
+			t.Fatalf("failed termination acknowledged: reply=%q err=%v", reply, err)
+		}
+		if !refuse && (err != nil || reply != "ok\n") {
+			t.Fatalf("successful termination reply=%q err=%v", reply, err)
+		}
+	}
 }

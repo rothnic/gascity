@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
@@ -1544,5 +1545,169 @@ func TestSubprocessSeedsIdentityTokenEpochID(t *testing.T) {
 				t.Fatalf("squatting %v: seed error = %v, want the %s write to fail first", squat, err, squat[0])
 			}
 		}
+	}
+}
+
+func TestStopKillsTermResistantChildAfterLeaderExit(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.pid")
+	p := newTestProvider(t)
+	if err := p.Start(context.Background(), "resistant-child", runtime.Config{
+		Command: "sh -c 'trap \"\" TERM; echo $$ > " + childPath + "; while :; do sleep 1; done' & wait",
+		WorkDir: dir,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var child int
+	deadline := time.Now().Add(testutil.ExecRaceTimeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(childPath)
+		if err == nil {
+			child, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+			if child > 1 {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if child <= 1 {
+		t.Fatal("child did not become ready")
+	}
+	identity, err := pidutil.StartTime(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	group := p.procs["resistant-child"].cmd.Process.Pid
+	p.mu.Unlock()
+	t.Cleanup(func() {
+		if pidutil.AliveWithStartTime(child, identity) {
+			_ = syscall.Kill(-group, syscall.SIGKILL)
+		}
+	})
+	if err := p.Stop("resistant-child"); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(testutil.ExecRaceTimeout)
+	for time.Now().Before(deadline) {
+		if !pidutil.AliveWithStartTime(child, identity) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("TERM-resistant child %d survived Stop after its leader exited", child)
+}
+
+func TestStopSocketDoesNotAcknowledgeTerminationFailure(t *testing.T) {
+	previous := stopSessionConn
+	t.Cleanup(func() { stopSessionConn = previous })
+	for _, refuse := range []bool{false, true} {
+		stopSessionConn = func(*sessionConn) error {
+			if refuse {
+				return errors.New("termination refused")
+			}
+			return nil
+		}
+		client, server := net.Pipe()
+		if err := client.SetDeadline(time.Now().Add(testutil.GoroutineRaceTimeout)); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() { defer close(done); handleSessionConn(server, &sessionConn{}) }()
+		if _, err := client.Write([]byte("stop\n")); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := bufio.NewReader(client).ReadString('\n')
+		_ = client.Close()
+		<-done
+		if refuse && (err == nil || reply == "ok\n") {
+			t.Fatalf("failed termination acknowledged: reply=%q err=%v", reply, err)
+		}
+		if !refuse && (err != nil || reply != "ok\n") {
+			t.Fatalf("successful termination reply=%q err=%v", reply, err)
+		}
+	}
+}
+
+// The leader has already been reaped when termination begins. Its surviving
+// group must be refused without receiving a signal based on an unproven owner.
+func TestTerminateRefusesReapedLeaderWithLiveGroup(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.pid")
+	termPath := filepath.Join(dir, "term")
+	checkPath := filepath.Join(dir, "check")
+	ackPath := filepath.Join(dir, "ack")
+	cmd := exec.Command("sh", "-c", `
+sh -c 'trap '\''echo term > "$1"'\'' TERM
+ echo $$ > "$2"
+ while [ ! -e "$3" ]; do sleep 0.01; done
+ : > "$4"
+ while :; do sleep 1; done' sh "$1" "$2" "$3" "$4" &
+while [ ! -s "$2" ]; do sleep 0.01; done
+`, "sh", termPath, childPath, checkPath, ackPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	group := cmd.Process.Pid
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(testutil.ExecRaceTimeout):
+		_ = syscall.Kill(-group, syscall.SIGKILL)
+		<-waited
+		t.Fatal("leader did not exit after its child became ready")
+	}
+	data, err := os.ReadFile(childPath)
+	if err != nil {
+		_ = syscall.Kill(-group, syscall.SIGKILL)
+		t.Fatal(err)
+	}
+	child, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || child <= 1 {
+		_ = syscall.Kill(-group, syscall.SIGKILL)
+		t.Fatalf("invalid child PID %q: %v", data, err)
+	}
+	identity, err := pidutil.StartTime(child)
+	if err != nil {
+		_ = syscall.Kill(-group, syscall.SIGKILL)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if pidutil.AliveWithStartTime(child, identity) {
+			_ = syscall.Kill(-group, syscall.SIGKILL)
+		}
+	})
+	if pgid, err := syscall.Getpgid(child); err != nil || pgid != group {
+		t.Fatalf("child group = %d, %v; want %d", pgid, err, group)
+	}
+	if !pidutil.AliveWithStartTime(child, identity) {
+		t.Fatal("child was not alive at termination entry")
+	}
+	done := make(chan struct{})
+	close(done) // cmd.Wait above has actually reaped this leader.
+	stopErr := runtime.TerminateManagedProcess(cmd, done, 25*time.Millisecond, pidutil.StartTime)
+	if err := os.WriteFile(checkPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(testutil.ExecRaceTimeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(ackPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(ackPath); err != nil {
+		t.Fatalf("surviving child did not acknowledge the post-stop check: %v", err)
+	}
+	if stopErr == nil {
+		t.Error("termination acknowledged an unproven live process group")
+	}
+	if _, err := os.Stat(termPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("unproven live process group received SIGTERM: marker error=%v", err)
 	}
 }

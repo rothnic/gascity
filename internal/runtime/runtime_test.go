@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"syscall"
 	"testing"
 )
 
@@ -280,5 +283,60 @@ func TestMetaValueFoldsOnlyMetaUnsupported(t *testing.T) {
 				t.Errorf("MetaValue(%q, %v) = (%q, %v), want (%q, %v)", tc.v, tc.err, got, err, tc.want, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestTerminateManagedProcessRefusesMissingIdentityReader(t *testing.T) {
+	cmd := &exec.Cmd{Process: &os.Process{Pid: -1}}
+	if err := TerminateManagedProcess(cmd, nil, 0, nil); err == nil {
+		t.Fatal("termination accepted a missing process identity reader")
+	}
+}
+
+func TestExitedManagedGroupRefusesForeignIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		current  string
+		readErr  error
+		probeErr error
+		wantKill bool
+		wantErr  bool
+	}{
+		{name: "original leader", current: "original", wantKill: true},
+		{name: "reaped leader", readErr: errors.New("gone"), probeErr: syscall.ESRCH, wantKill: true},
+		{name: "recycled PID", current: "foreign"},
+		{name: "unknown identity", readErr: errors.New("unreadable"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			killed := false
+			err := signalExitedManagedGroup(123, "original", func(int) (string, error) { return tc.current, tc.readErr }, func(pid int, signal syscall.Signal) error {
+				if signal == 0 {
+					return tc.probeErr
+				}
+				if pid != -123 || signal != syscall.SIGKILL {
+					t.Fatalf("signal(%d, %v), want group-only SIGKILL", pid, signal)
+				}
+				killed = true
+				return nil
+			})
+			if (err != nil) != tc.wantErr || killed != tc.wantKill {
+				t.Fatalf("err=%v killed=%v, want error=%v killed=%v", err, killed, tc.wantErr, tc.wantKill)
+			}
+		})
+	}
+}
+
+func TestExitedManagedGroupReturnsSignalError(t *testing.T) {
+	refused := errors.New("group signal refused")
+	err := signalExitedManagedGroup(123, "original", func(int) (string, error) {
+		return "original", nil
+	}, func(pid int, signal syscall.Signal) error {
+		if pid != -123 || signal != syscall.SIGKILL {
+			t.Fatalf("signal(%d, %v), want group-only SIGKILL", pid, signal)
+		}
+		return refused
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("group escalation error = %v, want %v", err, refused)
 	}
 }

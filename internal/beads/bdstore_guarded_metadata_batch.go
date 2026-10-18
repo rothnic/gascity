@@ -9,12 +9,16 @@ import (
 	"github.com/steveyegge/beads/issueops"
 )
 
-const bdGuardedBatchCapability = "issues.batchApply.cli.v1"
+const (
+	bdGuardedBatchCapability   = "issues.batchApply.cli.json.v1"
+	bdExactStoreReadCapability = "issues.getExact.cli.json.v1"
+)
 
 var _ GuardedMetadataBatchStore = (*BdStore)(nil)
 
 // SnapshotMetadata uses the native reader's raw metadata and opaque revisions.
-// The store-free capability probe cannot accidentally invoke legacy bd batch.
+// The store-free probe requires the exact-store reader and JSON batch grammar.
+// An ordinary show can route a locally missing ID into a foreign store.
 func (s *BdStore) SnapshotMetadata(ids []string) ([]MetadataSnapshot, error) {
 	if len(ids) == 0 || len(ids) > issueops.MaxApplyBatchItems {
 		return nil, fmt.Errorf("metadata snapshot requires 1..%d IDs: %w", issueops.MaxApplyBatchItems, issueops.ErrValidation)
@@ -26,22 +30,23 @@ func (s *BdStore) SnapshotMetadata(ids []string) ([]MetadataSnapshot, error) {
 	}
 	version, err := s.runner(s.dir, "bd", "version", "--json")
 	if err != nil {
-		return nil, fmt.Errorf("probing native guarded batch capability: %w", err)
+		return nil, fmt.Errorf("probing native exact-read and guarded batch capabilities: %w", err)
 	}
 	var capability struct {
 		Capabilities []string `json:"capabilities"`
 	}
 	if err := json.Unmarshal(bdGuardedJSONBody(version), &capability); err != nil {
-		return nil, fmt.Errorf("parsing native guarded batch capability: %w", err)
+		return nil, fmt.Errorf("parsing native exact-read and guarded batch capabilities: %w", err)
 	}
-	capable := false
+	batchCapable, readCapable := false, false
 	for _, name := range capability.Capabilities {
-		capable = capable || name == bdGuardedBatchCapability
+		batchCapable = batchCapable || name == bdGuardedBatchCapability
+		readCapable = readCapable || name == bdExactStoreReadCapability
 	}
-	if !capable {
+	if !batchCapable || !readCapable {
 		return nil, ErrConditionalWriteUnsupported
 	}
-	args := append([]string{"show", "--json", "--"}, ids...)
+	args := append([]string{"show", "--exact-store", "--json", "--"}, ids...)
 	out, err := s.runner(s.dir, "bd", args...)
 	if err != nil {
 		return nil, fmt.Errorf("reading native metadata snapshots: %w", err)
@@ -86,44 +91,73 @@ func (s *BdStore) ApplyGuardedMetadataBatch(request GuardedMetadataBatchRequest)
 		func(id string) (MetadataSnapshot, error) { return byID[id], nil }, s.applyNativeGuardedBatch)
 }
 
+// These wire structs spell only the update/normal-close subset emitted by the
+// guarded planner. Actor remains a CLI flag, outside the request document.
+type bdGuardedMetadataRef struct {
+	ID string `json:"id"`
+}
+
+type bdGuardedMetadataEdits struct {
+	Set   map[string]json.RawMessage `json:"set,omitempty"`
+	Unset []string                   `json:"unset,omitempty"`
+}
+
+type bdGuardedMetadataUpdate struct {
+	Target           bdGuardedMetadataRef `json:"target"`
+	ExpectedVersion  string               `json:"expected_version"`
+	ExpectedStatus   *issueops.Status     `json:"expected_status,omitempty"`
+	ExpectedAssignee *string              `json:"expected_assignee,omitempty"`
+	Patch            struct {
+		Metadata bdGuardedMetadataEdits `json:"metadata"`
+	} `json:"patch"`
+}
+
+type bdGuardedMetadataClose struct {
+	Target  bdGuardedMetadataRef `json:"target"`
+	Reason  string               `json:"reason"`
+	Session string               `json:"session"`
+	Force   bool                 `json:"force"`
+}
+
+type bdGuardedMetadataItem struct {
+	Kind   issueops.ItemKind        `json:"kind"`
+	Update *bdGuardedMetadataUpdate `json:"update,omitempty"`
+	Close  *bdGuardedMetadataClose  `json:"close,omitempty"`
+}
+
+type bdGuardedMetadataWireRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	Request       struct {
+		Items      []bdGuardedMetadataItem `json:"items"`
+		Provenance string                  `json:"provenance"`
+	} `json:"request"`
+}
+
 func (s *BdStore) applyNativeGuardedBatch(batch issueops.ApplyBatchRequest) (issueops.ApplyBatchResult, error) {
-	// This is the existing Beads batchApply wire format, restricted to the
-	// update/normal-close plan produced by prepareGuardedMetadataBatch.
-	items := make([]any, len(batch.Items))
+	var request bdGuardedMetadataWireRequest
+	request.SchemaVersion = "1"
+	request.Request.Provenance = batch.Provenance
+	request.Request.Items = make([]bdGuardedMetadataItem, len(batch.Items))
 	for i, item := range batch.Items {
+		wire := bdGuardedMetadataItem{Kind: item.Kind}
 		switch item.Kind {
 		case issueops.ItemUpdate:
 			u := item.Update
-			payload := map[string]any{
-				"target":           map[string]string{"id": u.Target.ID},
-				"expected_version": strconv.FormatInt(*u.ExpectedVersion, 10),
-				"patch":            map[string]any{"metadata": map[string]any{"set": u.Patch.Metadata.Set, "unset": u.Patch.Metadata.Unset}},
+			wire.Update = &bdGuardedMetadataUpdate{
+				Target:          bdGuardedMetadataRef{ID: u.Target.ID},
+				ExpectedVersion: strconv.FormatInt(*u.ExpectedVersion, 10),
+				ExpectedStatus:  u.ExpectedStatus, ExpectedAssignee: u.ExpectedAssignee,
 			}
-			// Omitted edits must stay omitted: null is not a metadata edit array.
-			metadata := payload["patch"].(map[string]any)["metadata"].(map[string]any)
-			if len(u.Patch.Metadata.Set) == 0 {
-				delete(metadata, "set")
-			}
-			if len(u.Patch.Metadata.Unset) == 0 {
-				delete(metadata, "unset")
-			}
-			if u.ExpectedStatus != nil {
-				payload["expected_status"] = *u.ExpectedStatus
-			}
-			if u.ExpectedAssignee != nil {
-				payload["expected_assignee"] = *u.ExpectedAssignee
-			}
-			items[i] = map[string]any{"kind": "update", "update": payload}
+			wire.Update.Patch.Metadata = bdGuardedMetadataEdits{Set: u.Patch.Metadata.Set, Unset: u.Patch.Metadata.Unset}
 		case issueops.ItemClose:
 			c := item.Close
-			items[i] = map[string]any{"kind": "close", "close": map[string]any{
-				"target": map[string]string{"id": c.Target.ID}, "reason": c.Reason, "session": c.Session, "force": false,
-			}}
+			wire.Close = &bdGuardedMetadataClose{Target: bdGuardedMetadataRef{ID: c.Target.ID}, Reason: c.Reason, Session: c.Session}
 		default:
 			return issueops.ApplyBatchResult{}, fmt.Errorf("unsupported guarded native item %q", item.Kind)
 		}
+		request.Request.Items[i] = wire
 	}
-	wire, err := json.Marshal(map[string]any{"actor": batch.Actor, "items": items, "provenance": batch.Provenance})
+	wire, err := json.Marshal(request)
 	if err != nil {
 		return issueops.ApplyBatchResult{}, err
 	}
@@ -139,7 +173,7 @@ func (s *BdStore) applyNativeGuardedBatch(batch issueops.ApplyBatchRequest) (iss
 	if err := file.Close(); err != nil {
 		return issueops.ApplyBatchResult{}, err
 	}
-	out, err := s.runner(s.dir, "bd", "batch", "apply", "--request", file.Name(), "--json")
+	out, err := s.runner(s.dir, "bd", "--actor", batch.Actor, "batch", "--input-format=json", "--file", file.Name(), "--json")
 	if err != nil {
 		if body, ok := parseBdConditionalErrorBody(out, err); ok {
 			var refusal error
@@ -160,6 +194,15 @@ func (s *BdStore) applyNativeGuardedBatch(batch issueops.ApplyBatchRequest) (iss
 			}
 		}
 		return issueops.ApplyBatchResult{}, err
+	}
+	var schema struct {
+		Version *int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(out, &schema); err != nil {
+		return issueops.ApplyBatchResult{}, fmt.Errorf("parsing native guarded batch acknowledgment (commit outcome unknown): %w", err)
+	}
+	if schema.Version == nil || *schema.Version != 1 {
+		return issueops.ApplyBatchResult{}, fmt.Errorf("unsupported native guarded batch acknowledgment schema (commit outcome unknown)")
 	}
 	var response struct {
 		Keys  map[string]string `json:"keys"`

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	guardedVersionJSON = `{"capabilities":["issues.batchApply.cli.v1"]}`
+	guardedVersionJSON = `{"capabilities":["issues.batchApply.cli.json.v1","issues.getExact.cli.json.v1"]}`
 	guardedRowsJSON    = `[{"id":"gc-guard","revision":"9223372036854775807","status":"in_progress","assignee":"worker","issue_type":"task","metadata":{"nonce":"old","large":9007199254740993123456789,"bool":true,"object":{"x":1},"array":[1,false],"null":null}},{"id":"gc-payload","revision":"19","status":"open","issue_type":"task","metadata":{"payload":"old"}}]`
 )
 
@@ -30,6 +30,10 @@ func TestBdGuardedMetadataRefusesOlderCapabilityBeforeShowOrBatch(t *testing.T) 
 		err          error
 	}{
 		{"older", `{"version":"1.3.1"}`, nil},
+		{"batch-without-exact-reader", `{"capabilities":["issues.batchApply.cli.json.v1"]}`, nil},
+		{"exact-reader-without-batch", `{"capabilities":["issues.getExact.cli.json.v1"]}`, nil},
+		{"other-cli-grammar", `{"capabilities":["issues.batchApply.cli.v1"]}`, nil},
+		{"http-only", `{"capabilities":["issues.batchApplyLarge"]}`, nil},
 		{"malformed", `{"capabilities":`, nil},
 		{"failed-probe", "", errors.New("unavailable")},
 	} {
@@ -57,7 +61,7 @@ func TestBdGuardedMetadataKeepsRawTypedSnapshot(t *testing.T) {
 		if args[0] == "version" {
 			return []byte(`{"schema_version":1,"data":` + guardedVersionJSON + `}`), nil
 		}
-		if !reflect.DeepEqual(args, []string{"show", "--json", "--", "gc-guard", "gc-payload"}) {
+		if !reflect.DeepEqual(args, []string{"show", "--exact-store", "--json", "--", "gc-guard", "gc-payload"}) {
 			t.Fatalf("unsafe exact-ID arguments: %v", args)
 		}
 		return []byte(guardedRowsJSON), nil
@@ -90,11 +94,11 @@ func TestBdGuardedMetadataUsesOneGuardedNativeRequestAndNormalClose(t *testing.T
 			return []byte(guardedVersionJSON), nil
 		case "show":
 			return []byte(guardedRowsJSON), nil
-		case "batch":
-			if dir != "owned" || name != "bd" || len(args) != 5 || args[1] != "apply" || args[2] != "--request" || args[4] != "--json" {
+		case "--actor":
+			if dir != "owned" || name != "bd" || len(args) != 7 || args[0] != "--actor" || args[1] != nativeDoltStoreActor || args[2] != "batch" || args[3] != "--input-format=json" || args[4] != "--file" || args[6] != "--json" {
 				t.Fatalf("wrong native batch: %v", args)
 			}
-			requestPath = args[3]
+			requestPath = args[5]
 			info, err := os.Stat(requestPath)
 			if err != nil || info.Mode().Perm() != 0o600 {
 				t.Fatalf("request permissions: %v %v", info, err)
@@ -104,39 +108,42 @@ func TestBdGuardedMetadataUsesOneGuardedNativeRequestAndNormalClose(t *testing.T
 				t.Fatal(err)
 			}
 			var wire struct {
-				Actor string `json:"actor"`
-				Items []struct {
-					Kind   string `json:"kind"`
-					Update struct {
-						ExpectedVersion  string `json:"expected_version"`
-						ExpectedStatus   string `json:"expected_status"`
-						ExpectedAssignee string `json:"expected_assignee"`
-						Patch            struct {
-							Metadata struct {
-								Set     map[string]json.RawMessage `json:"set"`
-								Replace json.RawMessage            `json:"replace"`
-							} `json:"metadata"`
-						} `json:"patch"`
-					} `json:"update"`
-					Close struct {
-						Reason, Session string
-						Force           bool
-					} `json:"close"`
-				} `json:"items"`
+				SchemaVersion string `json:"schema_version"`
+				Request       struct {
+					Actor json.RawMessage `json:"actor"`
+					Items []struct {
+						Kind   string `json:"kind"`
+						Update struct {
+							ExpectedVersion  string `json:"expected_version"`
+							ExpectedStatus   string `json:"expected_status"`
+							ExpectedAssignee string `json:"expected_assignee"`
+							Patch            struct {
+								Metadata struct {
+									Set     map[string]json.RawMessage `json:"set"`
+									Replace json.RawMessage            `json:"replace"`
+								} `json:"metadata"`
+							} `json:"patch"`
+						} `json:"update"`
+						Close struct {
+							Reason, Session string
+							Force           bool
+						} `json:"close"`
+					} `json:"items"`
+				} `json:"request"`
 			}
 			if err := json.Unmarshal(raw, &wire); err != nil {
 				t.Fatal(err)
 			}
-			if wire.Actor != nativeDoltStoreActor || len(wire.Items) != 3 || wire.Items[0].Update.ExpectedVersion != "9223372036854775807" || wire.Items[0].Update.ExpectedStatus != "in_progress" || wire.Items[0].Update.ExpectedAssignee != "worker" {
+			if wire.SchemaVersion != "1" || len(wire.Request.Actor) != 0 || len(wire.Request.Items) != 3 || wire.Request.Items[0].Update.ExpectedVersion != "9223372036854775807" || wire.Request.Items[0].Update.ExpectedStatus != "in_progress" || wire.Request.Items[0].Update.ExpectedAssignee != "worker" {
 				t.Fatalf("guard changed on transport: %s", raw)
 			}
-			if string(wire.Items[0].Update.Patch.Metadata.Set["nonce"]) != `"new"` || len(wire.Items[0].Update.Patch.Metadata.Replace) != 0 {
+			if string(wire.Request.Items[0].Update.Patch.Metadata.Set["nonce"]) != `"new"` || len(wire.Request.Items[0].Update.Patch.Metadata.Replace) != 0 {
 				t.Fatalf("patch replaced typed siblings: %s", raw)
 			}
-			if wire.Items[2].Kind != "close" || wire.Items[2].Close.Force || wire.Items[2].Close.Session != "admitted-session" || wire.Items[2].Close.Reason != "finished" {
+			if wire.Request.Items[2].Kind != "close" || wire.Request.Items[2].Close.Force || wire.Request.Items[2].Close.Session != "admitted-session" || wire.Request.Items[2].Close.Reason != "finished" {
 				t.Fatalf("normal admitted close changed: %s", raw)
 			}
-			return []byte(`{"keys":{},"items":[{"kind":"update","issue_id":"gc-guard","changed":true,"revision":"-9223372036854775808"},{"kind":"update","issue_id":"gc-payload","changed":true,"revision":"20"},{"kind":"close","issue_id":"gc-payload","changed":true,"revision":"21"}]}`), nil
+			return []byte(`{"schema_version":1,"keys":{},"items":[{"kind":"update","issue_id":"gc-guard","changed":true,"revision":"-9223372036854775808"},{"kind":"update","issue_id":"gc-payload","changed":true,"revision":"20"},{"kind":"close","issue_id":"gc-payload","changed":true,"revision":"21"}]}`), nil
 		default:
 			t.Fatalf("ordinary write fallback: %v", args)
 			return nil, nil
@@ -178,20 +185,26 @@ func TestBdGuardedMetadataNeverRetriesRefusalOrAmbiguousAcknowledgment(t *testin
 		refusal      error
 	}{
 		{"late-status-refusal", `{"code":"status_mismatch","error":"late guard"}`, errors.New("exit 1"), issueops.ErrStatusMismatch},
+		{"native-stderr-refusal", "", errors.New("bd: {\"schema_version\":1,\"code\":\"version_mismatch\",\"error\":\"late guard\"}\nError: exit 13"), issueops.ErrVersionMismatch},
+		{"assignee-refusal", `{"code":"assignee_mismatch","error":"owner moved"}`, errors.New("exit 13"), issueops.ErrAssigneeMismatch},
+		{"validation-refusal", `{"code":"validation_failed","error":"invalid request"}`, errors.New("exit 1"), issueops.ErrValidation},
+		{"close-refusal", `{"code":"close_blocked","error":"blocked"}`, errors.New("exit 1"), issueops.ErrCloseBlocked},
 		{"lost-ack", "", errors.New("connection lost after commit"), nil},
-		{"malformed-ack", `{"keys":`, nil, nil},
-		{"numeric-revision", `{"keys":{},"items":[{"kind":"update","issue_id":"gc-guard","changed":true,"revision":19}]}`, nil, nil},
-		{"missing-items", `{"keys":{},"items":[]}`, nil, nil},
+		{"malformed-ack", `{"schema_version":1,"keys":`, nil, nil},
+		{"numeric-revision", `{"schema_version":1,"keys":{},"items":[{"kind":"update","issue_id":"gc-guard","changed":true,"revision":19}]}`, nil, nil},
+		{"missing-items", `{"schema_version":1,"keys":{},"items":[]}`, nil, nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			writes := 0
+			var requestPath string
 			store := NewBdStore("owned", func(_ string, _ string, args ...string) ([]byte, error) {
 				switch args[0] {
 				case "version":
 					return []byte(guardedVersionJSON), nil
 				case "show":
 					return []byte(guardedRowsJSON), nil
-				case "batch":
+				case "--actor":
+					requestPath = args[5]
 					writes++
 					return []byte(c.output), c.err
 				default:
@@ -206,6 +219,9 @@ func TestBdGuardedMetadataNeverRetriesRefusalOrAmbiguousAcknowledgment(t *testin
 			if c.refusal != nil && !errors.Is(err, c.refusal) {
 				t.Fatalf("lost typed native refusal: %v", err)
 			}
+			if _, err := os.Stat(requestPath); !os.IsNotExist(err) {
+				t.Fatalf("private request not removed after failure: %v", err)
+			}
 		})
 	}
 }
@@ -217,5 +233,83 @@ func TestProxiedGuardedMetadataRefusesUnsupportedWriteLeaf(t *testing.T) {
 	}
 	if _, err := store.ApplyGuardedMetadataBatch(guardedBDRequest()); !errors.Is(err, ErrConditionalWriteUnsupported) {
 		t.Fatalf("batch used native leaf: %v", err)
+	}
+}
+
+func TestBdGuardedMetadataPortKeepsDeleteOnlyAndEmptyAssignee(t *testing.T) {
+	request := guardedBDRequest()
+	empty := ""
+	request.Rows[1].Set = nil
+	request.Rows[1].Delete = []string{"payload"}
+	request.Rows[1].ExpectedAssignee = &empty
+	writes := 0
+	store := NewBdStore("owned", func(_ string, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "version":
+			return []byte(guardedVersionJSON), nil
+		case "show":
+			return []byte(guardedRowsJSON), nil
+		case "--actor":
+			writes++
+			raw, err := os.ReadFile(args[5])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire bdGuardedMetadataWireRequest
+			if err := json.Unmarshal(raw, &wire); err != nil {
+				t.Fatal(err)
+			}
+			update := wire.Request.Items[1].Update
+			if update.ExpectedAssignee == nil || *update.ExpectedAssignee != "" ||
+				len(update.Patch.Metadata.Set) != 0 || !reflect.DeepEqual(update.Patch.Metadata.Unset, []string{"payload"}) ||
+				strings.Contains(string(raw), `"set":null`) {
+				t.Fatalf("typed wire lost deletion or explicit empty-assignee guard: %s", raw)
+			}
+			return []byte(`{"schema_version":1,"keys":{},"items":[{"kind":"update","issue_id":"gc-guard","changed":true,"revision":"18"},{"kind":"update","issue_id":"gc-payload","changed":true,"revision":"20"},{"kind":"close","issue_id":"gc-payload","changed":true,"revision":"21"}]}`), nil
+		default:
+			t.Fatalf("ordinary write fallback: %v", args)
+			return nil, nil
+		}
+	})
+	if rows, err := store.ApplyGuardedMetadataBatch(request); err != nil || len(rows) != 2 || writes != 1 {
+		t.Fatalf("delete-only transport = %+v, %v, %d writes", rows, err, writes)
+	}
+}
+
+func TestBdGuardedMetadataRequiresVersionedAcknowledgment(t *testing.T) {
+	plan, err := prepareGuardedMetadataBatch(guardedBDRequest(), nativeDoltStoreActor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = `"keys":{},"items":[{"kind":"update","issue_id":"gc-guard","changed":true,"revision":"0"},{"kind":"update","issue_id":"gc-payload","changed":true,"revision":"20"},{"kind":"close","issue_id":"gc-payload","changed":true,"revision":"21"}]`
+	for _, c := range []struct {
+		name, output string
+		valid        bool
+	}{
+		{"flat", `{"schema_version":1,` + body + `}`, true},
+		{"envelope", `{"schema_version":1,"data":{` + body + `}}`, true},
+		{"missing", `{` + body + `}`, false},
+		{"unsupported", `{"schema_version":2,` + body + `}`, false},
+		{"string", `{"schema_version":"1",` + body + `}`, false},
+		{"null", `{"schema_version":null,` + body + `}`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			writes := 0
+			store := NewBdStore("owned", func(_ string, _ string, _ ...string) ([]byte, error) {
+				writes++
+				return []byte(c.output), nil
+			})
+			result, err := store.applyNativeGuardedBatch(plan.batch)
+			if writes != 1 {
+				t.Fatalf("native acknowledgment triggered %d writes, want one", writes)
+			}
+			if c.valid {
+				if err != nil || len(result.Items) != 3 || result.Items[0].RowVersion != 0 {
+					t.Fatalf("valid versioned acknowledgment lost zero revision: %+v, %v", result, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "commit outcome unknown") || len(result.Items) != 0 {
+				t.Fatalf("untrusted acknowledgment accepted: %+v, %v", result, err)
+			}
+		})
 	}
 }

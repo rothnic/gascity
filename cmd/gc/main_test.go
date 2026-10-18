@@ -223,6 +223,11 @@ func testscriptGC() {
 }
 
 func TestMain(m *testing.M) {
+	if marker, ok := workflowServeSignalChildInvocation(os.Args); ok {
+		workflowServeSignalChildMarker = marker
+		os.Args = os.Args[:len(os.Args)-1]
+		os.Exit(m.Run())
+	}
 	maybeRunHostedBeadsCredentialProvider()
 	maybeRunProductMetricsDirectChildEnvSpy()
 	maybeRunFakeDoltSQLServer()

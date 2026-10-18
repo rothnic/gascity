@@ -791,6 +791,8 @@ func (p *Provider) startControlSocket(name string, sc *sessionConn, dir string, 
 	return lis, nil
 }
 
+var stopSessionConn = terminateSessionConn
+
 // handleSessionConn reads a command from the connection and acts on the process.
 func handleSessionConn(conn net.Conn, sc *sessionConn) {
 	defer conn.Close()                                     //nolint:errcheck
@@ -801,7 +803,9 @@ func handleSessionConn(conn net.Conn, sc *sessionConn) {
 	}
 	switch scanner.Text() {
 	case "stop":
-		_ = terminateSessionConn(sc)
+		if err := stopSessionConn(sc); err != nil {
+			return
+		}
 		conn.Write([]byte("ok\n")) //nolint:errcheck
 	case "interrupt":
 		_ = runtime.SignalProcessGroup(sc.cmd, syscall.SIGINT)
@@ -966,7 +970,7 @@ func isUnavailableSocketError(err error) bool {
 // process and returns once reap has finished, so a stopped session's sidecar
 // is gone when Stop (or a socket "stop") returns.
 func terminateSessionConn(sc *sessionConn) error {
-	err := runtime.TerminateManagedProcess(sc.cmd, sc.done, runtime.ManagedProcessStopGrace)
+	err := runtime.TerminateManagedProcess(sc.cmd, sc.done, runtime.ManagedProcessStopGrace, proctable.ProcessIdentity)
 	<-sc.reaped
 	return err
 }

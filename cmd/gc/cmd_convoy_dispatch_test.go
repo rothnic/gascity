@@ -9,10 +9,12 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -11354,5 +11356,85 @@ func TestWorkflowDeleteSourceLocksTheCityScopeForABindingTarget(t *testing.T) {
 	takeSourceWorkflowLock(t, cityPath, convoyBindingViewPath, source.ID)
 	if after := sourceWorkflowLockFiles(t, cityPath); len(after) != 2 {
 		t.Errorf("the binding's view path hashes to the same file as the city scope (%v), so this test cannot tell them apart", after)
+	}
+}
+
+const workflowServeSignalChildArg = "--gc-test-workflow-serve-signal="
+
+var workflowServeSignalChildMarker string
+
+// The signal child runs only this test, before TestMain installs the normal
+// shard cleanup guards. A real SIGTERM must never target those parent guards.
+func workflowServeSignalChildInvocation(args []string) (string, bool) {
+	if len(args) != 4 || args[1] != "-test.run=^TestRunWorkflowServeFollowStopsAfterFinalizerSIGTERM$" || args[2] != "-test.v" {
+		return "", false
+	}
+	marker, ok := strings.CutPrefix(args[3], workflowServeSignalChildArg)
+	return marker, ok && filepath.IsAbs(marker)
+}
+
+// A finalizer temporarily catches SIGTERM while holding its source-workflow
+// lock. The enclosing follow command must remember that stop after it returns.
+func TestRunWorkflowServeFollowStopsAfterFinalizerSIGTERM(t *testing.T) {
+	if workflowServeSignalChildMarker == "" {
+		root := t.TempDir()
+		sentinel := filepath.Join(root, "parent-alive")
+		if err := os.WriteFile(sentinel, []byte("parent-alive\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(root, "signal-child-complete")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRunWorkflowServeFollowStopsAfterFinalizerSIGTERM$", "-test.v", workflowServeSignalChildArg+marker)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("signal child failed: %v\n%s", err, output)
+		}
+		for path, want := range map[string]string{sentinel: "parent-alive\n", marker: "signal-child-complete\n"} {
+			if got, err := os.ReadFile(path); err != nil || string(got) != want {
+				t.Fatalf("signal child receipt %s = %q, %v; want %q", path, got, err, want)
+			}
+		}
+		return
+	}
+	ep := newTestProvider(t, t.TempDir())
+	commandCtx, stop := sourceWorkflowCommandContext()
+	defer stop()
+	previousContext := workflowServeCommandContext
+	workflowServeCommandContext = func() (context.Context, context.CancelFunc) { return commandCtx, func() {} }
+	previousList, previousControl, previousProvider := workflowServeList, controlDispatcherServe, workflowServeOpenEventsProvider
+	t.Cleanup(func() {
+		workflowServeCommandContext = previousContext
+		workflowServeList, controlDispatcherServe, workflowServeOpenEventsProvider = previousList, previousControl, previousProvider
+	})
+	workflowServeOpenEventsProvider = func(io.Writer) (events.Provider, error) { return ep, nil }
+	queries := 0
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		queries++
+		if queries > 1 {
+			return nil, errors.New("queried again after SIGTERM")
+		}
+		return []hookBead{{ID: "finalize", Metadata: hookBeadMetadata{"gc.kind": "workflow-finalize"}}}, nil
+	}
+	controlDispatcherServe = func(_, _, _ string, _, _ io.Writer, _ *executionEmitDeferral) error {
+		ctx, stop := sourceWorkflowCommandContext()
+		defer stop()
+		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+			return err
+		}
+		awaitClose(t, ctx.Done(), "finalizer SIGTERM cancellation")
+		// Wait for the enclosing command context too; NotifyContext cancels
+		// separate listeners asynchronously.
+		awaitClose(t, commandCtx.Done(), "follow SIGTERM cancellation")
+		return nil
+	}
+	err := runWorkflowServeFollow(config.Agent{Name: "control-dispatcher"}, t.TempDir(), t.TempDir(), "", nil, io.Discard)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("follow error = %v, want cancellation after finalizer SIGTERM", err)
+	}
+	if queries != 1 {
+		t.Fatalf("queries = %d, want no query after SIGTERM", queries)
+	}
+	if err := os.WriteFile(workflowServeSignalChildMarker, []byte("signal-child-complete\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

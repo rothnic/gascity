@@ -235,8 +235,9 @@ becoming more useful as models improve — it becomes LESS useful instead.
 - Native guarded metadata requests check controller and coordination ownership
   before close-policy or backend effects. Both the original row and projected
   metadata must remain eligible; removing an ownership mark cannot authorize a write.
-  Proxied stores use the advertised native `bd batch apply` capability and normal
-  notifying provider. Unsupported CLI versions refuse before writes; never
+  Proxied stores require advertised exact-store reads and versioned native JSON
+  batch capabilities, using the normal notifying provider. Unsupported CLI
+  versions refuse before writes; never
   substitute separate updates or direct SQL for the guarded transaction.
 - Comments describe current behavior; don't narrate removed functionality.
 - Role names never appear in Go code. If you're writing `if role == "mayor"`,

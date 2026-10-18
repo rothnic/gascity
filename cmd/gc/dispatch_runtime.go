@@ -40,6 +40,7 @@ func applyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string,
 }
 
 var (
+	workflowServeCommandContext     = sourceWorkflowCommandContext
 	workflowServeList               = nextWorkflowServeBeads
 	controlDispatcherServe          = runControlDispatcherInStore
 	workflowServeOpenEventsProvider = func(stderr io.Writer) (events.Provider, error) {
@@ -434,11 +435,18 @@ type workflowServeDrainResult struct {
 // whether the queue still contains only pending work so the --follow caller
 // can distinguish blocked work from genuine idle.
 func drainWorkflowServeWork(agentCfg config.Agent, cityPath, storePath, workQuery string, workEnv map[string]string, stderr io.Writer) (workflowServeDrainResult, error) {
+	return drainWorkflowServeWorkContext(context.Background(), agentCfg, cityPath, storePath, workQuery, workEnv, stderr)
+}
+
+func drainWorkflowServeWorkContext(ctx context.Context, agentCfg config.Agent, cityPath, storePath, workQuery string, workEnv map[string]string, stderr io.Writer) (workflowServeDrainResult, error) {
 	result := workflowServeDrainResult{}
 	idlePolls := 0
 	emits := newExecutionEmitDeferral(cityPath, storePath, stderr)
 	defer emits.flush()
 	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		serveQuery := workflowServeWorkQuery(agentCfg, workQuery)
 		queue, err := workflowServeList(serveQuery, storePath, workEnv)
 		if err == nil {
@@ -469,6 +477,9 @@ func drainWorkflowServeWork(agentCfg config.Agent, cityPath, storePath, workQuer
 		processedThisCycle := false
 		pendingCount := 0
 		for _, candidate := range queue {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			beadID := candidate.ID
 			kind := strings.TrimSpace(candidate.Metadata[beadmeta.KindMetadataKey])
 			workflowTracef("serve process bead=%s kind=%s store=%s", beadID, kind, storePath)
@@ -540,6 +551,9 @@ func drainWorkflowServeWork(agentCfg config.Agent, cityPath, storePath, workQuer
 }
 
 func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuery string, workEnv map[string]string, stderr io.Writer) error {
+	ctx, stop := workflowServeCommandContext()
+	defer stop()
+
 	ep, err := workflowServeOpenEventsProvider(stderr)
 	if err != nil {
 		return err
@@ -550,7 +564,7 @@ func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuer
 	if err != nil {
 		return fmt.Errorf("reading current event cursor: %w", err)
 	}
-	watcher, err := ep.Watch(context.Background(), afterSeq)
+	watcher, err := ep.Watch(ctx, afterSeq)
 	if err != nil {
 		return fmt.Errorf("watching city events: %w", err)
 	}
@@ -564,7 +578,7 @@ func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuer
 	idleSweeps := 0
 	var pendingWakeErr error
 	for {
-		drainResult, err := drainWorkflowServeWork(agentCfg, cityPath, storePath, workQuery, workEnv, stderr)
+		drainResult, err := drainWorkflowServeWorkContext(ctx, agentCfg, cityPath, storePath, workQuery, workEnv, stderr)
 		if err != nil {
 			// A transient work-query/store failure — most commonly the
 			// work-query timeout (hookWorkQueryTimeout) when the bead store is
@@ -580,6 +594,9 @@ func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuer
 			}
 			workflowTracef("serve drain-transient-retry agent=%s err=%v", agentCfg.QualifiedName(), err)
 			drainResult = workflowServeDrainResult{}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if pendingWakeErr != nil {
 			// The previous wait observed a relevant event and then a fatal

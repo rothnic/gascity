@@ -1288,7 +1288,10 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	durable, stamped := stampHookClaimIdentity(bead, opts, ops, dir, stderr)
 	if ops.PrepareRunRoot != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		// Preparation keeps the invocation's landing fence; its guarded write
+		// gets a separate reserve inside hookPrepareRunRoot.
+		remaining := ops.claimWindowOrDefault() + hookClaimMutationTimeout - ops.invocationAge()
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
 		err := ops.PrepareRunRoot(ctx, dir, opts.Env, bead)
 		if err == nil {
 			err = ctx.Err()

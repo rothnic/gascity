@@ -952,38 +952,37 @@ func (s scopeSnapshot) skipOpenScopeMembers(store beads.Store, skipControlID str
 	// does not return strictly shrinks it — a preserve deletes its member, a skip
 	// wave deletes every id it closed. So the round count is bounded by the
 	// initial member count, and only a round that neither skips nor preserves
-	// (a genuine blocks cycle among the pending members) is a real deadlock.
+	// (a genuine readiness-blocking cycle among pending members) is a real deadlock.
 	for len(pending) > 0 {
 		ids := sortedPendingIDs(pending)
 		depsByID, err := loadDownDepsForScopeSkip(store, ids)
 		if err != nil {
 			return skipped, err
 		}
-		preserved := 0
-		skippable := make([]string, 0, len(ids))
 		for _, id := range ids {
 			if preserveScopeCheckForSubject(pending[id], depsByID[id], skipControlID) {
 				delete(pending, id)
-				preserved++
-				continue
 			}
-			if !canSkipScopeMemberWithDeps(depsByID[id], pending) {
-				continue
+		}
+		// Close dependents before their prerequisites, so no intermediate close
+		// makes still-open work in the aborted scope ready for dispatch.
+		prerequisites := make(map[string]bool, len(pending))
+		for id := range pending {
+			for _, dep := range depsByID[id] {
+				if beads.IsReadyBlockingDependencyType(dep.Type) {
+					prerequisites[dep.DependsOnID] = true
+				}
 			}
-			skippable = append(skippable, id)
+		}
+		skippable := make([]string, 0, len(pending))
+		for _, id := range ids {
+			if _, open := pending[id]; open && !prerequisites[id] {
+				skippable = append(skippable, id)
+			}
 		}
 		if len(skippable) == 0 {
 			if len(pending) == 0 {
 				break
-			}
-			// Preserving a member IS progress: it drops a blocker out of pending,
-			// and members sorted before it were judged against the pre-preserve
-			// set. Re-plan instead of calling the round a deadlock — finalize
-			// scope-checks are minted after the members they block, so a preserve
-			// routinely lands too late in the pass to unblock anything in the
-			// same round.
-			if preserved > 0 {
-				continue
 			}
 			return skipped, fmt.Errorf("unable to skip remaining scope members: %s", describeStuckScopeMembers(pending, depsByID))
 		}
@@ -1010,7 +1009,7 @@ func describeStuckScopeMembers(pending map[string]beads.Bead, depsByID map[strin
 	for _, id := range sortedPendingIDs(pending) {
 		blockers := make([]string, 0, len(depsByID[id]))
 		for _, dep := range depsByID[id] {
-			if dep.Type != "blocks" {
+			if !beads.IsReadyBlockingDependencyType(dep.Type) {
 				continue
 			}
 			if _, blocked := pending[dep.DependsOnID]; blocked {
@@ -1780,18 +1779,6 @@ func resolveScopeBodyOnce(store beads.Store, rootID, scopeRef string) (beads.Bea
 		return beads.Bead{}, err
 	}
 	return findScopeBody(all, rootID, scopeRef)
-}
-
-func canSkipScopeMemberWithDeps(deps []beads.Dep, pending map[string]beads.Bead) bool {
-	for _, dep := range deps {
-		if dep.Type != "blocks" {
-			continue
-		}
-		if _, blocked := pending[dep.DependsOnID]; blocked {
-			return false
-		}
-	}
-	return true
 }
 
 type scopeSkipDepBatchLister interface {

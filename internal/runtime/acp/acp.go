@@ -22,6 +22,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/proctable"
 )
 
 // stopSocketReplyMargin is how much longer a cross-process stop waits for the
@@ -1175,6 +1176,10 @@ func (p *Provider) startControlSocket(name string, cmd *exec.Cmd, done <-chan st
 	return lis, nil
 }
 
+var stopManagedProcess = func(cmd *exec.Cmd, done <-chan struct{}, grace time.Duration) error {
+	return runtime.TerminateManagedProcess(cmd, done, grace, proctable.ProcessIdentity)
+}
+
 // handleControlConn reads a command from the connection and acts on the process.
 // A "stop" escalates from SIGTERM to SIGKILL after stopGrace. An "interrupt"
 // is fire-and-forget: it replies at once and runs interrupt, the owner's
@@ -1188,7 +1193,9 @@ func handleControlConn(conn net.Conn, cmd *exec.Cmd, done <-chan struct{}, stopG
 	}
 	switch scanner.Text() {
 	case "stop":
-		_ = runtime.TerminateManagedProcess(cmd, done, stopGrace)
+		if err := stopManagedProcess(cmd, done, stopGrace); err != nil {
+			return
+		}
 		conn.Write([]byte("ok\n")) //nolint:errcheck
 	case "interrupt":
 		// The settle can take the whole cancel_timeout plus the SIGINT
@@ -1353,5 +1360,5 @@ func isPipeWriteError(err error) bool {
 // terminateProcess sends SIGTERM then, after grace, SIGKILL to a tracked
 // process group.
 func terminateProcess(sc *sessionConn, grace time.Duration) error {
-	return runtime.TerminateManagedProcess(sc.cmd, sc.done, grace)
+	return runtime.TerminateManagedProcess(sc.cmd, sc.done, grace, proctable.ProcessIdentity)
 }

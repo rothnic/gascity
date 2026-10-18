@@ -286,6 +286,56 @@ func TestHookClaimRootBarrierAndUndeliveredFallback(t *testing.T) {
 	}
 }
 
+func TestHookClaimRootPreparationRetainsLandingWindow(t *testing.T) {
+	originalTimeout := hookClaimMutationTimeout
+	hookClaimMutationTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { hookClaimMutationTimeout = originalTimeout })
+	for _, minted := range []bool{false, true} {
+		t.Run(strconv.FormatBool(minted), func(t *testing.T) {
+			root := beads.Bead{ID: "root", Status: "in_progress", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}}
+			step := beads.Bead{ID: "step", Status: "in_progress", Assignee: "worker", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID, beadmeta.StepIDMetadataKey: "implementation"}}
+			store := &runRootBatchRace{MemStore: beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)}
+			opts := hookClaimOptions{Assignee: "worker", Env: []string{"GC_SESSION_ID=session", "GC_SESSION_NAME=worker"}, VerifiedSession: &session.Info{ID: "session", InstanceToken: "verified"}}
+			releases, starts := 0, 0
+			ops := hookClaimOps{
+				InvokedAt: time.Now(), ClaimWindow: 3 * time.Second,
+				ResolveWorkBranch:     func(hookClaimWorkTree) string { return "" },
+				ResolveSessionWorkDir: func(string) string { return "" },
+				StampWorkMeta: func(_ context.Context, _ string, _ []string, id, _ string, patch map[string]string) error {
+					return store.SetMetadataBatch(id, patch)
+				},
+				ReadWorkMeta:      func(_ context.Context, _ string, _ []string, id, _ string) (beads.Bead, error) { return store.Get(id) },
+				StampSessionClaim: noopStampSessionClaim, PublishRunMap: noopPublishRunMap,
+				PrepareRunRoot: func(ctx context.Context, _ string, _ []string, step beads.Bead) error {
+					// Live routing/session reads can exceed the write reserve while
+					// the invoking turn still has time to receive its claim.
+					timer := time.NewTimer(250 * time.Millisecond)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						return settleRunRootFromStep(gaConfig(), store, step, "worker", "/worker", true, nil)
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				},
+				EmitExecutionStepStarted: func(beads.Bead, string, []string, string) { starts++ },
+				Release:                  func(context.Context, string, []string, string, string) (bool, error) { releases++; return true, nil },
+				EmitClaimReleased:        func(hookClaimReleaseRecord) {},
+			}
+			ops.applyDefaults()
+			var output, stderr bytes.Buffer
+			code := writeHookClaimWorkResultForBead(hookClaimJSONResult{BeadID: step.ID}, step, opts, ops, "/rig", minted, &output, &stderr)
+			if code != 0 || output.String() != step.ID+"\n" || releases != 0 || starts != 1 || len(store.requests) != 1 {
+				t.Fatalf("valid preparation consumed the write reserve: code=%d output=%q releases=%d starts=%d writes=%d stderr=%s", code, output.String(), releases, starts, len(store.requests), stderr.String())
+			}
+			current, err := store.Get(root.ID)
+			if err != nil || current.Metadata[beadmeta.SessionNameMetadataKey] != "worker" || current.Metadata[beadmeta.WorkDirMetadataKey] != "/worker" {
+				t.Fatalf("delivered claim lacks its complete root correlation: root=%+v err=%v", current, err)
+			}
+		})
+	}
+}
+
 func TestHookPrepareRunRootUsesRelocatedClass(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -365,6 +415,107 @@ func TestRunRootStampPreservesWrapperCapabilitiesAndEmission(t *testing.T) {
 				}
 			} else if !reflect.DeepEqual(notifications, []string{"bead.updated:" + root.ID}) {
 				t.Fatalf("controller root write notifications: %v", notifications)
+			}
+		})
+	}
+}
+
+func TestHookPrepareRunRootSeparatesReadAndWriteDeadlines(t *testing.T) {
+	originalTimeout := hookClaimMutationTimeout
+	hookClaimMutationTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { hookClaimMutationTimeout = originalTimeout })
+	for _, failure := range []string{"none", "preparation deadline", "write deadline", "landing deadline", "canceled parent", "canceled after snapshot", "unknown write result"} {
+		t.Run(failure, func(t *testing.T) {
+			clearGCEnv(t)
+			disableManagedDoltRecoveryForTest(t)
+			t.Setenv("GC_BEADS", "file")
+			cityDir := writeFenceTestCity(t)
+			sessionID := newFenceSessionBead(t, cityDir, session.StateActive, "token")
+			cfg, err := loadCityConfig(cityDir, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentBudget := 3 * time.Second
+			if failure == "preparation deadline" {
+				parentBudget = hookClaimMutationTimeout
+			}
+			if failure == "landing deadline" {
+				parentBudget = 300 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), parentBudget)
+			parentDeadline, _ := ctx.Deadline()
+			defer cancel()
+			if failure == "canceled parent" {
+				cancel()
+			}
+			originalRunner := hookClaimCommandRunnerWithEnvContext
+			t.Cleanup(func() { hookClaimCommandRunnerWithEnvContext = originalRunner })
+			reads, writes := 0, 0
+			uncertain := errors.New("native write acknowledgement lost")
+			hookClaimCommandRunnerWithEnvContext = func(commandCtx context.Context, env map[string]string) beads.CommandRunner {
+				if env["BEADS_ACTOR"] != "worker" {
+					t.Fatalf("root runner lost its actor: %q", env["BEADS_ACTOR"])
+				}
+				return func(dir, name string, args ...string) ([]byte, error) {
+					if dir != "/selected-work" || name != "bd" {
+						t.Fatalf("root runner changed selected store: %s %s", dir, name)
+					}
+					if err := commandCtx.Err(); err != nil {
+						return nil, err
+					}
+					switch args[0] {
+					case "version":
+						reads++
+						if reads == 1 {
+							timer := time.NewTimer(250 * time.Millisecond)
+							defer timer.Stop()
+							select {
+							case <-timer.C:
+							case <-commandCtx.Done():
+								return nil, commandCtx.Err()
+							}
+						}
+						return []byte(`{"capabilities":["issues.batchApply.cli.json.v1","issues.getExact.cli.json.v1"]}`), nil
+					case "show":
+						if !reflect.DeepEqual(args, []string{"show", "--exact-store", "--json", "--", "root"}) {
+							t.Fatalf("root read lost exact-store binding: %v", args)
+						}
+						if failure == "canceled after snapshot" && reads == 1 {
+							cancel()
+						}
+						return []byte(`[{"id":"root","revision":"7","status":"in_progress","assignee":"","metadata":{"gc.kind":"workflow"}}]`), nil
+					case "--actor":
+						writes++
+						deadline, bounded := commandCtx.Deadline()
+						if !bounded || time.Until(deadline) > hookClaimMutationTimeout || deadline.After(parentDeadline) {
+							t.Fatalf("root write lacks its separate bounded reserve: deadline=%s bounded=%v", deadline, bounded)
+						}
+						if failure == "write deadline" || failure == "landing deadline" {
+							<-commandCtx.Done()
+							return nil, commandCtx.Err()
+						}
+						if failure == "unknown write result" {
+							return nil, uncertain
+						}
+						return []byte(`{"schema_version":1,"keys":{},"items":[{"kind":"update","issue_id":"root","changed":true,"revision":"8"}]}`), nil
+					default:
+						t.Fatalf("unexpected root command: %v", args)
+						return nil, nil
+					}
+				}
+			}
+			opts := hookClaimOptions{Assignee: "worker", VerifiedSession: &session.Info{ID: sessionID, InstanceToken: "token", SessionNameMetadata: "worker", WorkDir: "/worker"}}
+			step := beads.Bead{ID: "step", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: "root"}}
+			err = hookPrepareRunRoot(cfg, cityDir, opts, nil)(ctx, "/selected-work", nil, step)
+			wantWrites := 1
+			if failure == "preparation deadline" || failure == "canceled parent" || failure == "canceled after snapshot" {
+				wantWrites = 0
+			}
+			if (err == nil) != (failure == "none") || writes != wantWrites {
+				t.Fatalf("root phase outcome: failure=%s writes=%d want=%d error=%v", failure, writes, wantWrites, err)
+			}
+			if failure == "unknown write result" && reads != 2 {
+				t.Fatalf("uncertain root write reread/replayed: probes=%d writes=%d", reads, writes)
 			}
 		})
 	}
