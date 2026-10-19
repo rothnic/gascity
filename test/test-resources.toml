@@ -10,8 +10,8 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 748
-baseline_files = 226
+baseline_calls = 750
+baseline_files = 228
 reported_calls = 495
 reported_files = 135
 owner_bead = "ga-cp3hwi"
@@ -51,8 +51,8 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 499
-baseline_files = 151
+baseline_calls = 501
+baseline_files = 153
 reported_calls = 380
 reported_files = 98
 owner_bead = "ga-cp3hwi"
@@ -491,6 +491,28 @@ resources = ["subprocess"]
 owner_bead = "ga-cp3hwi"
 invariant = "the embedded provider-plugin behavior proof is a checked Medium subprocess owner"
 resource_owner = "the one node subprocess is confined to TestProviderPluginNodeSuite, which exists to run the embedded OpenCode, MiMo Code, and Pi plugins under node against a GC_BIN fake gc: the plugins are JavaScript the provider loads, so only a real node run can prove the system-prompt shape and the once-per-turn drain they produce"
+migration_target = "P0.4b"
+expires = "2026-10-31"
+
+[[medium]]
+package_dir = "cmd/gc"
+package_name = "main"
+owner = "TestRunWorkflowServeFollowStopsAfterFinalizerSIGTERM"
+resources = ["subprocess"]
+owner_bead = "ga-cp3hwi"
+invariant = "workflow finalizer SIGTERM cancellation is a checked Medium subprocess owner"
+resource_owner = "one re-executed test process owns the real SIGTERM handlers without invoking the parent package's Dolt leak guard; the parent retains a sentinel and reaps the child"
+migration_target = "P0.4b"
+expires = "2026-10-31"
+
+[[medium]]
+package_dir = "internal/runtime/subprocess"
+package_name = "subprocess"
+owner = "TestTerminateRefusesReapedLeaderWithLiveGroup"
+resources = ["subprocess"]
+owner_bead = "ga-cp3hwi"
+invariant = "reaped-leader process-group refusal is a checked Medium subprocess owner"
+resource_owner = "the test owns and reaps its shell leader, then verifies the surviving child receives no signal or successful stop acknowledgment before cleaning up the group"
 migration_target = "P0.4b"
 expires = "2026-10-31"
 

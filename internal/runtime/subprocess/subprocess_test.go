@@ -1559,8 +1559,11 @@ func TestStopKillsTermResistantChildAfterLeaderExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var child int
-	deadline := time.Now().Add(testutil.ExecRaceTimeout)
-	for time.Now().Before(deadline) {
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
+	defer cancelReady()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		data, err := os.ReadFile(childPath)
 		if err == nil {
 			child, _ = strconv.Atoi(strings.TrimSpace(string(data)))
@@ -1568,10 +1571,11 @@ func TestStopKillsTermResistantChildAfterLeaderExit(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if child <= 1 {
-		t.Fatal("child did not become ready")
+		select {
+		case <-readyCtx.Done():
+			t.Fatal("child did not become ready")
+		case <-ticker.C:
+		}
 	}
 	identity, err := pidutil.StartTime(child)
 	if err != nil {
@@ -1588,14 +1592,18 @@ func TestStopKillsTermResistantChildAfterLeaderExit(t *testing.T) {
 	if err := p.Stop("resistant-child"); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.Now().Add(testutil.ExecRaceTimeout)
-	for time.Now().Before(deadline) {
+	exitCtx, cancelExit := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
+	defer cancelExit()
+	for {
 		if !pidutil.AliveWithStartTime(child, identity) {
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		select {
+		case <-exitCtx.Done():
+			t.Fatalf("TERM-resistant child %d survived Stop after its leader exited", child)
+		case <-ticker.C:
+		}
 	}
-	t.Fatalf("TERM-resistant child %d survived Stop after its leader exited", child)
 }
 
 func TestStopSocketDoesNotAcknowledgeTerminationFailure(t *testing.T) {
@@ -1694,12 +1702,19 @@ while [ ! -s "$2" ]; do sleep 0.01; done
 	if err := os.WriteFile(checkPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(testutil.ExecRaceTimeout)
-	for time.Now().Before(deadline) {
+	ackCtx, cancelAck := context.WithTimeout(context.Background(), testutil.ExecRaceTimeout)
+	defer cancelAck()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		if _, err := os.Stat(ackPath); err == nil {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ackCtx.Done():
+			t.Fatal("surviving child did not acknowledge the post-stop check")
+		case <-ticker.C:
+		}
 	}
 	if _, err := os.Stat(ackPath); err != nil {
 		t.Fatalf("surviving child did not acknowledge the post-stop check: %v", err)
