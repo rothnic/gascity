@@ -133,6 +133,8 @@ go_test(
         "//internal/materialize",
         "//internal/pathutil",
         "//internal/runtime",
+        "//internal/runtime/subprocess",
+        "//internal/session",
         "//internal/supervisor",
         "//internal/testenv",
         "//internal/testfixtures/reviewworkflows",

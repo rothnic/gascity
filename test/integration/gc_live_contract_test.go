@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,8 @@ import (
 	"github.com/gastownhall/gascity/internal/api/apicontract"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	sessionsubprocess "github.com/gastownhall/gascity/internal/runtime/subprocess"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // TestGCLiveContract_BeadsAndEvents covers real-world app API usage directly
@@ -493,7 +496,7 @@ description = "Read and complete {{issue}}."
 		Status string `json:"status"`
 	}](t, baseURL, validator, http.MethodPost, cityBase+"/session/"+url.PathEscape(sessionID)+"/close?delete=true", nil, http.StatusOK)
 
-	exerciseLiveContractSessionLifecycle(t, baseURL, validator, cityBase, targetAgent, rigName, runID)
+	exerciseLiveContractSessionLifecycle(t, baseURL, validator, cityBase, targetAgent, rigName, runID, env, cityDir, gcHome)
 
 	events, err := liveContractEventList(baseURL, validator, "/v0/events?limit=50")
 	if err != nil {
@@ -758,16 +761,17 @@ func liveContractRigSessionNeedsClose(sess liveContractSessionListItem, rigName 
 		!strings.HasSuffix(sess.Template, "/"+config.ControlDispatcherAgentName)
 }
 
-func exerciseLiveContractSessionLifecycle(t *testing.T, baseURL string, v *apicontract.Spec, cityBase, targetAgent, rigName, runID string) {
+func exerciseLiveContractSessionLifecycle(t *testing.T, baseURL string, v *apicontract.Spec, cityBase, targetAgent, rigName, runID string, env []string, cityDir, gcHome string) {
 	t.Helper()
 	id := createLiveContractAgentSession(t, baseURL, v, cityBase, targetAgent, rigName, "lifecycle-"+runID)
 	sessionPath := cityBase + "/session/" + url.PathEscape(id)
 
 	detail := liveContractJSON[struct {
-		ID string `json:"id"`
+		ID          string `json:"id"`
+		SessionName string `json:"session_name"`
 	}](t, baseURL, v, http.MethodGet, sessionPath, nil, http.StatusOK)
-	if detail.ID != id {
-		t.Fatalf("session detail id = %q, want %q", detail.ID, id)
+	if detail.ID != id || detail.SessionName == "" {
+		t.Fatalf("session detail = %+v, want id=%q with runtime name", detail, id)
 	}
 
 	patchedTitle := "real-world app contract patched " + runID
@@ -789,15 +793,53 @@ func exerciseLiveContractSessionLifecycle(t *testing.T, baseURL string, v *apico
 		t.Fatalf("renamed session = %+v, want id=%q title=%q", renamed, id, renamedTitle)
 	}
 
-	liveContractJSON[struct {
+	// Match providerStateDir's city-scoped subprocess directory. A positive
+	// observation binds the exact runtime before we test its absence.
+	cityKey := sha256.Sum256([]byte(filepath.Clean(cityDir)))
+	provider := sessionsubprocess.NewProviderWithDir(filepath.Join(gcHome, "subprocess", fmt.Sprintf("%x", cityKey[:4])))
+	beforeStop, err := provider.ObserveLivenessWithError(detail.SessionName, nil)
+	if err != nil || !beforeStop.Running || !beforeStop.Alive {
+		t.Fatalf("runtime before suspend = %+v, err=%v; want exact runtime present", beforeStop, err)
+	}
+	accepted := liveContractJSON[struct {
 		Status string `json:"status"`
 	}](t, baseURL, v, http.MethodPost, sessionPath+"/suspend", nil, http.StatusOK)
+	if accepted.Status != "ok" {
+		t.Fatalf("suspend response = %+v, want status=ok", accepted)
+	}
+	afterStop, err := provider.ObserveLivenessWithError(detail.SessionName, nil)
+	if err != nil || afterStop.Running || afterStop.Alive {
+		t.Fatalf("runtime after synchronous suspend = %+v, err=%v; want exact runtime absent", afterStop, err)
+	}
+
+	// Read the session through native class routing, independently of the API's
+	// cached projection. A completed controller sleep may change its base state
+	// to asleep, but it must retain the operator hold that refuses automatic wake.
+	out, err := runGCWithEnv(env, cityDir, "bd", "show", id, "--json")
+	if err != nil {
+		t.Fatalf("read suspended session class: %v\n%s", err, out)
+	}
+	var rows []struct {
+		ID       string          `json:"id"`
+		Status   string          `json:"status"`
+		Metadata beads.StringMap `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(extractJSONPayload(out)), &rows); err != nil || len(rows) != 1 || rows[0].ID != id {
+		t.Fatalf("suspended session class = %s, decode=%v; want exact id=%q", out, err, id)
+	}
+	hold := session.DecodeDisposition(rows[0].Metadata)
+	now := time.Now()
+	if rows[0].Status == "closed" || rows[0].Metadata["session_name"] != detail.SessionName || hold.Operator != session.OperatorSuspended || hold.Since.IsZero() || hold.Since.After(now) || !hold.Until.After(now) || !hold.RefusesPreWake(now) {
+		t.Fatalf("suspended session lost its operator hold: status=%q disposition=%+v", rows[0].Status, hold)
+	}
+	t.Logf("suspended session id=%s runtime=%s hold_since=%s hold_until=%s", id, detail.SessionName, hold.Since.Format(time.RFC3339Nano), hold.Until.Format(time.RFC3339Nano))
 	suspended := liveContractJSON[struct {
-		ID    string `json:"id"`
-		State string `json:"state"`
+		ID      string `json:"id"`
+		State   string `json:"state"`
+		Running bool   `json:"running"`
 	}](t, baseURL, v, http.MethodGet, sessionPath, nil, http.StatusOK)
-	if suspended.ID != id || suspended.State != "suspended" {
-		t.Fatalf("session after synchronous suspend = %+v, want id=%q state=suspended", suspended, id)
+	if suspended.ID != id || suspended.Running || (suspended.State != string(session.StateSuspended) && suspended.State != string(session.StateAsleep)) {
+		t.Fatalf("session after synchronous suspend = %+v, want id=%q held and not running", suspended, id)
 	}
 
 	wake := liveContractJSON[struct {

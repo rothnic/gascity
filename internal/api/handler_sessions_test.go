@@ -1299,6 +1299,131 @@ func TestHandleSessionGetNotFound(t *testing.T) {
 	}
 }
 
+type suspendReadbackProvider struct {
+	*runtime.Fake
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *suspendReadbackProvider) Stop(name string) error {
+	close(p.entered)
+	<-p.release
+	return p.Fake.Stop(name)
+}
+
+// The controller can finish an older sleep while the synchronous suspend is
+// stopping the runtime. Exercise that ordering through the city Huma routes,
+// with and without the controller's write-through store cache.
+func TestHumaSessionSuspendPreservesOperatorHoldThroughSleep(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, lateSleep := range []bool{false, true} {
+			t.Run(fmt.Sprintf("cached=%t/late_sleep=%t", cached, lateSleep), func(t *testing.T) {
+				fs := newSessionFakeState(t)
+				backing := fs.cityBeadStore
+				if cached {
+					cache := beads.NewCachingStoreForTest(backing, nil)
+					fs.cityBeadStore = cache
+					if err := cache.Prime(t.Context()); err != nil {
+						t.Fatalf("prime cache: %v", err)
+					}
+				}
+				info := createTestSession(t, fs.cityBeadStore, fs.sp, "Suspend readback")
+				provider := &suspendReadbackProvider{Fake: fs.sp, entered: make(chan struct{}), release: make(chan struct{})}
+				fs.sessionProvider = provider
+				h := newTestCityHandler(t, fs)
+				var release sync.Once
+				w := httptest.NewRecorder()
+				done := make(chan struct{})
+				defer func() {
+					release.Do(func() { close(provider.release) })
+					select {
+					case <-done:
+					case <-time.After(testEventTimeout):
+						t.Error("suspend handler did not exit during cleanup")
+					}
+				}()
+				go func() {
+					defer close(done)
+					h.ServeHTTP(w, newPostRequest(cityURL(fs, "/session/")+info.ID+"/suspend", nil))
+				}()
+				select {
+				case <-provider.entered:
+				case <-done:
+					t.Fatalf("suspend returned before runtime stop: %d %s", w.Code, w.Body.String())
+				case <-time.After(testEventTimeout):
+					t.Fatal("suspend did not reach runtime stop")
+				}
+				suspended, err := backing.Get(info.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stamp := suspended.Metadata["suspended_at"]
+				hold := session.DecodeDisposition(suspended.Metadata)
+				if suspended.Metadata["state"] != string(session.StateSuspended) || hold.Operator != session.OperatorSuspended || hold.Since.IsZero() || !hold.Until.After(time.Now()) {
+					t.Fatalf("before stop: state=%q intent=%q stamp=%q", suspended.Metadata["state"], suspended.Metadata["sleep_intent"], stamp)
+				}
+				if lateSleep {
+					front := session.NewStore(fs.SessionsBeadStore())
+					if _, err := front.ApplySleep(info.ID, session.SleepPatch(time.Now(), "idle")); err != nil {
+						t.Fatalf("complete older sleep: %v", err)
+					}
+				}
+				release.Do(func() { close(provider.release) })
+				select {
+				case <-done:
+				case <-time.After(testEventTimeout):
+					t.Fatal("suspend did not return after runtime stop")
+				}
+				if w.Code != http.StatusOK {
+					t.Fatalf("suspend status=%d body=%s", w.Code, w.Body.String())
+				}
+				var accepted struct {
+					Status string `json:"status"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &accepted); err != nil || accepted.Status != "ok" {
+					t.Fatalf("suspend response=%s, decode=%v", w.Body.String(), err)
+				}
+				if provider.IsRunning(info.SessionName) {
+					t.Fatal("runtime is still running after synchronous suspend")
+				}
+				front := session.NewStore(fs.SessionsBeadStore())
+				_, err = front.ApplyDispositionFresh(info.ID, session.ActorController, session.DispEvent{Kind: session.EvPreWake}, nil, time.Now())
+				var refused *session.ErrDispositionRefused
+				if !errors.As(err, &refused) || refused.Event != session.EvPreWake || refused.By != session.ActorController || refused.From != session.OperatorSuspended {
+					t.Fatalf("automatic pre-wake = %v, want disposition refusal", err)
+				}
+				wantState := string(session.StateSuspended)
+				if lateSleep {
+					wantState = string(session.StateAsleep)
+				}
+				for name, store := range map[string]beads.Store{"backing": backing, "read_store": fs.cityBeadStore} {
+					row, err := store.Get(info.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Logf("%s: revision=%d state=%q intent=%q stamp=%q", name, row.Revision, row.Metadata["state"], row.Metadata["sleep_intent"], row.Metadata["suspended_at"])
+					if row.Metadata["state"] != wantState {
+						t.Fatalf("%s state=%q, want %q after controlled write ordering", name, row.Metadata["state"], wantState)
+					}
+					gotHold := session.DecodeDisposition(row.Metadata)
+					if gotHold.Operator != session.OperatorSuspended || !gotHold.Since.Equal(hold.Since) || !gotHold.Until.Equal(hold.Until) || !gotHold.RefusesPreWake(time.Now()) {
+						t.Fatalf("%s lost the operator hold or suspension stamp", name)
+					}
+				}
+				get := httptest.NewRecorder()
+				h.ServeHTTP(get, httptest.NewRequest(http.MethodGet, cityURL(fs, "/session/")+info.ID+"?exact_id=true", nil))
+				var got sessionResponse
+				if err := json.Unmarshal(get.Body.Bytes(), &got); err != nil || get.Code != http.StatusOK {
+					t.Fatalf("GET status=%d body=%s decode=%v", get.Code, get.Body.String(), err)
+				}
+				if got.ID != info.ID || got.State != wantState || got.Running {
+					t.Fatalf("GET after synchronous suspend: id=%q state=%q running=%t, want id=%q state=%q running=false", got.ID, got.State, got.Running, info.ID, wantState)
+				}
+			})
+		}
+	}
+}
+
 func TestHandleSessionSuspend(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)

@@ -796,6 +796,11 @@ func (s *Store) closeAtomically(closer beads.AtomicConditionalCloser, bead beads
 		case !beads.IsPreconditionFailed(err):
 			return false, fmt.Errorf("closing session %q: %w", id, err)
 		}
+		var fence *beads.PreconditionFailedError
+		if errors.As(err, &fence) && fence != nil {
+			log.Printf("session %q: atomic close revision conflict attempt=%d/%d read_store=%T closer=%T read_revision=%d backend_expected_revision=%d backend_current_revision=%d",
+				id, attempt, terminalCloseMaxAttempts, s.store.Store, closer, bead.Revision, fence.Expected, fence.Current)
+		}
 		conflict = err
 		if attempt == terminalCloseMaxAttempts {
 			return false, fmt.Errorf("closing session %q: %w %d times: %w", id, errCloseContended, terminalCloseMaxAttempts, conflict)

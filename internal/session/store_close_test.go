@@ -261,6 +261,112 @@ func TestCloseBoundsRepeatedAtomicRevisionConflicts(t *testing.T) {
 	}
 }
 
+func TestCloseRevisionFenceDiagnostics(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, tc := range []struct {
+			name         string
+			want         CommitResult
+			wantAttempts int
+			wantFences   int
+		}{
+			{name: "one unrelated write", want: CommitLanded, wantAttempts: 2, wantFences: 1},
+			{name: "three unrelated writes", want: CommitContended, wantAttempts: 3, wantFences: 3},
+			{name: "new incarnation", want: CommitMoved, wantAttempts: 1, wantFences: 1},
+		} {
+			t.Run(fmt.Sprintf("cached=%t/%s", cached, tc.name), func(t *testing.T) {
+				logs := captureLog(t)
+				backing := beads.NewAtomicCloseMemStore()
+				created, err := backing.Create(sessionBeadFixture("close-diagnostics", "open", map[string]string{
+					"state":             string(StateAsleep),
+					"generation":        "1",
+					"instance_token":    "private-original-token",
+					"test_private_data": "private-metadata-value",
+				}))
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				tracing := &closeInterferenceStore{Store: backing}
+				var readStore beads.Store = tracing
+				if cached {
+					readStore = beads.NewCachingStoreForTest(tracing, nil)
+				}
+				front := NewStore(beads.SessionStore{Store: readStore})
+				// Prime the same read route the close uses, so the cache starts
+				// with the revision that each interference can make stale.
+				decided := Decide(decidedOn(t, readStore, created.ID), FactsOpClose)
+				closer, ok := beads.AtomicConditionalCloserFor(beads.SessionStore{Store: readStore})
+				if !ok {
+					t.Fatal("test store has no atomic closer")
+				}
+				var wantLogs []string
+				tracing.interfere = func(id string) error {
+					if tracing.atomicCalls > tc.wantFences {
+						return nil
+					}
+					before, err := backing.Get(id)
+					if err != nil {
+						return err
+					}
+					if tc.want == CommitMoved {
+						err = backing.SetMetadataBatch(id, map[string]string{
+							"generation":     "2",
+							"instance_token": "private-successor-token",
+						})
+					} else {
+						err = backing.SetMetadata(id, unrelatedKey, fmt.Sprintf("private-nudge-value-%d", tracing.atomicCalls))
+					}
+					if err != nil {
+						return err
+					}
+					after, err := backing.Get(id)
+					if err != nil {
+						return err
+					}
+					wantLogs = append(wantLogs, fmt.Sprintf("session %q: atomic close revision conflict attempt=%d/%d read_store=%T closer=%T read_revision=%d backend_expected_revision=%d backend_current_revision=%d",
+						id, tracing.atomicCalls, terminalCloseMaxAttempts, readStore, closer, before.Revision, before.Revision, after.Revision))
+					return nil
+				}
+				result, err := front.CommitClose(decided, ClosePatch(closeTestNow, string(StateDrained)), closeTestNow)
+				if err != nil || result != tc.want {
+					t.Fatalf("CommitClose = (%v, %v), want (%v, nil)", result, err, tc.want)
+				}
+				if tracing.atomicCalls != tc.wantAttempts || tracing.plainCloseCalls != 0 {
+					t.Fatalf("atomic/plain calls = %d/%d, want %d/0", tracing.atomicCalls, tracing.plainCloseCalls, tc.wantAttempts)
+				}
+				got, err := backing.Get(created.ID)
+				if err != nil {
+					t.Fatalf("Get: %v", err)
+				}
+				if tc.want == CommitLanded {
+					if got.Status != "closed" || got.Metadata["close_reason"] == "" {
+						t.Fatalf("successful close = %s/%q, want closed with terminal metadata", got.Status, got.Metadata["close_reason"])
+					}
+				} else if got.Status != "open" || got.Metadata["close_reason"] != "" {
+					t.Fatalf("refused close = %s/%q, want open without terminal metadata", got.Status, got.Metadata["close_reason"])
+				}
+				if got.Metadata["test_private_data"] != "private-metadata-value" {
+					t.Fatal("close overwrote unrelated metadata")
+				}
+				if tc.want == CommitMoved && (got.Metadata["generation"] != "2" || got.Metadata["instance_token"] != "private-successor-token") {
+					t.Fatal("close changed the successor incarnation")
+				}
+				lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+				if len(lines) != tc.wantFences {
+					t.Fatalf("diagnostic lines = %d, want %d: %q", len(lines), tc.wantFences, logs.String())
+				}
+				for i, want := range wantLogs {
+					if lines[i] != want {
+						t.Errorf("diagnostic %d = %q, want %q", i+1, lines[i], want)
+					}
+				}
+				if strings.Contains(logs.String(), "private-") {
+					t.Fatal("diagnostic disclosed metadata or an instance token")
+				}
+			})
+		}
+	}
+}
+
 // TestCloseReportsFalseWhenAnotherActorClosesFirst covers losing the fence to
 // a competing close: the re-read sees the row closed, so Close reports that it
 // did not close it (false, nil) and writes nothing more. This is what makes

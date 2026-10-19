@@ -234,6 +234,21 @@ func newQuiescenceCity(t *testing.T) *quiescenceCity {
 	})
 	city.Init("claude")
 	city.RigAdd(rigDir, "")
+	// The controller must have applied the rig before its suspension is measured.
+	out, stderr, err := helpers.RunGCStreams(city.Env, city.Dir, "reload", "--json")
+	if err != nil {
+		t.Fatalf("gc reload after rig add: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+	var reload struct {
+		OK       bool   `json:"ok"`
+		Outcome  string `json:"outcome"`
+		Revision string `json:"revision"`
+	}
+	lastJSONLine(t, out, &reload)
+	if !reload.OK || (reload.Outcome != "applied" && reload.Outcome != "no_change") || strings.TrimSpace(reload.Revision) == "" {
+		t.Fatalf("controller did not complete the rig configuration reload:\n%s", out)
+	}
+	t.Logf("rig configuration reload: outcome=%s revision=%s", reload.Outcome, reload.Revision)
 	const rigName = "testrig"
 	if len(doltProcessesUnder(t, rigDir)) == 0 {
 		if out, err := city.GC("bd", "--rig", rigName, "list", "--json"); err != nil {
